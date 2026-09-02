@@ -1,0 +1,43 @@
+name: Build MINHDUC
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install Theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/vendor/ios-sdks" >> $GITHUB_ENV
+
+      - name: Install iOS SDK
+        run: |
+          mkdir -p "$HOME/theos/sdks"
+          # Download iOS 16.5 SDK (Tipar uses this successfully)
+          curl -L -o /tmp/sdk.zip https://github.com/xybp888/iOS-SDKs/archive/refs/heads/master.zip
+          cd /tmp && unzip -q sdk.zip
+          cp -r /tmp/iOS-SDKs-master/iPhoneOS16.5.sdk "$HOME/theos/sdks/" || true
+          ls "$HOME/theos/sdks/"
+
+      - name: Build
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          make -f Makefile.app clean || true
+          make -f Makefile.app package FINALPACKAGE=1
+          ls -la packages/
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MINHDUC-ipa
+          path: packages/*.ipa
+          if-no-files-found: error
