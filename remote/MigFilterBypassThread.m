@@ -6,11 +6,11 @@
 //
 
 #import "MigFilterBypassThread.h"
-#import "../kexploit/kexploit_opa334.h"
-#import "../kexploit/kutils.h"
-#import "../kexploit/krw.h"
-#import "../kexploit/xpaci.h"
-#import "../utils/process.h"
+#import "../../kexploit/kexploit_opa334.h"
+#import "../../kexploit/kutils.h"
+#import "../../kexploit/krw.h"
+#import "../../kexploit/xpaci.h"
+#import "../../utils/process.h"
 
 #import <stdio.h>
 #import <stdlib.h>

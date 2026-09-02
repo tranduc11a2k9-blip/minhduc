@@ -10,7 +10,7 @@
 #import <stdbool.h>
 #import <stddef.h>
 #ifdef __OBJC__
-#import "../TaskRop/RemoteCall.h"
+#import "RemoteCall.h"
 #endif
 
 #define R_TIMEOUT 5

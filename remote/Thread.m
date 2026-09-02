@@ -8,9 +8,9 @@
 #import "Thread.h"
 
 #import <Foundation/Foundation.h>
-#import "../kexploit/kutils.h"
-#import "../kexploit/krw.h"
-#import "../kexploit/kexploit_opa334.h"
+#import "../../kexploit/kutils.h"
+#import "../../kexploit/krw.h"
+#import "../../kexploit/kexploit_opa334.h"
 
 // xnu-10002.81.5/osfmk/kern/ast.h
 #define AST_GUARD               0x1000

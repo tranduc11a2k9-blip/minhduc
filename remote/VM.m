@@ -8,10 +8,10 @@
 #import <Foundation/Foundation.h>
 #import "RemoteCall.h"
 #import "vm.h"
-#import "../kexploit/krw.h"
-#import "../kexploit/offsets.h"
-#import "../kexploit/kutils.h"
-#import "../kexploit/kexploit_opa334.h"
+#import "../../kexploit/krw.h"
+#import "../../kexploit/offsets.h"
+#import "../../kexploit/kutils.h"
+#import "../../kexploit/kexploit_opa334.h"
 
 #define VM_PAGE_PACKED_PTR_BITS                         31
 #define VM_PAGE_PACKED_PTR_SHIFT                        6

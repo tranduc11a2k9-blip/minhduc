@@ -8,8 +8,8 @@
 #import "RemoteCall.h"
 #import "Thread.h"
 #import "Exception.h"
-#import "../kexploit/kexploit_opa334.h"
-#import "../kexploit/kutils.h"
+#import "../../kexploit/kexploit_opa334.h"
+#import "../../kexploit/kutils.h"
 
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>

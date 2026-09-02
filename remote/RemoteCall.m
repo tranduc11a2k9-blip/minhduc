@@ -19,18 +19,18 @@
 #import <string.h>
 
 #import "RemoteCall.h"
-#import "../VPhoneDebug.h"
+#import "VPhoneDebug.h"
 #import "VM.h"
 #import "Exception.h"
 #import "PAC.h"
 #import "Thread.h"
 #import "MigFilterBypassThread.h"
-#import "../kexploit/kexploit_opa334.h"
-#import "../kexploit/krw.h"
-#import "../kexploit/offsets.h"
-#import "../kexploit/kutils.h"
-#import "../kexploit/xpaci.h"
-#import "../utils/process.h"
+#import "../../kexploit/kexploit_opa334.h"
+#import "../../kexploit/krw.h"
+#import "../../kexploit/offsets.h"
+#import "../../kexploit/kutils.h"
+#import "../../kexploit/xpaci.h"
+#import "../../utils/process.h"
 
 extern bool gIsPACSupported;
 extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t address, mach_vm_size_t size);
