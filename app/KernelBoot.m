@@ -43,45 +43,10 @@ static void L(NSString *fmt, ...) {
 // SpringBoard overlay session
 #import "SpringBoardOverlay.h"
 
-// Park file in app container — readable by this app across launches.
-static NSString *parkFileFullPath(void) {
-    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-    return [caches stringByAppendingPathComponent:@".minhduc_parked"];
-}
-
-// Park is only valid for the CURRENT boot. After a respring/reboot the
-// kernel primitives are gone (corrupted sockets died with the panic) but
-// the file would still exist → app would skip the exploit and use dead
-// primitives. Store the boot time; invalidate when it changes.
-static uint64_t systemBootTimeSec(void) {
-    struct timeval boottime;
-    size_t len = sizeof(boottime);
-    int mib[2] = { CTL_KERN, KERN_BOOTTIME };
-    if (sysctl(mib, 2, &boottime, &len, NULL, 0) != 0) return 0;
-    return (uint64_t)boottime.tv_sec;
-}
-
-static BOOL parkIsValid(void) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:parkFileFullPath()]) return NO;
-    NSString *saved = [NSString stringWithContentsOfFile:parkFileFullPath()
-                                                encoding:NSUTF8StringEncoding error:nil];
-    uint64_t boot = systemBootTimeSec();
-    NSString *expected = [NSString stringWithFormat:@"1:%llu", boot];
-    if (![saved isEqualToString:expected]) {
-        [fm removeItemAtPath:parkFileFullPath() error:nil]; // stale — clear it
-        return NO;
-    }
-    return YES;
-}
-
-static void writePark(void) {
-    NSString *park = parkFileFullPath();
-    [[NSFileManager defaultManager] createDirectoryAtPath:[park stringByDeletingLastPathComponent]
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *val = [NSString stringWithFormat:@"1:%llu", systemBootTimeSec()];
-    [val writeToFile:park atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
+// Park file REMOVED. Kernel primitives (early_kread64 via the corrupted
+// socket) live in THIS process only — a fresh process launch always needs a
+// fresh exploit. The old park file made relaunches skip the exploit and use
+// dead primitives (nothing drew). g_kexploit_ready (process-local) is truth.
 
 void kernelBootStart(void) {
     if (g_booting) return;
@@ -94,21 +59,9 @@ void kernelBootStart(void) {
         return;
     }
 
-    // Parked fast path: exploit already ran THIS boot — skip it
-    // (re-running double-corrupts the socket zone → panic).
-    // After a respring/reboot boottime changes → park invalid → re-exploit.
-    if (parkIsValid()) {
-        L(@"OK Parked — skipping exploit, starting overlay.");
-        g_ready = YES;
-        [[KeepAlive shared] start];
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            if (SBoardStartOverlay() != 0) {
-                extern int StartDirectOverlay(void);
-                StartDirectOverlay();
-            }
-        });
-        return;
-    }
+    // PARK REMOVED — every process launch runs the exploit fresh.
+    // (Old fast path skipped the exploit on relaunch → dead primitives →
+    //  ESP never drew after app restart. g_kexploit_ready is process-local.)
 
     g_booting = YES;
     if (!g_bootQueue) {
@@ -139,9 +92,6 @@ void kernelBootStart(void) {
             return;
         }
         L(@"OK Kernel memory r/w acquired.");
-        L(@"OK State parked (boottime-tagged) — next run skips the exploit.");
-
-        writePark();
 
         uint64_t self_proc = proc_self();
         // NOTE: platformize/sandbox-elevate intentionally skipped — iOS 17.5.1
