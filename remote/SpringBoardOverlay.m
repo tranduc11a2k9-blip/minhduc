@@ -122,7 +122,7 @@ int SBoardStartOverlay(void) {
     if (!r_is_objc_ptr(clsUIWindow)) { NSLog(@"[SBOverlay] UIWindow missing"); destroy_remote_call(); return -1; }
     uint64_t winAlloc = r_msg2_main(clsUIWindow, "alloc", 0,0,0,0);
     if (!r_is_objc_ptr(winAlloc)) { NSLog(@"[SBOverlay] window alloc failed"); destroy_remote_call(); return -1; }
-    uint64_t win = r_msg2_main(winAlloc, "initWithWindowScene:", scene, 0,0,0,0);
+    uint64_t win = r_msg2_main(winAlloc, "initWithWindowScene:", scene, 0,0,0);
     if (!r_is_objc_ptr(win)) { NSLog(@"[SBOverlay] initWithWindowScene failed"); destroy_remote_call(); return -1; }
     NSLog(@"[SBOverlay] window=0x%llx (windowScene-attached)", win);
 
@@ -140,10 +140,10 @@ int SBoardStartOverlay(void) {
     uint64_t clsColor = r_class("UIColor");
     if (r_is_objc_ptr(clsColor)) {
         uint64_t clear = r_msg2_main(clsColor, "clearColor", 0,0,0,0);
-        if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0,0,0,0);
+        if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0,0,0);
     }
-    r_msg2_main(win, "setUserInteractionEnabled:", 0, 0,0,0,0); // passthrough
-    r_msg2_main(win, "setHidden:", 0, 0,0,0,0);
+    r_msg2_main(win, "setUserInteractionEnabled:", 0, 0,0,0); // passthrough
+    r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
     // ---- content: UILabel subview (the old code had NONE → invisible) ----
     uint64_t clsLabel = r_class("UILabel");
@@ -154,9 +154,9 @@ int SBoardStartOverlay(void) {
     if (!r_is_objc_ptr(label)) { NSLog(@"[SBOverlay] label init failed"); destroy_remote_call(); return -1; }
 
     sb_send_rect_main(label, "setFrame:", 0, 0, bounds[2], 60);
-    r_msg2_main(label, "setTag:", SB_OVERLAY_TAG, 0,0,0,0);
-    r_msg2_main(label, "setNumberOfLines:", 1, 0,0,0,0);
-    r_msg2_main(label, "setTextAlignment:", 1, 0,0,0,0); // center
+    r_msg2_main(label, "setTag:", SB_OVERLAY_TAG, 0,0,0);
+    r_msg2_main(label, "setNumberOfLines:", 1, 0,0,0);
+    r_msg2_main(label, "setTextAlignment:", 1, 0,0,0); // center
 
     uint64_t clsFont = r_class("UIFont");
     if (r_is_objc_ptr(clsFont)) {
@@ -164,23 +164,23 @@ int SBoardStartOverlay(void) {
         uint64_t font = r_msg2_main_raw(clsFont, "boldSystemFontOfSize:",
                                         &size, sizeof(size),
                                         NULL, 0, NULL, 0, NULL, 0);
-        if (r_is_objc_ptr(font)) r_msg2_main(label, "setFont:", font, 0,0,0,0);
+        if (r_is_objc_ptr(font)) r_msg2_main(label, "setFont:", font, 0,0,0);
     }
     if (r_is_objc_ptr(clsColor)) {
         uint64_t white = r_msg2_main(clsColor, "whiteColor", 0,0,0,0);
-        if (r_is_objc_ptr(white)) r_msg2_main(label, "setTextColor:", white, 0,0,0,0);
+        if (r_is_objc_ptr(white)) r_msg2_main(label, "setTextColor:", white, 0,0,0);
         uint64_t black = r_msg2_main(clsColor, "blackColor", 0,0,0,0);
-        if (r_is_objc_ptr(black)) r_msg2_main(label, "setBackgroundColor:", black, 0,0,0,0);
+        if (r_is_objc_ptr(black)) r_msg2_main(label, "setBackgroundColor:", black, 0,0,0);
     }
 
     NSString *initText = @"MINHDUC ESP ACTIVE";
     uint64_t textObj = sb_nsstring_utf8(initText.UTF8String);
     if (r_is_objc_ptr(textObj)) {
-        r_msg2_main(label, "setText:", textObj, 0,0,0,0);
+        r_msg2_main(label, "setText:", textObj, 0,0,0);
         sb_release_remote_obj(textObj);
     }
-    r_msg2_main(win, "addSubview:", label, 0,0,0,0);
-    r_msg2_main(win, "setHidden:", 0, 0,0,0,0);
+    r_msg2_main(win, "addSubview:", label, 0,0,0);
+    r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
     // ---- retain via associated object (cyanide pattern) ----
     uint64_t assocKey = r_sel("minhducSBOverlayWindow");
@@ -217,7 +217,7 @@ void SBoardOverlaySetStatus(const char *utf8) {
 
     uint64_t textObj = sb_nsstring_utf8(text.UTF8String);
     if (r_is_objc_ptr(textObj)) {
-        r_msg2_main(g_sbLabel, "setText:", textObj, 0,0,0,0);
+        r_msg2_main(g_sbLabel, "setText:", textObj, 0,0,0);
         sb_release_remote_obj(textObj);
     }
 }
@@ -226,7 +226,7 @@ void SBoardStopOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
     if (!g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return; }
     if (r_is_objc_ptr(g_sbWindow)) {
-        r_msg2_main(g_sbWindow, "setHidden:", 1, 0,0,0,0);
+        r_msg2_main(g_sbWindow, "setHidden:", 1, 0,0,0);
     }
     g_sbOverlayOn = NO;
     g_sbWindow = 0;
