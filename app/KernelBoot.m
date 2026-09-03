@@ -118,24 +118,36 @@ void kernelBootStart(void) {
         L(sret == 0 ? @"OK Sandbox escaped (R+W filesystem)."
                     : @"WARN sandbox_escape returned %d", sret);
 
-        L(@"RUN 4/6 Opening SpringBoard injection channel");
-        // Fl0rk pattern: ensure SB remote session while boot continues.
+        L(@"RUN 4/6 Opening SpringBoard injection channel (delayed)");
+        // CRITICAL respring fix: opening the SB remote session IMMEDIATELY
+        // after sandbox_escape crashed SpringBoard ~1s later (session rides
+        // on still-settling kernel primitives). Fl0rk opens its session only
+        // when the user configures settings — seconds after boot. We wait
+        // 10s, then retry up to 3 times with backoff.
         [[KeepAlive shared] start];
         __block BOOL sbDone = NO;
         __block int sbret = -1;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            sbret = SBoardStartOverlay();
+            for (int attempt = 0; attempt < 3; attempt++) {
+                sleep(10); // let primitives + SB settle after exploit
+                sbret = SBoardStartOverlay();
+                if (sbret == 0) break;
+                NSLog(@"[BOOT] SB overlay attempt %d failed rc=%d", attempt + 1, sbret);
+            }
             sbDone = YES;
         });
-        L(@"OK Channel establishing in background.");
+        L(@"OK Channel will establish after 10s settle.");
 
         L(@"RUN 5/6 Preparing SpringBoard session");
-        {
-            double deadline = CACurrentMediaTime() + 6.0;
-            while (!sbDone && CACurrentMediaTime() < deadline) usleep(50000);
-        }
-        L(sbDone && sbret == 0 ? @"OK SpringBoard session ready."
-                               : @"WARN SB session pending — falling back in-app.");
+        L(@"OK SpringBoard session pending (background).");
+
+        L(@"RUN 6/6 Starting ESP overlay");
+        // In-app overlay starts NOW (instant, safe). SB overlay replaces it
+        // later when its session establishes.
+        extern int StartDirectOverlay(void);
+        int dret = StartDirectOverlay();
+        L(dret == 0 ? @"OK DirectOverlay active (SB loading in bg)."
+                    : @"WARN StartDirectOverlay returned %d", dret);
 
         L(@"RUN 6/6 Starting ESP overlay");
         if (!(sbDone && sbret == 0)) {

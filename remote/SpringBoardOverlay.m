@@ -246,15 +246,65 @@ int SBoardStartOverlay(void) {
     return 0;
 }
 
+// Persistent remote path — created ONCE, emptied per sync (CGPathClear),
+// never destroyed. Fl0rk DrawView pattern.
+static uint64_t g_sbPersistentPath = 0;
+
+static uint64_t persistentPath(void) {
+    if (r_is_objc_ptr(g_sbPersistentPath)) return g_sbPersistentPath;
+    g_sbPersistentPath = dlsym("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+    return g_sbPersistentPath;
+}
+
 void SBRemotePushESPFrame(UIView *espView) {
     if (!g_sbOverlayOn || !espView) return;
-    // MIRROR DISABLED (respring bisect): the per-frame vector sync into
-    // SpringBoard (CGPathCreateMutable/AddLines/setPath remote) is the
-    // suspected SpringBoard killer — overlay lives ~1s then SB dies.
-    // Isolated test: static banner only, zero mirror traffic. If no
-    // respring with this build, the mirror calls are confirmed guilty.
-    (void)espView;
-    return;
+    if (++g_sbMirrorCount % 3 != 0) return; // 60fps / 3 = 20fps
+    uint64_t rp = persistentPath();
+    if (!r_is_objc_ptr(rp)) return;
+
+    // Fl0rk DrawView pattern: ONE persistent remote point buffer (allocated
+    // once, never freed) + ONE batched CGPathAddLines per sync. No per-frame
+    // malloc/free in SpringBoard — that churn is what killed SB.
+    static uint64_t ptsBuf = 0;
+    if (!r_is_objc_ptr(ptsBuf)) {
+        ptsBuf = dlsym("malloc", 65536, 0,0,0,0,0,0,0); // 4096 points
+        if (!r_is_objc_ptr(ptsBuf)) return;
+    }
+
+    static NSMutableData *ops = nil;
+    if (!ops) ops = [NSMutableData dataWithCapacity:8192];
+
+    if (!mergePaths(espView, ops)) return; // unchanged → 0 remote calls
+
+    // Reset path, then write points into the persistent buffer and batch.
+    dlsym("CGPathClear", rp, 0,0,0,0,0,0,0);
+    size_t len = ops.length;
+    const uint8_t *b = (const uint8_t *)ops.bytes;
+    double pts[4096];
+    int n = 0;
+    size_t i = 0;
+    while (i < len && n < 4090) {
+        uint8_t op = b[i++];
+        if (i + 16 > len) break;
+        double x, y; memcpy(&x, b+i, 8); memcpy(&y, b+i+8, 8); i += 16;
+        if (op == 1) { // moveTo
+            if (n > 0) {
+                remote_write(ptsBuf, pts, n*16);
+                dlsym("CGPathAddLines", rp, 0, ptsBuf, n, 0,0,0,0);
+                n = 0;
+            }
+            dlsym("CGPathMoveToPoint", rp, 0, dbl_bits(x), dbl_bits(y), 0,0,0,0);
+        } else {
+            pts[n*2] = x; pts[n*2+1] = y; n++;
+        }
+    }
+    if (n > 0) {
+        remote_write(ptsBuf, pts, n*16);
+        dlsym("CGPathAddLines", rp, 0, ptsBuf, n, 0,0,0,0);
+    }
+
+    // ONE setPath per sync — layer retains the persistent path.
+    r_msg2_main(g_sbShape, "setPath:", rp, 0,0,0);
 }
 
 void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
