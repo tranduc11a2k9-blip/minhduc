@@ -156,57 +156,23 @@ int SBoardStartOverlay(void) {
     uint64_t pid = do_remote_call_stable(5000, "getpid", 0,0,0,0,0,0,0,0);
     if (pid == 0) { destroy_remote_call(); return -1; }
 
-    // ---- window (scene-attached) ----
+    // ---- lara freakywindow pattern: NO new window! ----
+    // lara (same kexploit family) draws its overlays by addSubview'ing into
+    // the EXISTING SpringBoard keyWindow — the live render tree that already
+    // composites 60fps. Every window we created ourselves failed to render
+    // bare CAShapeLayers (no backing allocation for a fresh window we inject
+    // into remotely). Subclass registration via remote also corrupts SB's
+    // ObjC runtime (os_unfair_lock corrupt crash). Use the existing window.
     uint64_t app = r_msg2_main(r_class("UIApplication"), "sharedApplication", 0,0,0,0);
     if (!r_is_objc_ptr(app)) { destroy_remote_call(); return -1; }
-    uint64_t kw = r_msg2_main(app, "keyWindow", 0,0,0,0);
-    if (!r_is_objc_ptr(kw)) {
+    uint64_t win = r_msg2_main(app, "keyWindow", 0,0,0,0);
+    if (!r_is_objc_ptr(win)) {
         uint64_t ws = r_msg2_main(app, "windows", 0,0,0,0);
         uint64_t n = r_is_objc_ptr(ws) ? r_msg2_main(ws, "count", 0,0,0,0) : 0;
-        if (n > 0 && n < 64) kw = r_msg2_main(ws, "objectAtIndex:", 0,0,0,0);
+        if (n > 0 && n < 64) win = r_msg2_main(ws, "objectAtIndex:", 0,0,0,0);
     }
-    if (!r_is_objc_ptr(kw)) { destroy_remote_call(); return -1; }
-    uint64_t scene = r_msg2_main(kw, "windowScene", 0,0,0,0);
-    if (!r_is_objc_ptr(scene)) { destroy_remote_call(); return -1; }
-
-    // ---- Fl0rk _gDrawViewPassThroughWindowClass: register a WINDOW SUBCLASS
-    // INSIDE SpringBoard at runtime. A plain UIWindow only composites views
-    // with backing content — its bare CAShapeLayers never get rendered by
-    // the window server. A subclass overriding the private system flags
-    // (_isSystemWindow/hosting-managed/secure) gets FULL layer-tree backing
-    // (same as SB's own windows, which draw shape layers fine).
-    static uint64_t g_sbWindowClass = 0;
-    if (!r_is_objc_ptr(g_sbWindowClass)) {
-        // idempotent: reuse if a previous session registered it
-        uint64_t existing = do_remote_call_stable(5000, "objc_getClass", (uint64_t)(uintptr_t)"MHPassThroughWindow", 0,0,0,0,0,0,0);
-        if (r_is_objc_ptr(existing)) {
-            g_sbWindowClass = existing;
-        } else {
-            uint64_t nameBuf = r_alloc_str("MHPassThroughWindow");
-            uint64_t superName = r_alloc_str("UIWindow");
-            if (r_is_objc_ptr(nameBuf) && r_is_objc_ptr(superName)) {
-                uint64_t superCls = do_remote_call_stable(5000, "objc_getClass", superName, 0,0,0,0,0,0,0);
-                if (r_is_objc_ptr(superCls)) {
-                    // objc_allocateClassPair(super, name, 0)
-                    uint64_t newCls = do_remote_call_stable(5000, "objc_allocateClassPair",
-                                                            superCls, nameBuf, 0, 0,0,0,0,0);
-                    if (r_is_objc_ptr(newCls)) {
-                        // register
-                        do_remote_call_stable(5000, "objc_registerClassPair", newCls, 0,0,0,0,0,0,0);
-                        g_sbWindowClass = newCls;
-                        NSLog(@"[SBOverlay] registered MHPassThroughWindow subclass in SB");
-                    }
-                }
-            }
-            if (r_is_objc_ptr(nameBuf)) r_free(nameBuf);
-            if (r_is_objc_ptr(superName)) r_free(superName);
-        }
-    }
-
-    uint64_t clsWinUse = r_is_objc_ptr(g_sbWindowClass) ? g_sbWindowClass : r_class("UIWindow");
-    uint64_t win = r_msg2_main(r_msg2_main(clsWinUse, "alloc", 0,0,0,0),
-                               "initWithWindowScene:", scene, 0,0,0);
-    if (!r_is_objc_ptr(win)) { destroy_remote_call(); return -1; }
+    if (!r_is_objc_ptr(win)) { NSLog(@"[SBOverlay] no SB window found"); destroy_remote_call(); return -1; }
+    NSLog(@"[SBOverlay] using EXISTING SB keyWindow (lara pattern)");
 
     double bounds[4] = {0,0,390,844};
     uint64_t clsScr = r_class("UIScreen");
@@ -214,14 +180,8 @@ int SBoardStartOverlay(void) {
         r_msg2_main_struct_ret(r_msg2_main(clsScr, "mainScreen", 0,0,0,0),
                                "bounds", bounds, 32, NULL,0,NULL,0,NULL,0,NULL,0);
     }
-    r_msg2_main_raw(win, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-    double lvl = SB_OVERLAY_WIN_LEVEL;
-    r_msg2_main_raw(win, "setWindowLevel:", &lvl, 8, NULL,0,NULL,0,NULL,0);
     uint64_t clsCol = r_class("UIColor");
     uint64_t clear = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "clearColor", 0,0,0,0) : 0;
-    if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0,0,0);
-    r_msg2_main(win, "setUserInteractionEnabled:", 0, 0,0,0);
-    r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
     // ---- colors: SEPARATE UIColor vs CGColor — CRASH FIX ----
     // UILabel.setTextColor:/setBackgroundColor: take UIColor objects.
@@ -353,29 +313,17 @@ int SBoardStartOverlay(void) {
         }
     }
 
-    // VECTOR ATTEMPT 3 (Fl0rk-exact): add the shape layer DIRECTLY to the
-    // EXISTING SpringBoard keyWindow's root layer — Fl0rk's
-    // _drawview_find_or_create_view/_gDrawViewWindow suggests it reuses the
-    // live render tree rather than a fresh window. A new window's layer
-    // tree may not get shape-layer backing allocated (all our UIViews with
-    // content render, bare shape layers don't); the existing window's tree
-    // definitely renders every frame.
-    uint64_t winLayer = r_msg2_main(win, "layer", 0,0,0,0);
-    if (r_is_objc_ptr(winLayer)) {
-        r_msg2_main(winLayer, "addSublayer:", shape, 0,0,0);
-        r_msg2_main(shape, "setActions:", 0, 0,0,0);
-    }
-    g_sbCanvas = 0; // no canvas — shape sits on the window root layer
-
-    // container onto window — setHidden:NO is enough; makeKeyAndVisible on a
-    // 999999-level window changed SB's key window → crash → respring.
+    // lara pattern: bring our container to the front of the EXISTING window
+    uint64_t selBringFront = r_sel("bringSubviewToFront:");
+    // container onto the EXISTING SB keyWindow (never key it — that kills SB)
     r_msg2_main(win, "addSubview:", container, 0,0,0);
-    r_msg2_main(win, "setHidden:", 0, 0,0,0);
+    if (r_is_objc_ptr(selBringFront)) r_msg2_main(win, selBringFront, container, 0,0,0);
     g_sbShape = shape;
 
-    // retain
+    // retain container via associated object on the app (lara keeps remote
+    // refs alive the same way through its tag/lookup; ours needs a ref root)
     uint64_t key = r_sel("minhducSBOverlayWindow");
-    if (r_is_objc_ptr(key)) dlsym("objc_setAssociatedObject", app, key, win, 1, 0,0,0,0);
+    if (r_is_objc_ptr(key)) dlsym("objc_setAssociatedObject", app, key, container, 1, 0,0,0,0);
 
     pthread_mutex_lock(&g_sbLock);
     g_sbWin = win;
