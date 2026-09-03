@@ -3024,8 +3024,10 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
         // Keep frame alive when Brutal needs work (ON, still patched, or has saved addrs to restore).
         // Critical: user turns Brutal OFF after leave → must NOT early-return before restore.
+        // CamPC must ALSO keep the frame alive — it was missing from this list,
+        // so "only CamPC on" early-returned and CamPC never applied.
         const bool brutalNeedsFrame = Norecoil || g_brutalPatched.load() || g_brutalHasAddrs.load();
-        if (!isESP && !isESP2 && !isAimbot && !isAimAssist && !isAimSilent && !isSpeed && !brutalNeedsFrame) {
+        if (!isESP && !isESP2 && !isAimbot && !isAimAssist && !isAimSilent && !isSpeed && !isCamPC && !brutalNeedsFrame) {
             [self clearAllContent];
             if (!self.hidden) self.hidden = YES;
             return;
