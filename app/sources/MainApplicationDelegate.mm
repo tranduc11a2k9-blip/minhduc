@@ -99,7 +99,7 @@
     // Undo the krw socket leak BEFORE the process dies — exiting with
     // so_usecount bumped astronomically high makes kernel zone teardown
     // panic → device respring ("reparting"). Restore makes exit clean.
-    extern void krw_sockets_restore(void);
+    extern "C" void krw_sockets_restore(void);
     krw_sockets_restore();
 }
 
