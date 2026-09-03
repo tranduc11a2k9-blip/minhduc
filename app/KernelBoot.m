@@ -16,6 +16,7 @@
 #import "KernelBoot.h"
 #import <QuartzCore/QuartzCore.h>
 #import <sys/time.h>
+#import <sys/sysctl.h>
 #import <unistd.h>
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/kutils.h"
@@ -53,9 +54,11 @@ static NSString *parkFileFullPath(void) {
 // the file would still exist → app would skip the exploit and use dead
 // primitives. Store the boot time; invalidate when it changes.
 static uint64_t systemBootTimeSec(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec - (uint64_t)sysconf(_SC_BOOTTIME);
+    struct timeval boottime;
+    size_t len = sizeof(boottime);
+    int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+    if (sysctl(mib, 2, &boottime, &len, NULL, 0) != 0) return 0;
+    return (uint64_t)boottime.tv_sec;
 }
 
 static BOOL parkIsValid(void) {
