@@ -24,12 +24,20 @@
 
 static BOOL g_sbOverlayOn = NO;
 static uint64_t g_sbWin = 0;
-static uint64_t g_sbShape = 0;      // single CAShapeLayer
+static uint64_t g_sbShape = 0;      // single CAShapeLayer (Fl0rk geometry layer)
+static uint64_t g_sbCanvas = 0;     // dedicated UIView hosting the shape layer
 static uint64_t g_sbOldPath = 0;
 static uint32_t g_sbPathHash = 0;
 static int g_sbSettleWas = 50000;
 static int g_sbMirrorCount = 0;
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
+
+// Fl0rk DrawView pattern: cached NSInvocation for the ONE setPath: call we
+// make per sync. Built ONCE at init; every frame we only CGPathAddLines into
+// the persistent path and re-invoke the cached invocation (via
+// performSelectorOnMainThread). No per-frame NSInvocation build/release —
+// that churn raced SB's main thread (SIGBUS 0x401 crashes).
+static uint64_t g_sbSetPathInvocation = 0;
 
 // Per-SB-session mirror state (forward declarations — SBoardStartOverlay
 // resets these at the end of init; definitions live below).
@@ -249,9 +257,25 @@ int SBoardStartOverlay(void) {
         r_msg2_main(container, "addSubview:", label, 0,0,0);
     }
 
-    // shape layer onto container's layer
-    uint64_t containerLayer = r_msg2_main(container, "layer", 0,0,0,0);
-    if (r_is_objc_ptr(containerLayer)) r_msg2_main(containerLayer, "addSublayer:", shape, 0,0,0);
+    // shape layer onto a DEDICATED canvas UIView's layer (Fl0rk DrawView
+    // pattern: _gDrawViewCanvas). A CAShapeLayer added directly to a
+    // container's layer did NOT composite in SB window hosting — wrapping
+    // it in a UIView that is addSubview'd (like the banner label) is what
+    // makes the layer tree render.
+    uint64_t canvas = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
+                                      "initWithFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+    if (!r_is_objc_ptr(canvas)) { destroy_remote_call(); return -1; }
+    if (r_is_objc_ptr(clear)) r_msg2_main(canvas, "setBackgroundColor:", clear, 0,0,0);
+    r_msg2_main(canvas, "setUserInteractionEnabled:", 0, 0,0,0);
+    uint64_t canvasLayer = r_msg2_main(canvas, "layer", 0,0,0,0);
+    if (r_is_objc_ptr(canvasLayer)) {
+        r_msg2_main(canvasLayer, "addSublayer:", shape, 0,0,0);
+        // Fl0rk: _drawview_disable_line_layer_actions — kill implicit
+        // animations so per-frame setPath never races the render commit.
+        r_msg2_main(shape, "setActions:", 0, 0,0,0);
+    }
+    r_msg2_main(container, "addSubview:", canvas, 0,0,0);
+    g_sbCanvas = canvas;
 
     // container onto window — setHidden:NO is enough; makeKeyAndVisible on a
     // 999999-level window changed SB's key window → crash → respring.
@@ -273,10 +297,43 @@ int SBoardStartOverlay(void) {
     // dead address space (2nd boot: CGPathClear on stale addr = silent
     // mirror crash → banner visible but ESP never draws). Re-create lazily.
     g_sbPersistentPath = 0;
-    // ptsBuf is function-local static; reset via the mirror's own init.
     sb_reset_mirror_state();
 
-    NSLog(@"[SBOverlay] single-layer vector overlay ACTIVE");
+    // ---- Build the CACHED setPath: NSInvocation (Fl0rk
+    // _gDrawViewGeometryPathInvocation). Built ONCE per SB session,
+    // targeting the shape layer with the persistent path as argument.
+    // Every mirror sync just re-fires it (performSelectorOnMainThread).
+    {
+        uint64_t rp = persistentPath();
+        if (r_is_objc_ptr(rp) && r_is_objc_ptr(shape)) {
+            uint64_t clsShape = r_class("CAShapeLayer");
+            uint64_t sigSel = r_sel("methodSignatureForSelector:");
+            uint64_t setPathSel = r_sel("setPath:");
+            uint64_t sig = r_msg(clsShape, sigSel, setPathSel, 0, 0, 0);
+            if (r_is_objc_ptr(sig)) {
+                uint64_t clsInv = r_class("NSInvocation");
+                uint64_t inv = r_msg2_main(clsInv, "invocationWithMethodSignature:", sig, 0,0,0,0);
+                if (r_is_objc_ptr(inv)) {
+                    r_msg2_main(inv, "setTarget:", shape, 0,0,0,0);
+                    r_msg2_main(inv, "setSelector:", setPathSel, 0,0,0,0);
+                    // argument 2 = the CGPathRef (persistent — lives as long
+                    // as the session; retained by the layer on each invoke)
+                    uint64_t argBuf = dlsym("malloc", 8, 0,0,0,0,0,0,0);
+                    if (r_is_objc_ptr(argBuf)) {
+                        remote_write64(argBuf, rp);
+                        r_msg2_main(inv, "setArgument:atIndex:", argBuf, 2, 0,0,0);
+                        dlsym("free", argBuf, 0,0,0,0,0,0,0);
+                    }
+                    r_msg2_main(inv, "retainArguments", 0,0,0,0);
+                    g_sbSetPathInvocation = inv;
+                }
+            }
+        }
+    }
+
+    NSLog(@"[SBOverlay] vector overlay ACTIVE (canvas %s, cached invocation %s)",
+          r_is_objc_ptr(g_sbCanvas) ? "OK" : "NO",
+          r_is_objc_ptr(g_sbSetPathInvocation) ? "OK" : "fallback");
     return 0;
 }
 
@@ -296,6 +353,7 @@ static void sb_reset_mirror_state(void) {
     g_sbMirrorPtsBuf = 0;
     g_sbPathHash = 0;
     g_sbMirrorCount = 0;
+    g_sbSetPathInvocation = 0;
 }
 
 void SBRemotePushESPFrame(UIView *espView) {
@@ -368,8 +426,21 @@ void SBRemotePushESPFrame(UIView *espView) {
         dlsym("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
     }
 
-    // ONE setPath per sync — layer retains the persistent path.
-    r_msg2_main(g_sbShape, "setPath:", rp, 0,0,0);
+    // ONE setPath per sync — via the CACHED NSInvocation (Fl0rk
+    // _gDrawViewGeometryPathInvocation pattern): the invocation was built
+    // once at init targeting the shape layer; we only re-fire it with the
+    // persistent path. No per-frame NSInvocation build/retain/release —
+    // that churn raced SB's main thread and SIGBUS-crashed it.
+    if (r_is_objc_ptr(g_sbSetPathInvocation)) {
+        uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+        uint64_t invokeSel = r_sel("invoke");
+        if (performSel && invokeSel) {
+            r_msg(g_sbSetPathInvocation, performSel, invokeSel, 0, 1, 0);
+        }
+    } else {
+        // fallback: direct call (first frame before cache exists)
+        r_msg2_main(g_sbShape, "setPath:", rp, 0,0,0);
+    }
 }
 
 void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
