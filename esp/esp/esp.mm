@@ -3048,9 +3048,6 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                         task = get_task;
                         g_target_task = get_task;
                         s_attachedPid = curPid;
-                        if (gEngine) {
-                            delete gEngine;
-                            gEngine = nullptr;
                         }
                         gEngine = (void *)1; // DSMemory
                     } else {
@@ -3137,43 +3134,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     if (leftMatch && patched.load()) want = false;
     if (!Norecoil) want = false;
 
-    if (curPid > 0 && get_task != MACH_PORT_NULL) {
-        if (!gEngine) gEngine = (void *)1; // DSMemory
-        else gEngine->task = get_task;
-        task = get_task;
-        g_target_task = get_task;
-    }
 
-    if (gEngine && !busy.load() && want != patched.load()) {
-        busy.store(true);
-        g_brutalPatched.store(want);
-        g_brutalHasAddrs.store(true);
-        std::thread([want]() {
-            const uint64_t kOriginalValue = 4397530849764387586ULL;
-            const uint64_t kSpeedValue    = 4397530849735000000ULL;
-            uint64_t from = want ? kOriginalValue : kSpeedValue;
-            uint64_t to   = want ? kSpeedValue    : kOriginalValue;
-
-            pid_t pid = (pid_t)GameTargetProcessPid();
-            task_t t = MACH_PORT_NULL;
-            if (pid > 0) task_for_pid(mach_task_self(), pid, &t);
-            if (t == MACH_PORT_NULL) t = get_task;
-            if (t != MACH_PORT_NULL && gEngine) {
-                gEngine->task = t;
-                // Old MakeTipar range + JRScanMemory + write all hits.
-                AddrRange range = { 0x100000000, 0x200000000 };
-                gEngine->JRScanMemory(range, &from, JR_Search_Type_ULong);
-                auto results = gEngine->getAllResults();
-                for (void *addr : results) {
-                    if (addr) gEngine->JRWriteMemory((uint64_t)addr, &to, JR_Search_Type_ULong);
-                }
-            }
-            patched.store(want);
-            g_brutalPatched.store(want);
-            g_brutalHasAddrs.store(want);
-            busy.store(false);
-        }).detach();
-    }
 }
 
         if (showVisuals && stats.aimAssistPath) {
