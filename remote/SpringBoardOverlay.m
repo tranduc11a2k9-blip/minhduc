@@ -1,90 +1,178 @@
 //
-//  SpringBoardOverlay.m — Fl0rk-style SpringBoard overlay
-//  remote_objc creates a fullscreen UIImageView inside SpringBoard's
-//  process. Every ~10 frames the local ESP_View (box/bone/line/hp/name/
-//  distance/weapon/fov/aim) is rendered offscreen and the JPEG is uploaded
-//  into the remote image view → full ESP renders above EVERY app.
+//  SpringBoardOverlay.m — vector ESP mirror into SpringBoard
 //
-//  Bug fixes vs the first attempt:
-//  - initWithWindowScene: (NOT initWithFrame: — no scene = never on screen)
-//  - UIImageView subview added via addSubview: (had NO subviews → invisible)
-//  - CFRelease for ObjC objects (r_free = remote free() on ObjC = crash)
-//  - objc_setAssociatedObject retains the window
-//  - Remote temps kept in a small ring and released 3 frames later so the
-//    async setImage: never touches freed memory (UAF crash)
+//  NO JPEG. Local ESP_View renders at 60fps (source of truth). Each frame
+//  we serialize its CAShapeLayer paths → 1 remote_write → rebuild
+//  CGMutablePath in SpringBoard → setPath. Per-layer FNV hash skips
+//  unchanged layers (idle scene ≈ 0 remote calls).
+//
+//  Key fixes vs old JPEG approach:
+//  - Vector shapes (no blur, native resolution)
+//  - ~20fps sync (60fps timer / 3)
+//  - Per-layer hash: idle scene ≈ 0 cost
+//  - STRICT color scheme: force white stroke + no fill to avoid creating
+//    remote CGColorRef (which crashes via r_msg2_main). ESP colors are
+//    cosmetic — white on black is always readable.
+//  - r_settle_us(500) instead of default 50ms (was 100x slower!)
 //
 #import "SpringBoardOverlay.h"
 #import "RemoteCall.h"
 #import "remote_objc.h"
 #import "../../kexploit/kexploit_opa334.h"
-#import "../../kexploit/kutils.h"
 #import <UIKit/UIKit.h>
 #import <pthread.h>
 #import <string.h>
 
 #define SB_OVERLAY_WIN_LEVEL 10000000.0
-#define SB_OVERLAY_TAG 0x4D48 // "MH"
+#define SB_MAX_TEXT_SLOTS 24
 
 static BOOL g_sbOverlayOn = NO;
-static uint64_t g_sbWindow = 0;
-static uint64_t g_sbLabel = 0;
-static uint64_t g_sbImgView = 0;
-static NSString *g_sbLastText = nil;
+static uint64_t g_sbWin = 0;
+static uint64_t g_sbRoot = 0; // root UIView
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
-
-// Ring of remotely-retained temp UIImage/NSData for async setImage:.
-// Released 3 frames after use so the queued async call has already run.
-#define SB_PENDING_CAP 3
-static uint64_t g_sbPending[SB_PENDING_CAP] = {0, 0, 0};
-static int g_sbPendingIdx = 0;
 static int g_sbMirrorCount = 0;
+static int g_sbSettleWas = 50000;
 
-// --- helpers (statbar-style) ---
+// 16 shape layers + 24 text layers
+static uint64_t g_shape[16];
+static uint64_t g_oldPath[16];
+static uint32_t g_shapeHash[16];
+static uint64_t g_text[SB_MAX_TEXT_SLOTS];
+static uint32_t g_textHash[SB_MAX_TEXT_SLOTS];
+static uint64_t g_oldTextObj[SB_MAX_TEXT_SLOTS];
 
-static void sb_send_rect_main(uint64_t obj, const char *selName,
-                              double x, double y, double w, double h)
-{
-    if (!r_is_objc_ptr(obj)) return;
-    double rect[4] = { x, y, w, h };
-    r_msg2_main_raw(obj, selName,
-                    &rect, sizeof(rect),
-                    NULL, 0, NULL, 0, NULL, 0);
+static const char *kShapeKeys[16] = {
+    "boxLayer", "boxBotLayer", "boxKnockedLayer",
+    "boneLayer", "boneBotLayer", "boneKnockedLayer",
+    "snaplineLayer", "snaplineBotLayer", "snaplineKnockedLayer",
+    "hpFillGreenLayer", "hpFillOrangeLayer", "hpFillRedLayer",
+    "bgFillBlackLayer", "alertLayer", "fovLayer", "aimAssistLayer"
+};
+
+// ---- helpers ----
+static void dblCpy(double *d, const void *s) { memcpy(d, s, 8); }
+
+static uint64_t dlsym(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
+                      uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    return r_dlsym_call(R_TIMEOUT, fn, a0,a1,a2,a3,a4,a5,a6,a7);
 }
 
-static void sb_send_double_main(uint64_t obj, const char *selName, double d)
-{
-    if (!r_is_objc_ptr(obj)) return;
-    r_msg2_main_raw(obj, selName,
-                    &d, sizeof(d),
-                    NULL, 0, NULL, 0, NULL, 0);
+// Simple FNV-1a
+static uint32_t hsh(const void *p, size_t n) {
+    uint32_t h = 2166136261u;
+    const uint8_t *b = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
+    return h;
 }
 
-// ObjC objects must be released via remote CFRelease, NEVER r_free
-// (r_free = remote free() on an ObjC allocation).
-static void sb_release_remote_obj(uint64_t obj)
-{
-    if (!r_is_objc_ptr(obj)) return;
-    r_dlsym_call(R_TIMEOUT, "CFRelease", obj, 0, 0, 0, 0, 0, 0, 0);
+// Serialize a CGPath as byte stream: for each element, [op:1][data].
+// ops: 1=moveTo(2d), 2=lineTo(2d)
+static void serializePath(CGPathRef p, NSMutableData *d) {
+    [d setLength:0];
+    if (!p || CGPathIsEmpty(p)) return;
+    CGPathApply(p, (__bridge void *)d, ^(void *info, const CGPathElement *e) {
+        NSMutableData *dd = (__bridge NSMutableData *)info;
+        uint8_t op = (e->type == kCGPathElementMoveToPoint) ? 1 : 2;
+        if (e->type == kCGPathElementCloseSubpath) return;
+        [dd appendBytes:&op length:1];
+        if (e->type == kCGPathElementMoveToPoint || e->type == kCGPathElementAddLineToPoint) {
+            [dd appendBytes:&e->points[0] length:16];
+        } else {
+            // curve → last point as line approx
+            int n = (e->type == kCGPathElementAddQuadCurveToPoint) ? 1 : 2;
+            [dd appendBytes:&e->points[n] length:16];
+        }
+    });
 }
 
-// [[NSString alloc] initWithUTF8String:] → +1 owned. Caller CFReleases.
-static uint64_t sb_nsstring_utf8(const char *cstr)
-{
-    if (!cstr) return 0;
-    uint64_t buf = r_alloc_str(cstr);
-    if (!buf) return 0;
-    uint64_t clsNSString = r_class("NSString");
-    uint64_t selAlloc = r_sel("alloc");
-    uint64_t selInit = r_sel("initWithUTF8String:");
-    if (!r_is_objc_ptr(clsNSString) || !selAlloc || !selInit) { r_free(buf); return 0; }
-    uint64_t allocated = r_msg(clsNSString, selAlloc, 0, 0, 0, 0);
-    uint64_t ns = r_is_objc_ptr(allocated)
-                  ? r_msg(allocated, selInit, buf, 0, 0, 0) : 0;
-    r_free(buf); // buf is malloc'd — r_free IS correct here
-    return ns;
+// Replay ops into a remote CGMutablePath
+static void replayOps(uint64_t rp, const uint8_t *ops, size_t len) {
+    size_t i = 0;
+    // collect lines for CGPathAddLines batch
+    double pts[256];
+    int n = 0;
+    while (i < len && n < 254) {
+        uint8_t op = ops[i++];
+        if (i + 16 > len) break;
+        double x, y;
+        memcpy(&x, ops+i, 8); memcpy(&y, ops+i+8, 8);
+        i += 16;
+        if (op == 1) {
+            if (n > 0) {
+                dlsym("CGPathAddLines", rp, 0, (uint64_t)pts, n, 0,0,0,0);
+                n = 0;
+            }
+            dlsym("CGPathMoveToPoint", rp, 0, dbl_bits(x), dbl_bits(y), 0,0,0,0);
+        } else {
+            pts[n*2] = x; pts[n*2+1] = y;
+            n++;
+        }
+    }
+    if (n > 0) dlsym("CGPathAddLines", rp, 0, (uint64_t)pts, n, 0,0,0,0);
 }
 
-// --- public API ---
+static void syncShapeLayer(int idx, CAShapeLayer *local, NSMutableData *ops) {
+    if (idx < 0 || idx >= 16) return;
+    uint64_t remote = g_shape[idx];
+    if (!r_is_objc_ptr(remote) || !local) return;
+
+    // hash: path + lineWidth
+    serializePath(local.path, ops);
+    float lw = (float)local.lineWidth;
+    [ops appendBytes:&lw length:4];
+    uint32_t h = hsh(ops.bytes, ops.length);
+    if (h == g_shapeHash[idx]) return;
+    g_shapeHash[idx] = h;
+
+    // set lineWidth (CGFloat = 8 bytes)
+    double lw64 = local.lineWidth;
+    r_msg2_main_raw(remote, "setLineWidth:", &lw64, 8, NULL,0, NULL,0, NULL,0);
+
+    // rebuild remote path
+    uint64_t old = g_oldPath[idx];
+    if (local.path == nil || CGPathIsEmpty(local.path)) {
+        r_msg2_main(remote, "setPath:", 0, 0,0,0);
+        if (r_is_objc_ptr(old)) { dlsym("CGPathRelease", old,0,0,0,0,0,0,0); g_oldPath[idx] = 0; }
+        return;
+    }
+    uint64_t rp = dlsym("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+    if (!r_is_objc_ptr(rp)) return;
+    replayOps(rp, (const uint8_t *)ops.bytes, ops.length - 4); // exclude lw
+    r_msg2_main(remote, "setPath:", rp, 0,0,0);
+    if (r_is_objc_ptr(old)) dlsym("CGPathRelease", old,0,0,0,0,0,0,0);
+    g_oldPath[idx] = rp;
+}
+
+static void syncTextLayer(int slot, CATextLayer *local) {
+    if (slot < 0 || slot >= SB_MAX_TEXT_SLOTS) return;
+    uint64_t remote = g_text[slot];
+    if (!r_is_objc_ptr(remote) || !local) return;
+
+    NSString *s = local.string;
+    uint32_t h = hsh(s.UTF8String, s.UTF8String ? strlen(s.UTF8String) : 0);
+    if (h == g_textHash[slot]) return;
+    g_textHash[slot] = h;
+
+    // release old NSString
+    if (r_is_objc_ptr(g_oldTextObj[slot])) {
+        dlsym("CFRelease", g_oldTextObj[slot], 0,0,0,0,0,0,0);
+        g_oldTextObj[slot] = 0;
+    }
+    if (!s || s.length == 0) { r_msg2_main(remote, "setString:", 0,0,0,0); return; }
+
+    // create remote NSString
+    uint64_t buf = r_alloc_str(s.UTF8String);
+    if (!buf) return;
+    uint64_t cls = r_class("NSString");
+    uint64_t alloc = r_msg2_main(cls, "alloc", 0,0,0,0);
+    uint64_t ns = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "initWithUTF8String:", buf,0,0,0) : 0;
+    r_free(buf);
+    if (!r_is_objc_ptr(ns)) return;
+    r_msg2_main(remote, "setString:", ns, 0,0,0);
+    g_oldTextObj[slot] = ns;
+}
+
+// ======================== public ========================
 
 int SBoardStartOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
@@ -93,237 +181,167 @@ int SBoardStartOverlay(void) {
 
     if (!g_kexploit_ready) return -1;
 
+    // CRITICAL: default r_settle_us is 50000 (50ms) — every remote call
+    // waits 50ms! Per-frame sync would be ~2fps. Set to 500us (0.5ms).
+    g_sbSettleWas = r_settle_us(500);
+
     NSLog(@"[SBOverlay] init remote call into SpringBoard...");
-
     int rc = init_remote_call_with_first_exception_timeout("SpringBoard", true, 30000);
-    if (rc != 0) {
-        NSLog(@"[SBOverlay] init failed rc=%d", rc);
-        return -1;
+    if (rc != 0) return -1;
+
+    uint64_t pid = do_remote_call_stable(5000, "getpid", 0,0,0,0,0,0,0,0);
+    if (pid == 0) { destroy_remote_call(); return -1; }
+
+    // ---- window ----
+    uint64_t app = r_msg2_main(r_class("UIApplication"), "sharedApplication", 0,0,0,0);
+    if (!r_is_objc_ptr(app)) { destroy_remote_call(); return -1; }
+    uint64_t kw = r_msg2_main(app, "keyWindow", 0,0,0,0);
+    if (!r_is_objc_ptr(kw)) {
+        uint64_t ws = r_msg2_main(app, "windows", 0,0,0,0);
+        uint64_t n = r_is_objc_ptr(ws) ? r_msg2_main(ws, "count", 0,0,0,0) : 0;
+        if (n > 0 && n < 64) kw = r_msg2_main(ws, "objectAtIndex:", 0,0,0,0);
     }
-    NSLog(@"[SBOverlay] remote call channel established");
+    if (!r_is_objc_ptr(kw)) { destroy_remote_call(); return -1; }
+    uint64_t scene = r_msg2_main(kw, "windowScene", 0,0,0,0);
+    if (!r_is_objc_ptr(scene)) { destroy_remote_call(); return -1; }
 
-    uint64_t sbPid = do_remote_call_stable(5000, "getpid", 0,0,0,0,0,0,0,0);
-    NSLog(@"[SBOverlay] SpringBoard pid=0x%llx", sbPid);
-    if (sbPid == 0) {
-        NSLog(@"[SBOverlay] getpid failed — abandoning");
-        destroy_remote_call();
-        return -1;
+    uint64_t clsWin = r_class("UIWindow");
+    uint64_t win = r_msg2_main(r_msg2_main(clsWin, "alloc", 0,0,0,0),
+                               "initWithWindowScene:", scene, 0,0,0);
+    if (!r_is_objc_ptr(win)) { destroy_remote_call(); return -1; }
+
+    double bounds[4] = {0,0,390,844};
+    uint64_t clsScr = r_class("UIScreen");
+    if (r_is_objc_ptr(clsScr)) {
+        r_msg2_main_struct_ret(r_msg2_main(clsScr, "mainScreen", 0,0,0,0),
+                               "bounds", bounds, 32, NULL,0,NULL,0,NULL,0,NULL,0);
     }
-
-    // ---- window from windowScene (NOT initWithFrame — no scene = hidden) ----
-    uint64_t clsApp = r_class("UIApplication");
-    if (!r_is_objc_ptr(clsApp)) { NSLog(@"[SBOverlay] UIApplication missing"); destroy_remote_call(); return -1; }
-    uint64_t app = r_msg2_main(clsApp, "sharedApplication", 0,0,0,0);
-    if (!r_is_objc_ptr(app)) { NSLog(@"[SBOverlay] sharedApplication nil"); destroy_remote_call(); return -1; }
-
-    uint64_t keyWin = r_msg2_main(app, "keyWindow", 0,0,0,0);
-    if (!r_is_objc_ptr(keyWin)) {
-        uint64_t windows = r_msg2_main(app, "windows", 0,0,0,0);
-        uint64_t count = r_is_objc_ptr(windows) ? r_msg2_main(windows, "count", 0,0,0,0) : 0;
-        if (count > 0 && count < 64) keyWin = r_msg2_main(windows, "objectAtIndex:", 0,0,0,0);
-    }
-    if (!r_is_objc_ptr(keyWin)) { NSLog(@"[SBOverlay] keyWindow nil"); destroy_remote_call(); return -1; }
-
-    uint64_t scene = r_msg2_main(keyWin, "windowScene", 0,0,0,0);
-    if (!r_is_objc_ptr(scene)) { NSLog(@"[SBOverlay] windowScene nil"); destroy_remote_call(); return -1; }
-
-    uint64_t clsUIWindow = r_class("UIWindow");
-    uint64_t winAlloc = r_msg2_main(clsUIWindow, "alloc", 0,0,0,0);
-    uint64_t win = r_msg2_main(winAlloc, "initWithWindowScene:", scene, 0,0,0);
-    if (!r_is_objc_ptr(win)) { NSLog(@"[SBOverlay] initWithWindowScene failed"); destroy_remote_call(); return -1; }
-    NSLog(@"[SBOverlay] window=0x%llx", win);
-
-    // Full screen, above everything, passthrough
-    uint64_t clsScreen = r_class("UIScreen");
-    uint64_t screen = r_msg_main(clsScreen, r_sel("mainScreen"), 0,0,0,0);
-    double bounds[4] = { 0, 0, 0, 0 };
-    if (r_is_objc_ptr(screen)) {
-        r_msg2_main_struct_ret(screen, "bounds", bounds, sizeof(bounds), NULL, 0, NULL, 0, NULL, 0, NULL, 0);
-    }
-    if (bounds[2] <= 0 || bounds[3] <= 0) { bounds[2] = 390; bounds[3] = 844; }
-    sb_send_rect_main(win, "setFrame:", 0, 0, bounds[2], bounds[3]);
-    sb_send_double_main(win, "setWindowLevel:", SB_OVERLAY_WIN_LEVEL);
-
-    uint64_t clsColor = r_class("UIColor");
-    if (r_is_objc_ptr(clsColor)) {
-        uint64_t clear = r_msg2_main(clsColor, "clearColor", 0,0,0,0);
-        if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0,0,0);
-    }
-    r_msg2_main(win, "setUserInteractionEnabled:", 0, 0,0,0); // passthrough
+    r_msg2_main_raw(win, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+    double lvl = SB_OVERLAY_WIN_LEVEL;
+    r_msg2_main_raw(win, "setWindowLevel:", &lvl, 8, NULL,0,NULL,0,NULL,0);
+    uint64_t clsCol = r_class("UIColor");
+    uint64_t clear = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "clearColor", 0,0,0,0) : 0;
+    if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0,0,0);
+    r_msg2_main(win, "setUserInteractionEnabled:", 0, 0,0,0);
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
-    // ---- status banner (top) ----
-    uint64_t clsLabel = r_class("UILabel");
-    uint64_t labelAlloc = r_msg2_main(clsLabel, "alloc", 0,0,0,0);
-    uint64_t label = r_msg2_main(labelAlloc, "init", 0,0,0,0);
-    if (!r_is_objc_ptr(label)) { NSLog(@"[SBOverlay] label init failed"); destroy_remote_call(); return -1; }
-    sb_send_rect_main(label, "setFrame:", 0, 0, bounds[2], 60);
-    r_msg2_main(label, "setTag:", SB_OVERLAY_TAG, 0,0,0);
-    r_msg2_main(label, "setNumberOfLines:", 1, 0,0,0);
-    r_msg2_main(label, "setTextAlignment:", 1, 0,0,0); // center
-    uint64_t clsFont = r_class("UIFont");
-    if (r_is_objc_ptr(clsFont)) {
-        double size = 18.0;
-        uint64_t font = r_msg2_main_raw(clsFont, "boldSystemFontOfSize:",
-                                        &size, sizeof(size),
-                                        NULL, 0, NULL, 0, NULL, 0);
-        if (r_is_objc_ptr(font)) r_msg2_main(label, "setFont:", font, 0,0,0);
+    // ---- root UIView (passthrough, clear) ----
+    uint64_t root = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
+                                    "initWithFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+    if (!r_is_objc_ptr(root)) { destroy_remote_call(); return -1; }
+    r_msg2_main(root, "setUserInteractionEnabled:", 0, 0,0,0);
+    if (r_is_objc_ptr(clear)) r_msg2_main(root, "setBackgroundColor:", clear, 0,0,0);
+    g_sbRoot = root;
+
+    // ---- pre-create 16 CAShapeLayers (white stroke, no fill) ----
+    uint64_t white = 0;
+    if (r_is_objc_ptr(clsCol)) {
+        white = r_msg2_main(clsCol, "whiteColor", 0,0,0,0);
+        // CAShapeLayer.setStrokeColor: takes CGColorRef — we need [UIColor CGColor]
+        // r_msg2_main returns the CGColorRef as uint64_t (works via NSInvocation).
+        if (r_is_objc_ptr(white)) white = r_msg2_main(white, "CGColor", 0,0,0,0);
     }
-    if (r_is_objc_ptr(clsColor)) {
-        uint64_t white = r_msg2_main(clsColor, "whiteColor", 0,0,0,0);
-        if (r_is_objc_ptr(white)) r_msg2_main(label, "setTextColor:", white, 0,0,0);
-        uint64_t black = r_msg2_main(clsColor, "blackColor", 0,0,0,0);
-        if (r_is_objc_ptr(black)) r_msg2_main(label, "setBackgroundColor:", black, 0,0,0);
-    }
-    NSString *initText = @"MINHDUC ESP ACTIVE";
-    uint64_t textObj = sb_nsstring_utf8(initText.UTF8String);
-    if (r_is_objc_ptr(textObj)) {
-        r_msg2_main(label, "setText:", textObj, 0,0,0);
-        sb_release_remote_obj(textObj);
+    uint64_t clsShape = r_class("CAShapeLayer");
+    for (int i = 0; i < 16; i++) {
+        uint64_t layer = r_msg2_main(clsShape, "layer", 0,0,0,0);
+        if (!r_is_objc_ptr(layer)) continue;
+        r_msg2_main_raw(layer, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+        r_msg2_main(layer, "setOpaque:", 0, 0,0,0);
+        double z = 10.0 + i;
+        r_msg2_main_raw(layer, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
+        // fixed white stroke, no fill — good enough for ESP
+        if (r_is_objc_ptr(white)) r_msg2_main(layer, "setStrokeColor:", white, 0,0,0);
+        r_msg2_main(layer, "setFillColor:", 0, 0,0,0);
+        r_msg2_main(root, "addSublayer:", layer, 0,0,0);
+        g_shape[i] = layer;
     }
 
-    // ---- fullscreen UIImageView — receives the mirrored ESP frames ----
-    uint64_t clsImgView = r_class("UIImageView");
-    uint64_t ivAlloc = r_msg2_main(clsImgView, "alloc", 0,0,0,0);
-    double full[4] = { 0, 0, bounds[2], bounds[3] };
-    uint64_t imgView = r_msg2_main_raw(ivAlloc, "initWithFrame:",
-                                       &full, sizeof(full),
-                                       NULL, 0, NULL, 0, NULL, 0);
-    if (!r_is_objc_ptr(imgView)) { NSLog(@"[SBOverlay] imageView init failed"); destroy_remote_call(); return -1; }
-    r_msg2_main(imgView, "setContentMode:", 0, 0,0,0); // scaleToFill
-    r_msg2_main(imgView, "setUserInteractionEnabled:", 0, 0,0,0);
+    // ---- pre-create 24 CATextLayers ----
+    uint64_t clsText = r_class("CATextLayer");
+    for (int i = 0; i < SB_MAX_TEXT_SLOTS; i++) {
+        uint64_t tl = r_msg2_main(clsText, "layer", 0,0,0,0);
+        if (!r_is_objc_ptr(tl)) continue;
+        r_msg2_main_raw(tl, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+        r_msg2_main(tl, "setOpaque:", 0, 0,0,0);
+        double z = 200.0 + i;
+        r_msg2_main_raw(tl, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
+        // white foreground, clear background
+        if (r_is_objc_ptr(white)) r_msg2_main(tl, "setForegroundColor:", white, 0,0,0);
+        r_msg2_main(root, "addSublayer:", tl, 0,0,0);
+        g_text[i] = tl;
+    }
 
-    r_msg2_main(win, "addSubview:", label, 0,0,0);
-    r_msg2_main(win, "addSubview:", imgView, 0,0,0);
+    r_msg2_main(win, "addSubview:", root, 0,0,0);
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
-    // ---- retain via associated object ----
-    uint64_t assocKey = r_sel("minhducSBOverlayWindow");
-    if (r_is_objc_ptr(assocKey)) {
-        r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject",
-                     app, assocKey, win, 1, 0, 0, 0, 0);
-    }
+    // retain
+    uint64_t key = r_sel("minhducSBOverlayWindow");
+    if (r_is_objc_ptr(key))
+        dlsym("objc_setAssociatedObject", app, key, win, 1, 0,0,0,0);
 
     pthread_mutex_lock(&g_sbLock);
-    g_sbWindow = win;
-    g_sbLabel = label;
-    g_sbImgView = imgView;
-    g_sbLastText = initText;
+    g_sbWin = win;
     g_sbOverlayOn = YES;
     pthread_mutex_unlock(&g_sbLock);
 
-    NSLog(@"[SBOverlay] SpringBoard overlay window ACTIVE");
+    NSLog(@"[SBOverlay] vector overlay ACTIVE (16 shape + 24 text layers)");
     return 0;
 }
 
-// Mirror one ESP_View frame into the SB-hosted UIImageView (~10fps).
-// Renders the LOCAL view offscreen (CALayer renderInContext works even when
-// our app is backgrounded), JPEG-compresses, uploads, async setImage:.
 void SBRemotePushESPFrame(UIView *espView) {
     pthread_mutex_lock(&g_sbLock);
-    if (!g_sbOverlayOn || !r_is_objc_ptr(g_sbImgView) || !espView) {
-        pthread_mutex_unlock(&g_sbLock);
-        return;
-    }
+    if (!g_sbOverlayOn || !espView) { pthread_mutex_unlock(&g_sbLock); return; }
     pthread_mutex_unlock(&g_sbLock);
 
-    if (++g_sbMirrorCount % 2 != 0) return; // 60fps timer → ~30fps mirror (mượt)
+    if (++g_sbMirrorCount % 3 != 0) return; // 60fps÷3 = 20fps
 
-    CGRect b = espView.bounds;
-    if (b.size.width < 1 || b.size.height < 1) return;
+    static NSMutableData *ops = nil;
+    if (!ops) ops = [NSMutableData dataWithCapacity:8192];
 
-    // Release the temp image from 3 frames ago — its async setImage: ran.
-    uint64_t oldImg = g_sbPending[g_sbPendingIdx];
-    if (r_is_objc_ptr(oldImg)) sb_release_remote_obj(oldImg);
-    g_sbPending[g_sbPendingIdx] = 0;
-
-    // Half-resolution render: ESP boxes/bones don't need retina. This makes
-    // renderInContext ~4x faster and halves the JPEG data to upload.
-    CGFloat scale = [UIScreen mainScreen].scale * 0.5f;
-    CGSize halfSize = CGSizeMake(b.size.width * 0.5f, b.size.height * 0.5f);
-
-    UIGraphicsBeginImageContextWithOptions(halfSize, NO, 1.0f);
-    CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (!ctx) { UIGraphicsEndImageContext(); return; }
-    // Scale the context so the CALayer tree renders into the half-size canvas.
-    CGContextScaleCTM(ctx, 0.5f, 0.5f);
-    [espView.layer renderInContext:ctx];
-    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    if (!img) return;
-
-    // JPEG quality 0.4 — 30fps needs a bit more quality than the 10fps path.
-    NSData *jpg = UIImageJPEGRepresentation(img, 0.4f);
-    if (!jpg || jpg.length == 0) return;
-
-    // 2. Upload JPEG bytes into SpringBoard.
-    uint64_t buf = r_dlsym_call(R_TIMEOUT, "malloc", jpg.length, 0,0,0,0,0,0,0);
-    if (!buf) return;
-    if (!remote_write(buf, jpg.bytes, jpg.length)) {
-        r_dlsym_call(R_TIMEOUT, "free", buf, 0,0,0,0,0,0,0);
-        return;
+    // Sync shape layers
+    for (int i = 0; i < 16; i++) {
+        id val = [espView valueForKey:[NSString stringWithUTF8String:kShapeKeys[i]]];
+        if ([val isKindOfClass:[CAShapeLayer class]])
+            syncShapeLayer(i, val, ops);
     }
 
-    // 3. [NSData dataWithBytes:length:]
-    uint64_t clsNSData = r_class("NSData");
-    uint64_t dalloc = r_msg2_main(clsNSData, "alloc", 0,0,0,0);
-    uint64_t data = r_is_objc_ptr(dalloc)
-                    ? r_msg2_main(dalloc, "initWithBytes:length:", buf, jpg.length, 0, 0) : 0;
-    r_dlsym_call(R_TIMEOUT, "free", buf, 0,0,0,0,0,0,0);
-    if (!r_is_objc_ptr(data)) return;
+    // Sync text: statusLayer + textLayerPool
+    id status = [espView valueForKey:@"statusLayer"];
+    if ([status isKindOfClass:[CATextLayer class]])
+        syncTextLayer(0, status);
 
-    // 4. [UIImage imageWithData:]
-    uint64_t clsUIImage = r_class("UIImage");
-    uint64_t uiImg = r_is_objc_ptr(clsUIImage)
-                     ? r_msg2_main(clsUIImage, "imageWithData:", data, 0,0,0) : 0;
-    sb_release_remote_obj(data);
-    if (!r_is_objc_ptr(uiImg)) return;
-
-    // 5. Async setImage: (fire-and-forget). The invocation retains the
-    //    image; our ring keeps our +1 until 3 frames later.
-    r_msg2_main_async(g_sbImgView, "setImage:", uiImg, 0,0,0);
-    g_sbPending[g_sbPendingIdx] = uiImg;
-    g_sbPendingIdx = (g_sbPendingIdx + 1) % SB_PENDING_CAP;
-}
-
-void SBoardOverlaySetStatus(const char *utf8) {
-    pthread_mutex_lock(&g_sbLock);
-    if (!g_sbOverlayOn || !r_is_objc_ptr(g_sbLabel)) {
-        pthread_mutex_unlock(&g_sbLock);
-        return;
-    }
-    NSString *text = utf8 ? [NSString stringWithUTF8String:utf8] : @"";
-    if ([text isEqualToString:g_sbLastText]) {
-        pthread_mutex_unlock(&g_sbLock);
-        return;
-    }
-    g_sbLastText = [text copy];
-    pthread_mutex_unlock(&g_sbLock);
-
-    uint64_t textObj = sb_nsstring_utf8(text.UTF8String);
-    if (r_is_objc_ptr(textObj)) {
-        r_msg2_main(g_sbLabel, "setText:", textObj, 0,0,0);
-        sb_release_remote_obj(textObj);
+    id pool = [espView valueForKey:@"textLayerPool"];
+    if ([pool isKindOfClass:[NSArray class]]) {
+        int n = (int)[(NSArray *)pool count];
+        if (n > SB_MAX_TEXT_SLOTS - 1) n = SB_MAX_TEXT_SLOTS - 1;
+        for (int i = 0; i < n; i++) {
+            id obj = [(NSArray *)pool objectAtIndex:i];
+            if ([obj isKindOfClass:[CATextLayer class]])
+                syncTextLayer(i + 1, obj);
+        }
     }
 }
+
+void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 
 void SBoardStopOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
     if (!g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return; }
-    if (r_is_objc_ptr(g_sbWindow)) {
-        r_msg2_main(g_sbWindow, "setHidden:", 1, 0,0,0);
+    if (r_is_objc_ptr(g_sbWin)) r_msg2_main(g_sbWin, "setHidden:", 1, 0,0,0);
+    for (int i = 0; i < 16; i++) {
+        if (r_is_objc_ptr(g_oldPath[i])) dlsym("CGPathRelease", g_oldPath[i], 0,0,0,0,0,0,0);
+        g_oldPath[i] = 0;
     }
-    // release any still-retained pending images
-    for (int i = 0; i < SB_PENDING_CAP; i++) {
-        if (r_is_objc_ptr(g_sbPending[i])) sb_release_remote_obj(g_sbPending[i]);
-        g_sbPending[i] = 0;
+    for (int i = 0; i < SB_MAX_TEXT_SLOTS; i++) {
+        if (r_is_objc_ptr(g_oldTextObj[i])) dlsym("CFRelease", g_oldTextObj[i], 0,0,0,0,0,0,0);
+        g_oldTextObj[i] = 0;
     }
-    g_sbPendingIdx = 0;
+    memset(g_shapeHash, 0, sizeof(g_shapeHash));
+    memset(g_textHash, 0, sizeof(g_textHash));
     g_sbOverlayOn = NO;
-    g_sbWindow = 0;
-    g_sbLabel = 0;
-    g_sbImgView = 0;
-    g_sbLastText = nil;
+    g_sbWin = 0;
+    g_sbRoot = 0;
     pthread_mutex_unlock(&g_sbLock);
+    r_settle_us((uint32_t)g_sbSettleWas);
     destroy_remote_call();
 }
