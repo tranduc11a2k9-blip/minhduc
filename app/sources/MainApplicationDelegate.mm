@@ -97,11 +97,10 @@
 }
 
 - (void)applicationWillTerminate:(UIApplication *)application {
-    // Undo the krw socket leak BEFORE the process dies — exiting with
-    // so_usecount bumped astronomically high makes kernel zone teardown
-    // panic → device respring ("reparting"). Restore makes exit clean.
-    // Declared in kexploit_opa334.h (inside extern "C"), imported above.
-    krw_sockets_restore();
+    // Do NOT restore krw sockets — the exploit bumps so_usecount to
+    // astronomically high values so sodealloc never fires. Restoring
+    // (hacking usecount back) triggers sodealloc on the corrupted
+    // socket → kernel panic → device respring. The leak IS the fix.
 }
 
 @end

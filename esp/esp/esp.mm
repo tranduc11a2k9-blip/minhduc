@@ -2622,6 +2622,7 @@ void ESPSyncFromPrefs(void) {
 
 @interface ESP_View ()
 @property (nonatomic, strong) CADisplayLink *displayLink;
+@property (nonatomic, strong) dispatch_source_t frameTimer;
 @property (nonatomic, strong) HTHESPSecureWrapper *secureTextField; 
 @property (nonatomic, strong) UIView *secureCanvas;                  
 
@@ -2742,25 +2743,23 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         
         [self configureRenderingLayers];
 
-        self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updateFrame)];
-
-        // Match display refresh so ESP reprojects every vsync while cam turns.
-        // Low preferred rates make boxes jump/slide then catch up.
-        // 60fps cap: ESP rendering + DSMemory page walks are expensive; 120fps
-        // doubled the per-frame cost (14 CGPath allocs + kernel reads) → lag on A14.
-        // ESP precision at 60fps is identical for box/snap updates.
-        if ([self.displayLink respondsToSelector:@selector(setPreferredFrameRateRange:)]) {
-            self.displayLink.preferredFrameRateRange = CAFrameRateRangeMake(60.0, 60.0, 60.0);
+        // 60fps GCD timer — NOT CADisplayLink. CADisplayLink is paused by
+        // iOS when the app is backgrounded (game in foreground), so ESP froze.
+        // A dispatch_source timer on the main queue keeps firing while the
+        // process is alive (audio KeepAlive), so the overlay keeps rendering
+        // over the game.
+        self.frameTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        if (self.frameTimer) {
+            dispatch_source_set_timer(self.frameTimer,
+                                      dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC),
+                                      16 * NSEC_PER_MSEC,
+                                      2 * NSEC_PER_MSEC);
+            __weak ESP_View *wself = self;
+            dispatch_source_set_event_handler(self.frameTimer, ^{
+                [wself updateFrame];
+            });
+            dispatch_resume(self.frameTimer);
         }
-        // 60 = cap on older APIs too (0 = native = 120 on ProMotion → lag).
-        self.displayLink.preferredFramesPerSecond = 60;
-
-        [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-
-        // NOTE: do NOT pause on background — the overlay must keep rendering
-        // while the game (Free Fire) is in the foreground and MINHDUC is
-        // backgrounded. KeepAlive (audio) keeps us alive; pausing here would
-        // freeze the ESP over the game.
     }
     return self;
 }
