@@ -18,7 +18,9 @@
 #import <pthread.h>
 #import <string.h>
 
-#define SB_OVERLAY_WIN_LEVEL 10000000.0
+// Cyanide's statbar level (999999) — proven safe. 10,000,000 + makeKeyAndVisible
+// crashed SpringBoard → respring right after overlay init. Still above every app.
+#define SB_OVERLAY_WIN_LEVEL 999999.0
 
 static BOOL g_sbOverlayOn = NO;
 static uint64_t g_sbWin = 0;
@@ -124,7 +126,7 @@ int SBoardStartOverlay(void) {
 
     if (!g_kexploit_ready) return -1;
 
-    g_sbSettleWas = r_settle_us(500); // 0.5ms per call (was 50ms → lag)
+    g_sbSettleWas = r_settle_us(5000); // 5ms per call — 10x faster than default 50ms, safe
 
     NSLog(@"[SBOverlay] init remote call into SpringBoard (15s timeout)...");
     // 15s: the MIG exception handshake with a busy SpringBoard can take >5s.
@@ -221,10 +223,10 @@ int SBoardStartOverlay(void) {
     uint64_t containerLayer = r_msg2_main(container, "layer", 0,0,0,0);
     if (r_is_objc_ptr(containerLayer)) r_msg2_main(containerLayer, "addSublayer:", shape, 0,0,0);
 
-    // container onto window — the KEY: window with a UIView subview composites
+    // container onto window — setHidden:NO is enough; makeKeyAndVisible on a
+    // 999999-level window changed SB's key window → crash → respring.
     r_msg2_main(win, "addSubview:", container, 0,0,0);
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
-    r_msg2_main(win, "makeKeyAndVisible", 0, 0,0,0);
     g_sbShape = shape;
 
     // retain
