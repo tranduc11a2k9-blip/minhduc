@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Escape sandbox by rewriting sandbox extension data in kernel memory.
 // Walk: proc_ro -> ucred -> cr_label -> sandbox -> ext_set -> ext_table -> ext -> data
 int sandbox_escape(uint64_t self_proc);
@@ -10,5 +14,9 @@ int sandbox_escape(uint64_t self_proc);
 // Elevate to uid=0 by swapping our p_ucred pointer with launchd's.
 // Fixes UNIX DAC (owner/mode) checks so chmod/chown/writes to root-owned
 int sandbox_elevate_to_root(uint64_t self_proc);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

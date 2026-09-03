@@ -58,7 +58,8 @@ extern "C" {
 
 extern int GetGameProcesspid(char *name);
 
-// Forward for cross-TU clearer (defined in espdraw.mm)
+// Cross-TU clearer for the pro (isESP fast) box smoother — defined below
+// next to ClearBoxScreenForPawn (same g_boxScr table the pro path uses).
 void ClearProBoxScreenForPawn(uint64_t pawn);
 
 
@@ -1819,6 +1820,13 @@ static inline void ClearBoxScreenForPawn(uint64_t pawn) {
     if (pawn == 0) return;
     BoxScreenTrack &t = g_boxScr[pawn % 96ull];
     if (t.pawn == pawn) t = BoxScreenTrack{};
+}
+
+// Pro (isESP fast) path uses the SAME g_boxScr smoother as the Lite path.
+// Clears this pawn's entry when it dies/despawns so stale box size never
+// bleeds to a new occupant of the same slot.
+void ClearProBoxScreenForPawn(uint64_t pawn) {
+    ClearBoxScreenForPawn(pawn);
 }
 
 // Pick stable source. Real players: network root XZ + head Y under hard move.

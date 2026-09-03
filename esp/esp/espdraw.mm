@@ -9,6 +9,14 @@
 // Khai báo biến chứa mảng ảnh Súng từ WeaponTextures.mm
 extern NSMutableDictionary *gWeaponTextures;
 
+// NOTE: templates (ReadAddr<T>) and C++ types (Vector3) CANNOT be inside
+// extern "C" — so the imports stay above; only the ESP entry points that
+// esp.h declares with C linkage get wrapped below.
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 static inline float Clamp01f(float v) {
     if (v < 0.0f) return 0.0f;
     if (v > 1.0f) return 1.0f;
@@ -16,7 +24,7 @@ static inline float Clamp01f(float v) {
 }
 
 // ==========================================
-// TỐI ƯU HÓA BỘ NHỚ FONT 
+// TỐI ƯU HÓA BỘ NHỚ FONT
 // ==========================================
 static UIFont *cachedFonts[40] = {nil};
 
@@ -59,7 +67,7 @@ BOOL RenderFOVCirclePath(
 void RenderTotalEnemyCount(ESPAddTextCallback textCallback, void *callbackContext, int totalCount, float layerWidth) {
     if (!textCallback || totalCount < 0) return;
     NSString *countStr = [NSString stringWithFormat:@"%d", totalCount];
-    
+
     // [FIX LAG]: Bỏ tính toán size font, cấp khung rộng và ép tự căn giữa (NO)
     textCallback(callbackContext, countStr, CGRectMake((layerWidth / 2.0f) - 50.0f, 45.0f, 100.0f, 35.0f), [UIColor redColor], 26.0f, NO);
 }
@@ -70,10 +78,10 @@ void RenderTotalEnemyCount(ESPAddTextCallback textCallback, void *callbackContex
 uint32_t CurrentWeaponID(uint64_t PawnObject) {
     if (!isVaildPtr(PawnObject)) return UINT32_MAX;
 
-    uint32_t weaponID = ReadAddr<uint32_t>(PawnObject + 0x13C); 
+    uint32_t weaponID = ReadAddr<uint32_t>(PawnObject + 0x13C);
     if (weaponID == 0) return 1; // Fallback về 1 (Tay không)
-    
-    return weaponID; 
+
+    return weaponID;
 }
 
 // ==========================================
@@ -107,10 +115,13 @@ NSString* WeaponNameForPlayerNS(uint64_t PawnObject) {
     }
 }
 
-// ==========================================
-// HÀM VẼ ESP CHÍNH
-// ==========================================
-void RenderESPForPawn(
+// ============================================================
+// CORE RENDER — dùng chung cho cả slow path (RenderESPForPawn)
+// và fast path (RenderESPForPawnEx). Nhận sẵn head/hip/bot/knocked
+// từ caller để fast path khỏi đọc lại memory (tránh double reads
+// trong trận đông người). Bones/chân vẫn được đọc từ PawnObject.
+// ============================================================
+static void ESPRenderPawnCore(
     ESPGeometryBuffers *buffers,
     ESPAddTextCallback textCallback,
     ESPAddImageCallback imageCallback,
@@ -122,32 +133,34 @@ void RenderESPForPawn(
     float layerWidth,
     float layerHeight,
     float matrixVpWidth,
-    float matrixVpHeight
+    float matrixVpHeight,
+    float headX, float headY, float headZ,
+    float hipX, float hipY, float hipZ,
+    int isBotFlag,
+    int isKnockedFlag
 ) {
     if (dis > 400.0f || !buffers || !matrix || !PawnObject || dis < 1.0f) return;
+    if (headX == 0.0f && headY == 0.0f && headZ == 0.0f) return;
 
     int MaxHP = get_MaxHP(PawnObject);
-    if (MaxHP <= 0 || MaxHP > 300) return; 
+    if (MaxHP <= 0 || MaxHP > 300) return;
 
-    bool isKnocked = get_IsKnockedDown(PawnObject);
-    bool isBot = get_IsBot(PawnObject);
+    const bool isKnocked = (isKnockedFlag != 0);
+    const bool isBot = (isBotFlag != 0);
     NSString *Name = GetNickName(PawnObject);
-    
     if (!isBot && (!Name || Name.length == 0)) return;
 
-    Vector3 HeadPos      = getPositionExt(getHead(PawnObject));
-    Vector3 RightToePos  = getPositionExt(getRightToeNode(PawnObject));
+    Vector3 HeadPos; HeadPos.x = headX; HeadPos.y = headY; HeadPos.z = headZ;
+    Vector3 HipPos;  HipPos.x = hipX;  HipPos.y = hipY;  HipPos.z = hipZ;
+    Vector3 RightToePos = getPositionExt(getRightToeNode(PawnObject));
     // [FIX BOX LÙN KHI CHẠY]: Lấy thêm chân trái để so sánh
-    Vector3 LeftToePos   = getPositionExt(getLeftAnkle(PawnObject));
-    
-    if (HeadPos.x == 0.0f && HeadPos.y == 0.0f && HeadPos.z == 0.0f) return;
+    Vector3 LeftToePos  = getPositionExt(getLeftAnkle(PawnObject));
 
     float worldHeight = fabsf(HeadPos.y - RightToePos.y);
-    
-    // [FIX 0 HP & KNOCKED]: Không ẩn ESP nếu đang gục hoặc vừa chết
-    if (!isKnocked && CurHP > 0 && (worldHeight < 0.2f || worldHeight > 4.0f)) return; 
 
-    Vector3 HipPos       = getPositionExt(getHip(PawnObject));
+    // [FIX 0 HP & KNOCKED]: Không ẩn ESP nếu đang gục hoặc vừa chết
+    if (!isKnocked && CurHP > 0 && (worldHeight < 0.2f || worldHeight > 4.0f)) return;
+
     Vector3 L_Ankle      = getPositionExt(getLeftAnkle(PawnObject));
     Vector3 R_Ankle      = getPositionExt(getRightAnkle(PawnObject));
     Vector3 L_ForeArm    = getPositionExt(getLeftElbow(PawnObject));
@@ -170,16 +183,16 @@ void RenderESPForPawn(
     // ==========================================
     float top = w2sHead.y;
     // Chân nào chạm đất sâu nhất thì lấy chân đó làm đáy Box
-    float bottom = fmaxf(w2sToe.y, w2sLeftToe.y); 
+    float bottom = fmaxf(w2sToe.y, w2sLeftToe.y);
     if (top > bottom) { float temp = top; top = bottom; bottom = temp; }
-    
+
     float screenRealHeight = bottom - top;
 
     Vector3 fakeBasePos = HeadPos;
-    fakeBasePos.y -= 1.65f; 
+    fakeBasePos.y -= 1.65f;
     Vector3 w2sFakeBase = WorldToScreenLayer(fakeBasePos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
-    float stdHeight = fabsf(w2sHead.y - w2sFakeBase.y); 
-    
+    float stdHeight = fabsf(w2sHead.y - w2sFakeBase.y);
+
     float boxHeight, boxWidth, x, y;
 
     if (isKnocked || CurHP <= 0 || worldHeight < 0.7f) {
@@ -209,7 +222,7 @@ void RenderESPForPawn(
     float centerX = x + boxWidth * 0.5f;
 
     // ---------------------------------------------------------
-    // BONE 
+    // BONE
     // ---------------------------------------------------------
     if (isBone) {
         Vector3 wHead   = WorldToScreenLayer(HeadPos,   matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
@@ -253,9 +266,9 @@ void RenderESPForPawn(
     // WEAPON
     // ---------------------------------------------------------
     if (isWeapon) {
-        float wCX = centerX + 8.5f; 
+        float wCX = centerX + 8.5f;
         float wTY = y - 20.0f;
-        uint32_t wid = CurrentWeaponID(PawnObject); 
+        uint32_t wid = CurrentWeaponID(PawnObject);
 
         UIImage *wimg = (wid != UINT32_MAX && gWeaponTextures) ? gWeaponTextures[@(wid)] : nil;
         const float wIconH = 14.0f;
@@ -274,12 +287,12 @@ void RenderESPForPawn(
     }
 
     // ---------------------------------------------------------
-    // LINE 
+    // LINE
     // ---------------------------------------------------------
     if (isLine) {
-        CGPoint lineStart = CGPointMake(layerWidth / 2.0f, 35.0f); 
+        CGPoint lineStart = CGPointMake(layerWidth / 2.0f, 35.0f);
         CGPoint boxTopCenter = CGPointMake(centerX, y);
-        
+
         if (isKnocked) { ESPAddLine(buffers->snaplineKnockedPath, lineStart, boxTopCenter); buffers->snaplineKnockedDirty = true; }
         else if (isBot) { ESPAddLine(buffers->snaplineBotPath, lineStart, boxTopCenter); buffers->snaplineBotDirty = true; }
         else { ESPAddLine(buffers->snaplinePath, lineStart, boxTopCenter); buffers->snaplineDirty = true; }
@@ -307,7 +320,7 @@ void RenderESPForPawn(
     }
 
     // ---------------------------------------------------------
-    // DISTANCE 
+    // DISTANCE
     // ---------------------------------------------------------
     if (isDis && textCallback) {
         NSString *distString = [NSString stringWithFormat:NSSENCRYPT("[%dM]"), (int)dis];
@@ -320,9 +333,9 @@ void RenderESPForPawn(
     // ---------------------------------------------------------
     if (isHealth) {
         float healthRatio = Clamp01f((float)CurHP / (float)fmaxf(MaxHP, 1.0f));
-        const CGFloat barWidth = 2.0f; 
-        
-        CGFloat barX = x - barWidth - 1.0f; 
+        const CGFloat barWidth = 2.0f;
+
+        CGFloat barX = x - barWidth - 1.0f;
         CGFloat barHeight = boxHeight;
         CGFloat filledTop = y + barHeight - (barHeight * healthRatio);
 
@@ -333,9 +346,77 @@ void RenderESPForPawn(
         } else if (CurHP >= 75) {
             CGPathAddRect(buffers->hpFillOrangePath, NULL, fillRect);
             buffers->hpFillOrangeDirty = true;
-        } else if (CurHP > 0) { 
+        } else if (CurHP > 0) {
             CGPathAddRect(buffers->hpFillRedPath, NULL, fillRect);
             buffers->hpFillRedDirty = true;
         }
     }
 }
+
+// ==========================================
+// HÀM VẼ ESP — SLOW PATH
+// Đọc lại head/hip/bot/knocked từ PawnObject mỗi frame
+// ==========================================
+void RenderESPForPawn(
+    ESPGeometryBuffers *buffers,
+    ESPAddTextCallback textCallback,
+    ESPAddImageCallback imageCallback,
+    void *callbackContext,
+    uint64_t PawnObject,
+    int CurHP,
+    float dis,
+    float *matrix,
+    float layerWidth,
+    float layerHeight,
+    float matrixVpWidth,
+    float matrixVpHeight
+) {
+    if (dis > 400.0f || !buffers || !matrix || !PawnObject || dis < 1.0f) return;
+
+    bool isKnocked = get_IsKnockedDown(PawnObject);
+    bool isBot = get_IsBot(PawnObject);
+    Vector3 head = getPositionExt(getHead(PawnObject));
+    Vector3 hip  = getPositionExt(getHip(PawnObject));
+
+    ESPRenderPawnCore(buffers, textCallback, imageCallback, callbackContext,
+                      PawnObject, CurHP, dis, matrix,
+                      layerWidth, layerHeight, matrixVpWidth, matrixVpHeight,
+                      head.x, head.y, head.z,
+                      hip.x, hip.y, hip.z,
+                      isBot ? 1 : 0, isKnocked ? 1 : 0);
+}
+
+// ==========================================
+// HÀM VẼ ESP — FAST PATH
+// Caller (updateFrame) đã đọc sẵn head/hip/bot/knocked trong snapshot
+// (tránh double memory reads khi trận đông người)
+// ==========================================
+void RenderESPForPawnEx(
+    ESPGeometryBuffers *buffers,
+    ESPAddTextCallback textCallback,
+    ESPAddImageCallback imageCallback,
+    void *callbackContext,
+    uint64_t PawnObject,
+    int CurHP,
+    float dis,
+    float *matrix,
+    float layerWidth,
+    float layerHeight,
+    float matrixVpWidth,
+    float matrixVpHeight,
+    float headX, float headY, float headZ,
+    float hipX, float hipY, float hipZ,
+    int isBotFlag,
+    int isKnockedFlag
+) {
+    ESPRenderPawnCore(buffers, textCallback, imageCallback, callbackContext,
+                      PawnObject, CurHP, dis, matrix,
+                      layerWidth, layerHeight, matrixVpWidth, matrixVpHeight,
+                      headX, headY, headZ,
+                      hipX, hipY, hipZ,
+                      isBotFlag, isKnockedFlag);
+}
+
+#ifdef __cplusplus
+}
+#endif
