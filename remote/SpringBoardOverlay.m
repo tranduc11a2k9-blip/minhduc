@@ -258,6 +258,23 @@ int SBoardStartOverlay(void) {
         r_msg2_main(container, "addSubview:", label, 0,0,0);
     }
 
+    // ---- SELF-TEST #2: plain UIView with a RED background ----
+    // If this red bar shows (next to the banner) but the V does not, then
+    // plain UIViews render while CAShapeLayers don't → the ESP mirror must
+    // use rect-views (line = thin colored view) instead of shape layers.
+    {
+        uint64_t redUIColor = r_msg2_main(clsCol, "redColor", 0,0,0,0);
+        uint64_t rectView = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
+                                            "initWithFrame:", (double[4]){20.0, 70.0, 120.0, 8.0}, 32,
+                                            NULL,0,NULL,0,NULL,0);
+        if (r_is_objc_ptr(rectView)) {
+            if (r_is_objc_ptr(redUIColor)) r_msg2_main(rectView, "setBackgroundColor:", redUIColor, 0,0,0);
+            r_msg2_main(rectView, "setUserInteractionEnabled:", 0, 0,0,0);
+            r_msg2_main(container, "addSubview:", rectView, 0,0,0);
+            NSLog(@"[SBOverlay] SELF-TEST red bar added (expect a red strip under the banner)");
+        }
+    }
+
     // shape layer onto a DEDICATED canvas UIView's layer (Fl0rk DrawView
     // pattern: _gDrawViewCanvas). A CAShapeLayer added directly to a
     // container's layer did NOT composite in SB window hosting — wrapping
