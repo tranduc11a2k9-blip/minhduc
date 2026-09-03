@@ -31,6 +31,12 @@ static int g_sbSettleWas = 50000;
 static int g_sbMirrorCount = 0;
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
 
+// Per-SB-session mirror state (forward declarations — SBoardStartOverlay
+// resets these at the end of init; definitions live below).
+static uint64_t g_sbPersistentPath = 0;
+static uint64_t g_sbMirrorPtsBuf = 0;
+static void sb_reset_mirror_state(void);
+
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
     "boneLayer", "boneBotLayer", "boneKnockedLayer",
@@ -262,11 +268,6 @@ int SBoardStartOverlay(void) {
 // Persistent remote path — created ONCE per SB session, emptied per sync
 // (CGPathClear), never destroyed. Fl0rk DrawView pattern. Invalidated on
 // every SBoardStartOverlay (new SB process = new address space).
-static uint64_t g_sbPersistentPath = 0;
-
-// Forward — resets per-session mirror caches (called from SBoardStartOverlay).
-static void sb_reset_mirror_state(void);
-static uint64_t g_sbMirrorPtsBuf = 0; // persistent point buffer per SB session
 
 static uint64_t persistentPath(void) {
     if (r_is_objc_ptr(g_sbPersistentPath)) return g_sbPersistentPath;
