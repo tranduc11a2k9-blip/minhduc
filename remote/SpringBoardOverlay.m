@@ -263,7 +263,11 @@ static uint64_t persistentPath(void) {
 
 void SBRemotePushESPFrame(UIView *espView) {
     if (!g_sbOverlayOn || !espView) return;
-    if (++g_sbMirrorCount % 3 != 0) return; // 60fps / 3 = 20fps
+    // 60fps / 6 = ~10fps mirror. The 20fps rate crashed SpringBoard's
+    // main thread (NSInvocation retain race on the performSelector path —
+    // crash thread 32286: dead in objc retain inside NSInvocation setup).
+    // 10fps keeps ESP readable and the remote channel calm.
+    if (++g_sbMirrorCount % 6 != 0) return;
     uint64_t rp = persistentPath();
     if (!r_is_objc_ptr(rp)) return;
 

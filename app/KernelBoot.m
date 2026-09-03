@@ -15,6 +15,7 @@
 
 #import "KernelBoot.h"
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 #import <sys/time.h>
 #import <sys/sysctl.h>
 #import <unistd.h>
@@ -123,25 +124,34 @@ void kernelBootStart(void) {
         L(@"RUN 5/6 Preparing SpringBoard session");
         L(@"OK SpringBoard session pending (background).");
 
-        L(@"RUN 6/6 Starting ESP overlay");
-        // In-app overlay starts NOW (instant, safe). SB overlay replaces it
-        // later when its session establishes.
-        extern int StartDirectOverlay(void);
-        int dret = StartDirectOverlay();
-        L(dret == 0 ? @"OK DirectOverlay active (SB loading in bg)."
-                    : @"WARN StartDirectOverlay returned %d", dret);
-
-        L(@"RUN 6/6 Starting ESP overlay");
-        if (!(sbDone && sbret == 0)) {
+        L(@"RUN 6/6 Starting ESP renderer (offscreen data source)");
+        // ESP_View runs OFFSCREEN (no visible window): it reads the game via
+        // DSMemory at 60fps and mirrors its layers to the SpringBoard window
+        // via SBRemotePushESPFrame. NO DirectOverlay — all drawing goes to
+        // the SB window which renders above every app.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // Keep a strong ref forever — the view drives the ESP data loop.
+            static UIView *s_espSource = nil;
+            s_espSource = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
+            // Build the real ESP_View inside an hidden host window so its
+            // CADisplayLink/GCD timer runs and layers exist for the mirror.
             extern int StartDirectOverlay(void);
-            int dret = StartDirectOverlay();
-            L(dret == 0 ? @"OK DirectOverlay active."
-                        : @"WARN StartDirectOverlay returned %d", dret);
-        }
-        g_ready = YES;
-        g_booting = NO;
-        L(@"OK ESP overlay active.");
-        L(@"DONE ESP overlay active in-session.");
+            StartDirectOverlay();
+            // Hide the in-app window right after creation — it exists only
+            // as the data-source host; nothing visible stays in-app.
+        });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // After StartDirectOverlay creates the window, hide it.
+            Class hudWinCls = objc_getClass("HUDMainWindow");
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if ([w isKindOfClass:hudWinCls]) {
+                    w.alpha = 0.0;      // invisible but layer tree still renders
+                    w.hidden = NO;      // must stay "shown" for layout/timers
+                    w.userInteractionEnabled = NO;
+                }
+            }
+        });
+        L(@"OK ESP data source active (mirroring to SpringBoard).");
     });
 }
 
