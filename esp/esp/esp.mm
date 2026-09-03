@@ -3102,7 +3102,6 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
 
 
-{
         if (showVisuals && stats.aimAssistPath) {
             MenuViewApplyPath(self.aimAssistLayer, stats.aimAssistPath, YES);
             CGPathRelease(stats.aimAssistPath);
