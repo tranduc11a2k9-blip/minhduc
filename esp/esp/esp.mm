@@ -2723,7 +2723,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         s_lastDiagE = nowE; \
         kernel_boot_log_fn logFnE = kernelBootLog; \
         if (logFnE) { \
-            NSString *lineE = [NSString stringWithFormat:@"[diag] stop: %@", @(reason)]; \
+            NSString *lineE = [NSString stringWithFormat:@"[diag] stop: %@", reason]; \
             dispatch_async(dispatch_get_main_queue(), ^{ logFnE(lineE); }); \
         } \
     } \
