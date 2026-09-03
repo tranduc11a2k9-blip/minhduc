@@ -41,10 +41,14 @@ void kernelBootStart(void) {
     if (g_ready) {
         L(@"OK Already booted — starting overlay directly.");
         [[KeepAlive shared] start];
-        if (SBoardStartOverlay() != 0) {
-            extern int StartDirectOverlay(void);
-            StartDirectOverlay();
-        }
+        // MUST be off main thread — SBoardStartOverlay blocks up to 10s on
+        // the remote-call init; on main this froze the whole app ("đơ lag").
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (SBoardStartOverlay() != 0) {
+                extern int StartDirectOverlay(void);
+                StartDirectOverlay();
+            }
+        });
         return;
     }
 
@@ -58,10 +62,12 @@ void kernelBootStart(void) {
             L(@"OK Parked state found — skipping exploit, starting overlay.");
             g_ready = YES;
             [[KeepAlive shared] start];
-            if (SBoardStartOverlay() != 0) {
-                extern int StartDirectOverlay(void);
-                StartDirectOverlay();
-            }
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                if (SBoardStartOverlay() != 0) {
+                    extern int StartDirectOverlay(void);
+                    StartDirectOverlay();
+                }
+            });
             return;
         }
     }

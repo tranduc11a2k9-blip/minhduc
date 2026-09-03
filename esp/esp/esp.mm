@@ -2751,13 +2751,36 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
         // Match display refresh so ESP reprojects every vsync while cam turns.
         // Low preferred rates make boxes jump/slide then catch up.
+        // 60fps cap: ESP rendering + DSMemory page walks are expensive; 120fps
+        // doubled the per-frame cost (14 CGPath allocs + kernel reads) → lag on A14.
+        // ESP precision at 60fps is identical for box/snap updates.
         if ([self.displayLink respondsToSelector:@selector(setPreferredFrameRateRange:)]) {
-            self.displayLink.preferredFrameRateRange = CAFrameRateRangeMake(60.0, 120.0, 120.0);
+            self.displayLink.preferredFrameRateRange = CAFrameRateRangeMake(60.0, 60.0, 60.0);
         }
-        // 0 = native display rate on older APIs.
-        self.displayLink.preferredFramesPerSecond = 0;
+        // 60 = cap on older APIs too (0 = native = 120 on ProMotion → lag).
+        self.displayLink.preferredFramesPerSecond = 60;
 
         [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+        // Pause rendering while backgrounded — 60fps + kernel page walks in
+        // background burns CPU → iOS kills the app ("out app"). Resume on foreground.
+        __weak ESP_View *wself = self;
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *n) {
+            (void)n;
+            ESP_View *sself = wself;
+            if (sself) sself.displayLink.paused = YES;
+        }];
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *n) {
+            (void)n;
+            ESP_View *sself = wself;
+            if (sself) sself.displayLink.paused = NO;
+        }];
     }
     return self;
 }
