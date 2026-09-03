@@ -95,11 +95,15 @@ static void serializePath(CGPathRef p, NSMutableData *d) {
     CGPathApply(p, &ctx, pathSerFunc);
 }
 
-// Replay ops into a remote CGMutablePath
+// Replay ops into a remote CGMutablePath.
+// CRITICAL: points array must be allocated in SpringBoard's address space
+// (remote malloc). Passing a local stack pointer crashes SpringBoard.
 static void replayOps(uint64_t rp, const uint8_t *ops, size_t len) {
     size_t i = 0;
-    // collect lines for CGPathAddLines batch
-    double pts[256];
+    // Allocate remote buffer for batch points (max 256 points = 4096 bytes)
+    uint64_t remotePts = dlsym("malloc", 4096, 0,0,0,0,0,0,0);
+    if (!r_is_objc_ptr(remotePts)) return;
+    double localPts[256];
     int n = 0;
     while (i < len && n < 254) {
         uint8_t op = ops[i++];
@@ -109,16 +113,22 @@ static void replayOps(uint64_t rp, const uint8_t *ops, size_t len) {
         i += 16;
         if (op == 1) {
             if (n > 0) {
-                dlsym("CGPathAddLines", rp, 0, (uint64_t)pts, n, 0,0,0,0);
+                // write batch to remote buffer, then call CGPathAddLines
+                remote_write(remotePts, localPts, n * 16);
+                dlsym("CGPathAddLines", rp, 0, remotePts, n, 0,0,0,0);
                 n = 0;
             }
             dlsym("CGPathMoveToPoint", rp, 0, dbl_bits(x), dbl_bits(y), 0,0,0,0);
         } else {
-            pts[n*2] = x; pts[n*2+1] = y;
+            localPts[n*2] = x; localPts[n*2+1] = y;
             n++;
         }
     }
-    if (n > 0) dlsym("CGPathAddLines", rp, 0, (uint64_t)pts, n, 0,0,0,0);
+    if (n > 0) {
+        remote_write(remotePts, localPts, n * 16);
+        dlsym("CGPathAddLines", rp, 0, remotePts, n, 0,0,0,0);
+    }
+    dlsym("free", remotePts, 0,0,0,0,0,0,0);
 }
 
 static void syncShapeLayer(int idx, CAShapeLayer *local, NSMutableData *ops) {
