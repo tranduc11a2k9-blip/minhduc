@@ -1342,7 +1342,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         printf("[VPHONE-BRIDGE] SpringBoard bridge unavailable; falling back to KRW RemoteCall\n");
     }
 
-    if (!kexploit_krw_ready()) {
+    if (!g_kexploit_ready) {
         printf("[%s:%d] KRW unavailable; refusing RemoteCall init for %s\n",
                __FUNCTION__, __LINE__, process);
         remote_call_note_init_failure(RemoteCallInitFailureKRWUnavailable, 0);
@@ -1814,7 +1814,7 @@ int init_remote_call_original_thread_only_with_first_exception_timeout(const cha
     if (!self)
         return nil;
 
-    memset(&_state, 0, sizeof(_state));
+    memset((void *)&_state, 0, sizeof(_state));
     _state.success = true;
     _state.threadList = [NSMutableArray new];
     _state.firstExceptionTimeoutMS = firstExceptionTimeoutMS > 0 ? firstExceptionTimeoutMS : 120000;
