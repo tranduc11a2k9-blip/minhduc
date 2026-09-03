@@ -3,6 +3,7 @@
 #import "offset.h"
 #import "GameOffsets.h"
 #import "../DSMemory.h"
+#import "../../remote/SpringBoardOverlay.h" // SBRemotePushESPFrame (extern "C")
 
 #import "GameLogic.h" 
 #import <QuartzCore/QuartzCore.h>
@@ -3179,8 +3180,8 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         [CATransaction commit];
 
         // Mirror this frame to the SpringBoard-hosted overlay (if active).
-        // weak_import: no-op when SpringBoardOverlay isn't linked.
-        extern void SBRemotePushESPFrame(UIView *espView) __attribute__((weak_import));
+        // Declared in SpringBoardOverlay.h (inside extern "C").
+        extern void SBRemotePushESPFrame(UIView *espView);
         if (SBRemotePushESPFrame) SBRemotePushESPFrame(self);
     }
 }
