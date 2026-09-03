@@ -237,16 +237,23 @@ void SBRemotePushESPFrame(UIView *espView) {
     if (r_is_objc_ptr(oldImg)) sb_release_remote_obj(oldImg);
     g_sbPending[g_sbPendingIdx] = 0;
 
-    // 1. Offscreen render of the ESP_View layer tree (no render server).
-    UIGraphicsBeginImageContextWithOptions(b.size, NO, [UIScreen mainScreen].scale);
+    // Half-resolution render: ESP boxes/bones don't need retina. This makes
+    // renderInContext ~4x faster and halves the JPEG data to upload.
+    CGFloat scale = [UIScreen mainScreen].scale * 0.5f;
+    CGSize halfSize = CGSizeMake(b.size.width * 0.5f, b.size.height * 0.5f);
+
+    UIGraphicsBeginImageContextWithOptions(halfSize, NO, 1.0f);
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) { UIGraphicsEndImageContext(); return; }
+    // Scale the context so the CALayer tree renders into the half-size canvas.
+    CGContextScaleCTM(ctx, 0.5f, 0.5f);
     [espView.layer renderInContext:ctx];
     UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     if (!img) return;
 
-    NSData *jpg = UIImageJPEGRepresentation(img, 0.5f);
+    // Lower JPEG quality (0.3) — ESP lines are sharp enough at this setting.
+    NSData *jpg = UIImageJPEGRepresentation(img, 0.3f);
     if (!jpg || jpg.length == 0) return;
 
     // 2. Upload JPEG bytes into SpringBoard.
