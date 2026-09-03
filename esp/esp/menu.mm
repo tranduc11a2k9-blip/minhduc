@@ -1,4 +1,5 @@
 #import "menu.h"
+#import "ModMenuViewController.h"
 #import "icons.h"
 
 #import "ESPPrefs.h"
