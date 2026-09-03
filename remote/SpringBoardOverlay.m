@@ -1,6 +1,6 @@
 //
 //  SpringBoardOverlay.m — Fl0rk-style SpringBoard overlay
-//  Uses cyanide's init_remote_call_with_first_exception_timeout (avoids hang)
+//  Uses init_remote_call_with_first_exception_timeout (avoids hang/watchdog)
 //  + remote_objc to create a UIWindow inside SpringBoard's own process.
 //  Renders on top of EVERY app, no entitlement needed.
 //
@@ -10,6 +10,8 @@
 #import "../../kexploit/kexploit_opa334.h"
 #import "../../kexploit/kutils.h"
 #import <UIKit/UIKit.h>
+#import <pthread.h>
+#import <string.h>
 
 static BOOL g_sbOverlayOn = NO;
 
@@ -17,7 +19,7 @@ int SBoardStartOverlay(void) {
     if (g_sbOverlayOn) return 0;
     if (!g_kexploit_ready) return -1;
 
-    NSLog(@"[SBOverlay] init remote call into SpringBoard (timeout-safe)...");
+    NSLog(@"[SBOverlay] init remote call into SpringBoard (30s timeout)...");
 
     // 30s first-exception timeout — if SpringBoard doesn't respond, abandon
     // instead of hanging the whole device (this was the watchdog panic cause).
@@ -42,7 +44,6 @@ int SBoardStartOverlay(void) {
     uint64_t clsUIWindow  = r_class("UIWindow");
     uint64_t clsUIScreen  = r_class("UIScreen");
     uint64_t selMainScreen = r_sel("mainScreen");
-    uint64_t selBounds    = r_sel("bounds");
     uint64_t selAlloc     = r_sel("alloc");
     uint64_t selInitWithFrame = r_sel("initWithFrame:");
     uint64_t selSetWindowLevel = r_sel("setWindowLevel:");
