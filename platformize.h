@@ -9,8 +9,16 @@
 
 #import <Foundation/Foundation.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Returns 0 on success. Call AFTER sandbox_elevate_to_root() succeeded
 // (we need to write launchd's slot into ours).
 int platformize_self(uint64_t self_proc);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* platformize_h */

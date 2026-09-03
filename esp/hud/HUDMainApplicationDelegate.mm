@@ -18,6 +18,7 @@
 #import "../../kexploit/kexploit_opa334.h"
 #import "../../kexploit/kutils.h"
 #import "../../sandbox_escape.h"
+#import "../../platformize.h"
 
 static inline BOOL VNPointIsFinite(CGPoint p) {
     return isfinite(p.x) && isfinite(p.y);
@@ -349,7 +350,6 @@ BOOL HUDFloatButtonHandleTouch(CGPoint screenPoint, UITouchPhase phase, NSIntege
         // AMFI treats this process as a system app → GSInitialize +
         // BKSDisplayServicesStart + system UI work. The window then renders
         // above every app.
-        extern int platformize_self(uint64_t);
         uint64_t self_proc = proc_self();
         int pret = platformize_self(self_proc);
         NSLog(@"[HUD] platformize_self=%d", pret);
