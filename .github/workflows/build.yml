@@ -14,10 +14,10 @@ jobs:
       - name: Install Theos
         run: |
           git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
-          git clone --depth 1 https://github.com/theos/dm.pl.git "$HOME/theos/vendor/dm.pl"
-          chmod +x "$HOME/theos/vendor/dm.pl/dm.pl" || true
-          # vendor/include and vendor/lib are needed for theos
-          "$HOME/theos/bin/update-theos" 2>&1 || true
+          # dm.pl + vendor (include/lib) are separate repos `make package` needs
+          git clone --depth 1 https://github.com/theos/dm.pl.git "$HOME/theos/vendor/dm.pl" || true
+          git clone --depth 1 https://github.com/theos/vendor.git "$HOME/theos/vendor"
+          ls "$HOME/theos/vendor/" | head -20
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
       - name: Install iOS SDK
@@ -31,8 +31,11 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           make -f Makefile.app clean || true
-          make -f Makefile.app package FINALPACKAGE=1 2>&1 | tail -50
+          make -f Makefile.app package FINALPACKAGE=1 2>&1 | tail -80
+          echo "=== packages ==="
           ls -la packages/ || true
+          echo "=== find ipa ==="
+          find . -name "*.ipa" -o -name "*.tipa" 2>/dev/null | head -10
 
       - name: Upload IPA
         if: success()
