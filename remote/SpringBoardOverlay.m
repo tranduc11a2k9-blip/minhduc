@@ -248,19 +248,13 @@ int SBoardStartOverlay(void) {
 
 void SBRemotePushESPFrame(UIView *espView) {
     if (!g_sbOverlayOn || !espView) return;
-    if (++g_sbMirrorCount % 3 != 0) return; // 60fps / 3 = 20fps
-
-    static NSMutableData *ops = nil;
-    if (!ops) ops = [NSMutableData dataWithCapacity:8192];
-
-    if (!mergePaths(espView, ops)) return; // unchanged → 0 remote calls
-
-    uint64_t rp = dlsym("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-    if (!r_is_objc_ptr(rp)) return;
-    replayRemote(rp, (const uint8_t *)ops.bytes, ops.length);
-    r_msg2_main(g_sbShape, "setPath:", rp, 0,0,0);
-    if (r_is_objc_ptr(g_sbOldPath)) dlsym("CGPathRelease", g_sbOldPath, 0,0,0,0,0,0,0);
-    g_sbOldPath = rp;
+    // MIRROR DISABLED (respring bisect): the per-frame vector sync into
+    // SpringBoard (CGPathCreateMutable/AddLines/setPath remote) is the
+    // suspected SpringBoard killer — overlay lives ~1s then SB dies.
+    // Isolated test: static banner only, zero mirror traffic. If no
+    // respring with this build, the mirror calls are confirmed guilty.
+    (void)espView;
+    return;
 }
 
 void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
