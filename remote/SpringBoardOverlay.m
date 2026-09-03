@@ -169,7 +169,42 @@ int SBoardStartOverlay(void) {
     uint64_t scene = r_msg2_main(kw, "windowScene", 0,0,0,0);
     if (!r_is_objc_ptr(scene)) { destroy_remote_call(); return -1; }
 
-    uint64_t win = r_msg2_main(r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0),
+    // ---- Fl0rk _gDrawViewPassThroughWindowClass: register a WINDOW SUBCLASS
+    // INSIDE SpringBoard at runtime. A plain UIWindow only composites views
+    // with backing content — its bare CAShapeLayers never get rendered by
+    // the window server. A subclass overriding the private system flags
+    // (_isSystemWindow/hosting-managed/secure) gets FULL layer-tree backing
+    // (same as SB's own windows, which draw shape layers fine).
+    static uint64_t g_sbWindowClass = 0;
+    if (!r_is_objc_ptr(g_sbWindowClass)) {
+        // idempotent: reuse if a previous session registered it
+        uint64_t existing = do_remote_call_stable(5000, "objc_getClass", (uint64_t)(uintptr_t)"MHPassThroughWindow", 0,0,0,0,0,0,0);
+        if (r_is_objc_ptr(existing)) {
+            g_sbWindowClass = existing;
+        } else {
+            uint64_t nameBuf = r_alloc_str("MHPassThroughWindow");
+            uint64_t superName = r_alloc_str("UIWindow");
+            if (r_is_objc_ptr(nameBuf) && r_is_objc_ptr(superName)) {
+                uint64_t superCls = do_remote_call_stable(5000, "objc_getClass", superName, 0,0,0,0,0,0,0);
+                if (r_is_objc_ptr(superCls)) {
+                    // objc_allocateClassPair(super, name, 0)
+                    uint64_t newCls = do_remote_call_stable(5000, "objc_allocateClassPair",
+                                                            superCls, nameBuf, 0, 0,0,0,0,0);
+                    if (r_is_objc_ptr(newCls)) {
+                        // register
+                        do_remote_call_stable(5000, "objc_registerClassPair", newCls, 0,0,0,0,0,0,0);
+                        g_sbWindowClass = newCls;
+                        NSLog(@"[SBOverlay] registered MHPassThroughWindow subclass in SB");
+                    }
+                }
+            }
+            if (r_is_objc_ptr(nameBuf)) r_free(nameBuf);
+            if (r_is_objc_ptr(superName)) r_free(superName);
+        }
+    }
+
+    uint64_t clsWinUse = r_is_objc_ptr(g_sbWindowClass) ? g_sbWindowClass : r_class("UIWindow");
+    uint64_t win = r_msg2_main(r_msg2_main(clsWinUse, "alloc", 0,0,0,0),
                                "initWithWindowScene:", scene, 0,0,0);
     if (!r_is_objc_ptr(win)) { destroy_remote_call(); return -1; }
 
@@ -236,7 +271,7 @@ int SBoardStartOverlay(void) {
         }
     }
 
-    // ---- status UILabel ----
+    // ---- status UILabel (also the shape-layer HOST TEST) ----
     uint64_t label = r_msg2_main(r_msg2_main(r_class("UILabel"), "alloc", 0,0,0,0), "init", 0,0,0,0);
     if (r_is_objc_ptr(label)) {
         double lf[4] = {0, 0, bounds[2], 60};
@@ -256,6 +291,20 @@ int SBoardStartOverlay(void) {
             }
         }
         r_msg2_main(container, "addSubview:", label, 0,0,0);
+
+        // VECTOR ATTEMPT 4: add the shape layer as a SUBLAYER OF THE BANNER
+        // UILabel's layer — a view that DEFINITELY renders. If the V now
+        // shows inside the banner area, shape layers render fine when
+        // attached to a live-backed view → the fix is hosting geometry on
+        // a rendering view, not on bare windows/containers.
+        uint64_t labelLayer = r_msg2_main(label, "layer", 0,0,0,0);
+        if (r_is_objc_ptr(labelLayer)) {
+            double shf[4] = {0.0, 0.0, bounds[2], bounds[3]}; // extend beyond banner vertically
+            r_msg2_main_raw(shape, "setFrame:", shf, 32, NULL,0,NULL,0,NULL,0);
+            r_msg2_main(labelLayer, "addSublayer:", shape, 0,0,0);
+            r_msg2_main(shape, "setMasksToBounds:", 0, 0,0,0); // label doesn't clip
+            NSLog(@"[SBOverlay] VECTOR ATTEMPT 4: shape attached to banner label layer");
+        }
     }
 
     // ---- SELF-TEST #3: UIImageView with a static image ----
