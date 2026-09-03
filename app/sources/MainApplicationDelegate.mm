@@ -7,6 +7,7 @@
 #import "MDTheme.h"
 #import "HUDHelper.h"
 #import "ESPPrefs.h"
+#import "../../kexploit/kexploit_opa334.h" // krw_sockets_restore (extern "C")
 
 @implementation MainApplicationDelegate {
     HomeViewController *_homeViewController;
@@ -99,7 +100,7 @@
     // Undo the krw socket leak BEFORE the process dies — exiting with
     // so_usecount bumped astronomically high makes kernel zone teardown
     // panic → device respring ("reparting"). Restore makes exit clean.
-    extern "C" void krw_sockets_restore(void);
+    // Declared in kexploit_opa334.h (inside extern "C"), imported above.
     krw_sockets_restore();
 }
 
