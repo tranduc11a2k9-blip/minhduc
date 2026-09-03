@@ -3182,7 +3182,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         // Mirror this frame to the SpringBoard-hosted overlay (if active).
         // Declared in SpringBoardOverlay.h (inside extern "C").
         extern void SBRemotePushESPFrame(UIView *espView);
-        if (SBRemotePushESPFrame) SBRemotePushESPFrame(self);
+        SBRemotePushESPFrame(self);
     }
 }
 

@@ -227,7 +227,7 @@ void SBRemotePushESPFrame(UIView *espView) {
     }
     pthread_mutex_unlock(&g_sbLock);
 
-    if (++g_sbMirrorCount % 6 != 0) return; // 60fps timer → ~10fps mirror
+    if (++g_sbMirrorCount % 2 != 0) return; // 60fps timer → ~30fps mirror (mượt)
 
     CGRect b = espView.bounds;
     if (b.size.width < 1 || b.size.height < 1) return;
@@ -252,8 +252,8 @@ void SBRemotePushESPFrame(UIView *espView) {
     UIGraphicsEndImageContext();
     if (!img) return;
 
-    // Lower JPEG quality (0.3) — ESP lines are sharp enough at this setting.
-    NSData *jpg = UIImageJPEGRepresentation(img, 0.3f);
+    // JPEG quality 0.4 — 30fps needs a bit more quality than the 10fps path.
+    NSData *jpg = UIImageJPEGRepresentation(img, 0.4f);
     if (!jpg || jpg.length == 0) return;
 
     // 2. Upload JPEG bytes into SpringBoard.
