@@ -50,14 +50,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: MINHDUC.ipa
-          path: packages/MINHDUC*.ipa
+          path: |
+            packages/*.ipa
+            packages/*.tipa
           if-no-files-found: warn
 
       - name: Attach to latest release (direct .ipa download)
         if: success()
         run: |
           TAG="latest-build"
-          IPA_FILE=$(ls packages/MINHDUC*.ipa | head -1)
+          # Theos may name the package .ipa or .tipa depending on config
+          IPA_FILE=$(find . -maxdepth 2 \( -name "*.ipa" -o -name "*.tipa" \) | head -1)
+          if [ -z "$IPA_FILE" ]; then
+            echo "No IPA/TIPA produced"; ls -la packages/ || true; exit 1
+          fi
+          echo "Attaching $IPA_FILE"
           gh release upload "$TAG" "$IPA_FILE" --clobber --repo "$GITHUB_REPOSITORY" 2>/dev/null || \
           gh release create "$TAG" "$IPA_FILE" --title "MINHDUC latest build" --notes "Auto build $(date -u +%Y-%m-%d_%H:%M) UTC — commit ${GITHUB_SHA::7}" --repo "$GITHUB_REPOSITORY"
         env:
