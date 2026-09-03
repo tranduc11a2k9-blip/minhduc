@@ -2719,17 +2719,11 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         self.textLayerPool = [NSMutableArray arrayWithCapacity:300];
         self.imageLayerPool = [NSMutableArray arrayWithCapacity:80];
         
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            GameOffsetsReload();
-            Moudule_Base = (uint64_t)GameTargetModuleBase();
-            InitWeaponTextures();
-
-            pid_t pid = (pid_t)GameTargetProcessPid();
-            task = get_task_for_PID(pid);
-
-            gEngine = (void *)1; // DSMemory
-        });
+        // NOTE: no dispatch_once attach here! The game may not be running yet
+        // (attach via DSMemory is retried every frame in updateFrame). A once-
+        // cached Moudule_Base=0 permanently disabled ESP until app restart.
+        InitWeaponTextures();
+        gEngine = (void *)1; // DSMemory
 
         _secureTextField = [[HTHESPSecureWrapper alloc] initWithFrame:self.bounds];
         _secureTextField.userInteractionEnabled = NO; 
@@ -2762,25 +2756,10 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
         [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 
-        // Pause rendering while backgrounded — 60fps + kernel page walks in
-        // background burns CPU → iOS kills the app ("out app"). Resume on foreground.
-        __weak ESP_View *wself = self;
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification *n) {
-            (void)n;
-            ESP_View *sself = wself;
-            if (sself) sself.displayLink.paused = YES;
-        }];
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification *n) {
-            (void)n;
-            ESP_View *sself = wself;
-            if (sself) sself.displayLink.paused = NO;
-        }];
+        // NOTE: do NOT pause on background — the overlay must keep rendering
+        // while the game (Free Fire) is in the foreground and MINHDUC is
+        // backgrounded. KeepAlive (audio) keeps us alive; pausing here would
+        // freeze the ESP over the game.
     }
     return self;
 }
@@ -3064,29 +3043,23 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         {
             static pid_t s_attachedPid = -1;
             static int s_reattachCooldown = 0;
-            pid_t curPid = (pid_t)GameTargetProcessPid();
             bool needAttach = (Moudule_Base == (uint64_t)-1 || Moudule_Base == 0 ||
-                               get_task == MACH_PORT_NULL ||
-                               curPid <= 0 || curPid != s_attachedPid);
+                               !ds_attached() || ds_pid() != s_attachedPid);
             if (needAttach) {
                 if (s_reattachCooldown > 0) {
                     s_reattachCooldown--;
                 } else {
                     GameOffsetsReload();
-                    uintptr_t base = (curPid > 0) ? GameTargetModuleBase() : 0;
-                    if (base != 0 && curPid > 0 && get_task != MACH_PORT_NULL) {
+                    // DSMemory self-detects FF by name + re-walks the vm_map.
+                    uintptr_t base = (uintptr_t)GameTargetModuleBase();
+                    if (base != 0 && ds_attached()) {
                         Moudule_Base = (uint64_t)base;
-                        task = get_task;
-                        g_target_task = get_task;
-                        s_attachedPid = curPid;
+                        s_attachedPid = ds_pid();
                         gEngine = (void *)1; // DSMemory
                     } else {
-                        // Keep previous base if any — only clear when process gone.
-                        if (curPid <= 0) {
-                            Moudule_Base = 0;
-                            s_attachedPid = -1;
-                        }
-                        s_reattachCooldown = 20; // ~0.33s at 60fps
+                        Moudule_Base = 0;
+                        s_attachedPid = -1;
+                        s_reattachCooldown = 30; // ~0.5s at 60fps — poll game launch
                     }
                 }
             }

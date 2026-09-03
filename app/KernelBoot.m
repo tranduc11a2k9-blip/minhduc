@@ -147,20 +147,24 @@ void kernelBootStart(void) {
         // keepalive + background task prevent the exit path.
         [[KeepAlive shared] start];
 
-        // SpringBoard remote overlay first (now fixed with cyanide statbar pattern:
-        // windowScene-attached UIWindow + UILabel subview). Fallback to the in-app
-        // DirectOverlay if the remote channel fails.
-        L(@"RUN 6/6 Starting SpringBoard remote overlay");
-        int sbret = SBoardStartOverlay();
-        L(sbret == 0 ? @"OK SpringBoard overlay active."
-                     : @"WARN SBoardStartOverlay returned %d", sbret);
-        if (sbret != 0) {
-            extern int StartDirectOverlay(void);
-            L(@"RUN 6/6b Falling back to DirectOverlay (in-app system overlay)");
-            int dret = StartDirectOverlay();
-            L(dret == 0 ? @"OK DirectOverlay active."
-                        : @"WARN StartDirectOverlay returned %d", dret);
-        }
+        // ESP_View (DirectOverlay) FIRST — in-app, appears in <1s.
+        // The 30s SBoardStartOverlay remote init was blocking RUN 6/6, which
+        // delayed ESP by up to 30s and froze the UI. Overlay-over-game works
+        // because the app keeps running in background via audio KeepAlive.
+        L(@"RUN 6/6 Starting DirectOverlay (instant in-app overlay)");
+        extern int StartDirectOverlay(void);
+        int dret = StartDirectOverlay();
+        L(dret == 0 ? @"OK DirectOverlay active."
+                    : @"WARN StartDirectOverlay returned %d", dret);
+
+        // SB-hosted window is a background enhancement (survives app kill),
+        // never a blocker: short timeout, off-main.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            int sret = SBoardStartOverlay();
+            if (sret == 0) {
+                L(@"OK SpringBoard overlay backup active.");
+            }
+        });
         g_ready = YES;
         g_booting = NO;
         L(@"OK ESP overlay active.");
