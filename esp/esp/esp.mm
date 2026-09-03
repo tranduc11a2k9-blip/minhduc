@@ -3360,7 +3360,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                 NSLog(@"[DIAG] pawn=%llu alive=%d camPC=%d val=%.0f followCam=%llu valid=%d",
                       (unsigned long long)myPawnObject, (int)(isVaildPtr(myPawnObject) && get_CurHP(myPawnObject) > 0),
                       (int)isCamPC, camPCValue, (unsigned long long)fc, (int)isVaildPtr(fc));
-                void (^logFn)(NSString *) = kernelBootLog;
+                kernel_boot_log_fn logFn = kernelBootLog;
                 if (logFn) {
                     NSString *line = [NSString stringWithFormat:
                         @"[diag] pawn=%@ fc=%@ camPC=%d (%.0f)",
