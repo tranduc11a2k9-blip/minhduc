@@ -4347,7 +4347,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     bestScore = rawBestScore;
     isVis = rawBestVis;
 
-    static float s_lockScore = FLT_MAX;
+    static float s_lockScore = FLT_MAX; (void)s_lockScore;
     // s_lockHoldFrames declared at file scope (above) to allow cleanup on treo fix
     // reuse it here without redeclaring static
     const bool firingNow = isVaildPtr(myPawnObject) && get_IsFiring(myPawnObject);
