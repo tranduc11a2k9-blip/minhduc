@@ -126,8 +126,11 @@ int SBoardStartOverlay(void) {
 
     g_sbSettleWas = r_settle_us(500); // 0.5ms per call (was 50ms → lag)
 
-    NSLog(@"[SBOverlay] init remote call into SpringBoard (5s timeout)...");
-    int rc = init_remote_call_with_first_exception_timeout("SpringBoard", true, 5000);
+    NSLog(@"[SBOverlay] init remote call into SpringBoard (15s timeout)...");
+    // 15s: the MIG exception handshake with a busy SpringBoard can take >5s.
+    // 5s was too aggressive → overlay init failed → always fell back to
+    // DirectOverlay ("ESP only in-app"). Parallel startup keeps UI unblocked.
+    int rc = init_remote_call_with_first_exception_timeout("SpringBoard", true, 15000);
     if (rc != 0) return -1;
     uint64_t pid = do_remote_call_stable(5000, "getpid", 0,0,0,0,0,0,0,0);
     if (pid == 0) { destroy_remote_call(); return -1; }
@@ -170,6 +173,16 @@ int SBoardStartOverlay(void) {
         uint64_t w = r_msg2_main(clsCol, "whiteColor", 0,0,0,0);
         if (r_is_objc_ptr(w)) white = r_msg2_main(w, "CGColor", 0,0,0,0);
     }
+    // ---- container UIView (cyanide pattern: window MUST have a UIView
+    //      subview to be composited; bare CALayers on window.layer are
+    //      not guaranteed to render). ----
+    uint64_t container = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
+                                         "initWithFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
+    if (!r_is_objc_ptr(container)) { destroy_remote_call(); return -1; }
+    if (r_is_objc_ptr(clear)) r_msg2_main(container, "setBackgroundColor:", clear, 0,0,0);
+    r_msg2_main(container, "setUserInteractionEnabled:", 0, 0,0,0);
+    r_msg2_main(container, "setOpaque:", 0, 0,0,0);
+
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
@@ -201,13 +214,17 @@ int SBoardStartOverlay(void) {
                 dlsym("CFRelease", ns, 0,0,0,0,0,0,0);
             }
         }
-        r_msg2_main(win, "addSubview:", label, 0,0,0);
+        r_msg2_main(container, "addSubview:", label, 0,0,0);
     }
 
-    // shape layer onto window's root layer
-    uint64_t rootLayer = r_msg2_main(win, "layer", 0,0,0,0);
-    if (r_is_objc_ptr(rootLayer)) r_msg2_main(rootLayer, "addSublayer:", shape, 0,0,0);
+    // shape layer onto container's layer
+    uint64_t containerLayer = r_msg2_main(container, "layer", 0,0,0,0);
+    if (r_is_objc_ptr(containerLayer)) r_msg2_main(containerLayer, "addSublayer:", shape, 0,0,0);
+
+    // container onto window — the KEY: window with a UIView subview composites
+    r_msg2_main(win, "addSubview:", container, 0,0,0);
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
+    r_msg2_main(win, "makeKeyAndVisible", 0, 0,0,0);
     g_sbShape = shape;
 
     // retain
