@@ -34,7 +34,7 @@ static void L(NSString *fmt, ...) {
 }
 
 // 4/6 + 5/6 — SpringBoard session prep (Direct overlay inside app session)
-#import "../remote/SpringBoardOverlay.h"
+#import "SpringBoardOverlay.h"
 
 void kernelBootStart(void) {
     if (g_booting) return;
