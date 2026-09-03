@@ -15,6 +15,8 @@
 
 #import "KernelBoot.h"
 #import <QuartzCore/QuartzCore.h>
+#import <sys/time.h>
+#import <unistd.h>
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/kutils.h"
 #import "../sandbox_escape.h"
@@ -46,6 +48,38 @@ static NSString *parkFileFullPath(void) {
     return [caches stringByAppendingPathComponent:@".minhduc_parked"];
 }
 
+// Park is only valid for the CURRENT boot. After a respring/reboot the
+// kernel primitives are gone (corrupted sockets died with the panic) but
+// the file would still exist → app would skip the exploit and use dead
+// primitives. Store the boot time; invalidate when it changes.
+static uint64_t systemBootTimeSec(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec - (uint64_t)sysconf(_SC_BOOTTIME);
+}
+
+static BOOL parkIsValid(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:parkFileFullPath()]) return NO;
+    NSString *saved = [NSString stringWithContentsOfFile:parkFileFullPath()
+                                                encoding:NSUTF8StringEncoding error:nil];
+    uint64_t boot = systemBootTimeSec();
+    NSString *expected = [NSString stringWithFormat:@"1:%llu", boot];
+    if (![saved isEqualToString:expected]) {
+        [fm removeItemAtPath:parkFileFullPath() error:nil]; // stale — clear it
+        return NO;
+    }
+    return YES;
+}
+
+static void writePark(void) {
+    NSString *park = parkFileFullPath();
+    [[NSFileManager defaultManager] createDirectoryAtPath:[park stringByDeletingLastPathComponent]
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *val = [NSString stringWithFormat:@"1:%llu", systemBootTimeSec()];
+    [val writeToFile:park atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 void kernelBootStart(void) {
     if (g_booting) return;
     if (g_ready) {
@@ -57,9 +91,10 @@ void kernelBootStart(void) {
         return;
     }
 
-    // Parked fast path: exploit already ran this boot session — skip it
+    // Parked fast path: exploit already ran THIS boot — skip it
     // (re-running double-corrupts the socket zone → panic).
-    if ([[NSFileManager defaultManager] fileExistsAtPath:parkFileFullPath()]) {
+    // After a respring/reboot boottime changes → park invalid → re-exploit.
+    if (parkIsValid()) {
         L(@"OK Parked — skipping exploit, starting overlay.");
         g_ready = YES;
         [[KeepAlive shared] start];
@@ -101,14 +136,9 @@ void kernelBootStart(void) {
             return;
         }
         L(@"OK Kernel memory r/w acquired.");
-        L(@"OK State parked — next run skips the exploit.");
+        L(@"OK State parked (boottime-tagged) — next run skips the exploit.");
 
-        {
-            NSString *park = parkFileFullPath();
-            [[NSFileManager defaultManager] createDirectoryAtPath:[park stringByDeletingLastPathComponent]
-                                      withIntermediateDirectories:YES attributes:nil error:nil];
-            [@"1" writeToFile:park atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
+        writePark();
 
         uint64_t self_proc = proc_self();
         // NOTE: platformize/sandbox-elevate intentionally skipped — iOS 17.5.1

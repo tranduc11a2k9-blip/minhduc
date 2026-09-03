@@ -42,10 +42,20 @@ jobs:
           echo "=== find ipa ==="
           find . -name "*.ipa" -o -name "*.tipa" 2>/dev/null | head -10
 
-      - name: Upload IPA
+      - name: Upload IPA (direct .ipa file, no zip)
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: MINHDUC-ipa
-          path: packages/*.ipa
+          name: MINHDUC.ipa
+          path: packages/MINHDUC*.ipa
           if-no-files-found: warn
+
+      - name: Attach to latest release (direct .ipa download)
+        if: success()
+        run: |
+          TAG="latest-build"
+          IPA_FILE=$(ls packages/MINHDUC*.ipa | head -1)
+          gh release upload "$TAG" "$IPA_FILE" --clobber --repo "$GITHUB_REPOSITORY" 2>/dev/null || \
+          gh release create "$TAG" "$IPA_FILE" --title "MINHDUC latest build" --notes "Auto build $(date -u +%Y-%m-%d_%H:%M) UTC — commit ${GITHUB_SHA::7}" --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
