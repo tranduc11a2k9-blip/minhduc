@@ -285,31 +285,49 @@ void SBRemotePushESPFrame(UIView *espView) {
 
     if (!mergePaths(espView, ops)) return; // unchanged → 0 remote calls
 
-    // Reset path, then write points into the persistent buffer and batch.
+    // FAST PATH (2 remote calls total):
+    // ESP geometry is all straight segments (boxes, snaplines, bone lines,
+    // hp bars). Instead of replaying moveTo/AddLines per sub-path (10-30
+    // remote calls), flatten everything into ONE polyline where each
+    // sub-path break inserts a ZERO-LENGTH jump (repeat the previous end
+    // point) — the connecting stroke between sub-paths becomes invisible,
+    // so a single CGPathAddLines renders all segments correctly.
     dlsym("CGPathClear", rp, 0,0,0,0,0,0,0);
     size_t len = ops.length;
     const uint8_t *b = (const uint8_t *)ops.bytes;
+
     double pts[4096];
     int n = 0;
+    double lastX = 0, lastY = 0;
+    BOOL haveLast = NO;
+    BOOL havePrevEnd = NO;
     size_t i = 0;
     while (i < len && n < 4090) {
         uint8_t op = b[i++];
         if (i + 16 > len) break;
         double x, y; memcpy(&x, b+i, 8); memcpy(&y, b+i+8, 8); i += 16;
-        if (op == 1) { // moveTo
-            if (n > 0) {
-                remote_write(ptsBuf, pts, n*16);
-                dlsym("CGPathAddLines", rp, 0, ptsBuf, n, 0,0,0,0);
-                n = 0;
+        if (op == 1) { // moveTo → sub-path break
+            // Zero-length jump: repeat previous end point if a run is open.
+            if (n > 0 && havePrevEnd) {
+                pts[n++] = lastX; pts[n++] = lastY; // close the run at its end
             }
-            dlsym("CGPathMoveToPoint", rp, 0, dbl_bits(x), dbl_bits(y), 0,0,0,0);
-        } else {
-            pts[n*2] = x; pts[n*2+1] = y; n++;
+            lastX = x; lastY = y; haveLast = YES;
+        } else {       // lineTo from last point
+            if (!haveLast) { lastX = x; lastY = y; haveLast = YES; havePrevEnd = NO; continue; }
+            if (n == 0) {
+                // open a new run at the sub-path start
+                pts[n++] = lastX; pts[n++] = lastY;
+            }
+            pts[n++] = x; pts[n++] = y;
+            lastX = x; lastY = y;
+            havePrevEnd = YES;
         }
     }
-    if (n > 0) {
-        remote_write(ptsBuf, pts, n*16);
-        dlsym("CGPathAddLines", rp, 0, ptsBuf, n, 0,0,0,0);
+
+    // ONE remote_write into the persistent SB buffer + ONE CGPathAddLines.
+    if (n >= 2) {
+        remote_write(ptsBuf, pts, n * 8);
+        dlsym("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
     }
 
     // ONE setPath per sync — layer retains the persistent path.
