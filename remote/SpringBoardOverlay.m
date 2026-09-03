@@ -247,18 +247,39 @@ int SBoardStartOverlay(void) {
     g_sbOverlayOn = YES;
     pthread_mutex_unlock(&g_sbLock);
 
+    // RESET persistent mirror state — a NEW SpringBoard process means the
+    // old remote path/point-buffer addresses are dangling pointers into a
+    // dead address space (2nd boot: CGPathClear on stale addr = silent
+    // mirror crash → banner visible but ESP never draws). Re-create lazily.
+    g_sbPersistentPath = 0;
+    // ptsBuf is function-local static; reset via the mirror's own init.
+    sb_reset_mirror_state();
+
     NSLog(@"[SBOverlay] single-layer vector overlay ACTIVE");
     return 0;
 }
 
-// Persistent remote path — created ONCE, emptied per sync (CGPathClear),
-// never destroyed. Fl0rk DrawView pattern.
+// Persistent remote path — created ONCE per SB session, emptied per sync
+// (CGPathClear), never destroyed. Fl0rk DrawView pattern. Invalidated on
+// every SBoardStartOverlay (new SB process = new address space).
 static uint64_t g_sbPersistentPath = 0;
+
+// Forward — resets per-session mirror caches (called from SBoardStartOverlay).
+static void sb_reset_mirror_state(void);
+static uint64_t g_sbMirrorPtsBuf = 0; // persistent point buffer per SB session
 
 static uint64_t persistentPath(void) {
     if (r_is_objc_ptr(g_sbPersistentPath)) return g_sbPersistentPath;
     g_sbPersistentPath = dlsym("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
     return g_sbPersistentPath;
+}
+
+static void sb_reset_mirror_state(void) {
+    // per-SB-session caches — stale across sessions (new SB = new addrs)
+    g_sbPersistentPath = 0;
+    g_sbMirrorPtsBuf = 0;
+    g_sbPathHash = 0;
+    g_sbMirrorCount = 0;
 }
 
 void SBRemotePushESPFrame(UIView *espView) {
@@ -272,12 +293,13 @@ void SBRemotePushESPFrame(UIView *espView) {
     if (!r_is_objc_ptr(rp)) return;
 
     // Fl0rk DrawView pattern: ONE persistent remote point buffer (allocated
-    // once, never freed) + ONE batched CGPathAddLines per sync. No per-frame
-    // malloc/free in SpringBoard — that churn is what killed SB.
-    static uint64_t ptsBuf = 0;
+    // once per SB session, never freed) + ONE batched CGPathAddLines per
+    // sync. No per-frame malloc/free in SpringBoard — that churn killed SB.
+    uint64_t ptsBuf = g_sbMirrorPtsBuf;
     if (!r_is_objc_ptr(ptsBuf)) {
         ptsBuf = dlsym("malloc", 65536, 0,0,0,0,0,0,0); // 4096 points
         if (!r_is_objc_ptr(ptsBuf)) return;
+        g_sbMirrorPtsBuf = ptsBuf;
     }
 
     static NSMutableData *ops = nil;

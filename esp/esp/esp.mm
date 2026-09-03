@@ -2921,7 +2921,10 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 }
 
 - (void)updateFrame {
-    if (!self.window) return;
+    // NOTE: no self.window guard — the view may be an OFFSCREEN data source
+    // (host window alpha=0, never visible). The GCD frame timer drives the
+    // game reads + the SpringBoard mirror; stopping when not on screen
+    // would freeze the SB overlay. The timer itself is the lifecycle.
 
     @autoreleasepool {
         // ✅ FIX FPS DROP: ESPSyncFromPrefs chỉ gọi mỗi 1 giây, không phải mỗi frame
