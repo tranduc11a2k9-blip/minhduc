@@ -13,10 +13,15 @@ jobs:
 
       - name: Install Theos
         run: |
+          # theos.git main clone does NOT include vendor submodules with plain clone
           git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
-          # dm.pl + vendor (include/lib) are separate repos `make package` needs
-          git clone --depth 1 https://github.com/theos/dm.pl.git "$HOME/theos/vendor/dm.pl" || true
-          git clone --depth 1 https://github.com/theos/vendor.git "$HOME/theos/vendor"
+          # dm.pl is required by `make package` (installed into vendor/dm.pl)
+          mkdir -p "$HOME/theos/vendor"
+          git clone --depth 1 https://github.com/theos/dm.pl.git "$HOME/theos/vendor/dm.pl"
+          # vendor/include + vendor/lib (headers and libs like CydiaSubstrate)
+          git clone --depth 1 https://github.com/theos/vendor.git "$HOME/theos/vendor-tmp"
+          cp -R "$HOME/theos/vendor-tmp/." "$HOME/theos/vendor/"
+          rm -rf "$HOME/theos/vendor-tmp"
           ls "$HOME/theos/vendor/" | head -20
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
