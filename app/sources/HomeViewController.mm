@@ -31,6 +31,12 @@ static const CGFloat kMenuButtonSize = 56.0f;
 @property (nonatomic, strong) UILabel *controlSubtitleLabel;
 @property (nonatomic, strong) UIButton *startButton;
 
+@property (nonatomic, strong) UIView *togglesCard;
+@property (nonatomic, strong) UILabel *aimbotLabel;
+@property (nonatomic, strong) UISwitch *aimbotSwitch;
+@property (nonatomic, strong) UILabel *espLabel;
+@property (nonatomic, strong) UISwitch *espSwitch;
+
 @property (nonatomic, strong) UILabel *versionSectionLabel;
 @property (nonatomic, strong) UIButton *ffMaxCard;
 @property (nonatomic, strong) UIButton *ffCard;
@@ -342,6 +348,35 @@ static const CGFloat kMenuButtonSize = 56.0f;
     [_startButton addTarget:self action:@selector(startButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [_controlCard addSubview:_startButton];
 
+    // Quick toggles card — Aimbot + ESP on/off right from Home (no HUD draw
+    // needed to flip the cheat; ESP_View reads prefs every frame).
+    _togglesCard = [self makeCard];
+    [_contentView addSubview:_togglesCard];
+
+    _aimbotLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _aimbotLabel.text = @"Aimbot";
+    _aimbotLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _aimbotLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_aimbotLabel];
+
+    _aimbotSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _aimbotSwitch.onTintColor = [self accentGreen];
+    _aimbotSwitch.on = ESPPrefsBool(@"Aimbot", NO);
+    [_aimbotSwitch addTarget:self action:@selector(aimbotSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_aimbotSwitch];
+
+    _espLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _espLabel.text = @"ESP";
+    _espLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _espLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_espLabel];
+
+    _espSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _espSwitch.onTintColor = [self accentGreen];
+    _espSwitch.on = ESPPrefsBool(@"EnableESP", YES);
+    [_espSwitch addTarget:self action:@selector(espSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_espSwitch];
+
     // Boot log card (Fl0rk-style console)
     _logCard = [self makeCard];
     [_contentView addSubview:_logCard];
@@ -527,6 +562,15 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _controlSubtitleLabel.frame = CGRectMake(textX, 44, textW, 28);
     y = CGRectGetMaxY(_controlCard.frame) + 12;
 
+    // Quick toggles card (Aimbot / ESP)
+    CGFloat togglesH = 92.0f;
+    _togglesCard.frame = CGRectMake(xPad, y, cardW, togglesH);
+    _aimbotLabel.frame = CGRectMake(16, 14, 160, 24);
+    _aimbotSwitch.frame = CGRectMake(cardW - 68, 10, 51, 31);
+    _espLabel.frame = CGRectMake(16, 54, 160, 24);
+    _espSwitch.frame = CGRectMake(cardW - 68, 50, 51, 31);
+    y = CGRectGetMaxY(_togglesCard.frame) + 12;
+
     // Boot log card
     CGFloat logH = 210.0f;
     _logCard.frame = CGRectMake(xPad, y, cardW, logH);
@@ -645,6 +689,21 @@ static const CGFloat kMenuButtonSize = 56.0f;
 - (void)autoCleanSwitchChanged:(UISwitch *)sender {
     BOOL selectedValue = sender.on;
     ESPPrefsSetBool(@"AutoVarCleanBeforeHUD", selectedValue);
+}
+
+// Quick toggles — write pref + sync live ESP globals immediately.
+// ESP_View's frame loop re-reads prefs every 1s, but ESPSyncFromPrefs
+// makes the change land on the next frame without waiting.
+- (void)aimbotSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"Aimbot", sender.on);
+    extern void ESPSyncFromPrefs(void);
+    ESPSyncFromPrefs();
+}
+
+- (void)espSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"EnableESP", sender.on);
+    extern void ESPSyncFromPrefs(void);
+    ESPSyncFromPrefs();
 }
 
 - (void)startButtonTapped:(UIButton *)sender {
