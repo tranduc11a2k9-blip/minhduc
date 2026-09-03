@@ -3,12 +3,10 @@
 
 @implementation HUDMainWindow
 
-+ (BOOL)_isSystemWindow { return YES; }
-- (BOOL)_isWindowServerHostingManaged { return NO; }
-// NOT secure — _isSecure=YES made iOS 17+ hide this window entirely
-// (secure windows are only composited into the secure display path).
-- (BOOL)_isSecure { return NO; }
-- (BOOL)_shouldCreateContextAsSecure { return NO; }
+// All overrides REMOVED (was _isSystemWindow=YES/_isWindowServerHostingManaged=NO):
+// on a sideloaded app those flags made the window server skip rendering the
+// window entirely — ESP was invisible even in the app's own foreground.
+// A plain UIWindow with a high windowLevel renders fine while foregrounded.
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
