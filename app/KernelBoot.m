@@ -101,25 +101,24 @@ void kernelBootStart(void) {
         L(sret == 0 ? @"OK Sandbox escaped (R+W filesystem)."
                     : @"WARN sandbox_escape returned %d", sret);
 
-        L(@"RUN 4/6 Opening SpringBoard injection channel (delayed)");
-        // CRITICAL respring fix: opening the SB remote session IMMEDIATELY
-        // after sandbox_escape crashed SpringBoard ~1s later (session rides
-        // on still-settling kernel primitives). Fl0rk opens its session only
-        // when the user configures settings — seconds after boot. We wait
-        // 10s, then retry up to 3 times with backoff.
+        L(@"RUN 4/6 Opening SpringBoard injection channel (staged)");
+        // Opening the SB session immediately after sandbox_escape crashed SB.
+        // Staged settle: try at 3s, 5s, 8s, 12s — first success wins (fast
+        // path when SB is responsive; still avoids the post-exploit storm).
         [[KeepAlive shared] start];
         __block BOOL sbDone = NO;
         __block int sbret = -1;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            for (int attempt = 0; attempt < 3; attempt++) {
-                sleep(10); // let primitives + SB settle after exploit
+            static const int delays[] = {3, 2, 3, 4}; // cumulative: 3s,5s,8s,12s
+            for (int attempt = 0; attempt < 4; attempt++) {
+                sleep(delays[attempt]);
                 sbret = SBoardStartOverlay();
                 if (sbret == 0) break;
                 NSLog(@"[BOOT] SB overlay attempt %d failed rc=%d", attempt + 1, sbret);
             }
             sbDone = YES;
         });
-        L(@"OK Channel will establish after 10s settle.");
+        L(@"OK Channel establishing (3s..12s staged).");
 
         L(@"RUN 5/6 Preparing SpringBoard session");
         L(@"OK SpringBoard session pending (background).");
