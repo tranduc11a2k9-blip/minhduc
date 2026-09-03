@@ -1,7 +1,7 @@
 //
 //  SpringBoardOverlay.h — Fl0rk-style SpringBoard overlay
-//  Uses init_remote_call_with_first_exception_timeout + remote_objc to create
-//  a UIWindow inside SpringBoard's process — renders on top of EVERY app.
+//  cyanide statbar pattern: windowScene-attached UIWindow + UILabel subview,
+//  retained via objc_setAssociatedObject. Renders on top of EVERY app.
 //
 #import <Foundation/Foundation.h>
 
@@ -12,6 +12,8 @@ extern "C" {
 // Call AFTER kexploit_opa334(). Returns 0 on success.
 int SBoardStartOverlay(void);
 void SBoardStopOverlay(void);
+// Update the overlay label text (statbar-style, safe from any thread).
+void SBoardOverlaySetStatus(const char *utf8);
 
 #ifdef __cplusplus
 }

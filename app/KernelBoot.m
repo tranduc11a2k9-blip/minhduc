@@ -41,8 +41,10 @@ void kernelBootStart(void) {
     if (g_ready) {
         L(@"OK Already booted — starting overlay directly.");
         [[KeepAlive shared] start];
-        extern int StartDirectOverlay(void);
-        StartDirectOverlay();
+        if (SBoardStartOverlay() != 0) {
+            extern int StartDirectOverlay(void);
+            StartDirectOverlay();
+        }
         return;
     }
 
@@ -56,8 +58,10 @@ void kernelBootStart(void) {
             L(@"OK Parked state found — skipping exploit, starting overlay.");
             g_ready = YES;
             [[KeepAlive shared] start];
-            extern int StartDirectOverlay(void);
-            StartDirectOverlay();
+            if (SBoardStartOverlay() != 0) {
+                extern int StartDirectOverlay(void);
+                StartDirectOverlay();
+            }
             return;
         }
     }
@@ -137,16 +141,20 @@ void kernelBootStart(void) {
         // keepalive + background task prevent the exit path.
         [[KeepAlive shared] start];
 
-        // Direct in-app overlay using HUDMainWindow + SBSAccessibilityWindowHostingController.
-        // SpringBoard remote overlay is disabled: SBOverlay creates a window with NO subviews,
-        // making it invisible. DirectOverlay has proper ESP_View + MenuView rendering.
-        // The SBSAccessibilityWindowHostingController registration at level 10000010.0 puts
-        // the window above every app (including games) — no entitlement needed.
-        L(@"RUN 6/6 Starting DirectOverlay (in-app system overlay)");
-        extern int StartDirectOverlay(void);
-        int sbret = StartDirectOverlay();
-        L(sbret == 0 ? @"OK DirectOverlay active."
-                     : @"WARN StartDirectOverlay returned %d", sbret);
+        // SpringBoard remote overlay first (now fixed with cyanide statbar pattern:
+        // windowScene-attached UIWindow + UILabel subview). Fallback to the in-app
+        // DirectOverlay if the remote channel fails.
+        L(@"RUN 6/6 Starting SpringBoard remote overlay");
+        int sbret = SBoardStartOverlay();
+        L(sbret == 0 ? @"OK SpringBoard overlay active."
+                     : @"WARN SBoardStartOverlay returned %d", sbret);
+        if (sbret != 0) {
+            extern int StartDirectOverlay(void);
+            L(@"RUN 6/6b Falling back to DirectOverlay (in-app system overlay)");
+            int dret = StartDirectOverlay();
+            L(dret == 0 ? @"OK DirectOverlay active."
+                        : @"WARN StartDirectOverlay returned %d", dret);
+        }
         g_ready = YES;
         g_booting = NO;
         L(@"OK ESP overlay active.");
