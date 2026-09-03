@@ -14,7 +14,10 @@ jobs:
       - name: Install Theos
         run: |
           git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          # dm.pl is a separate repo that `make package` requires (not in main clone)
+          git clone --depth 1 https://github.com/theos/dm.pl.git "$HOME/theos/vendor/dm.pl"
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          chmod +x "$HOME/theos/vendor/dm.pl/dm.pl" || true
 
       - name: Install iOS SDK
         run: |
