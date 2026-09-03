@@ -62,6 +62,18 @@ static uint64_t dlsym(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
     return r_dlsym_call(R_TIMEOUT, fn, a0,a1,a2,a3,a4,a5,a6,a7);
 }
 
+// lara freakyperform: dispatch a 1-arg selector onto the SB MAIN THREAD.
+// CoreAnimation in SpringBoard asserts all layer-tree mutations happen on
+// the main thread (CA_ASSERT_MAIN_THREAD_TRANSACTIONS — the addSublayer
+// crash). r_msg2_main + performOnMain is the only safe route.
+static void sb_perform_main(uint64_t target, const char *selName, uint64_t arg) {
+    if (!r_is_objc_ptr(target)) return;
+    uint64_t sel = r_sel(selName);
+    uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+    if (!sel || !performSel) return;
+    r_msg(target, performSel, sel, arg, 0, 0); // wait=0 — async, never blocks
+}
+
 // CGPathApply needs a C function pointer.
 typedef struct { NSMutableData *data; } SerCtx;
 static void serFunc(void *info, const CGPathElement *e) {
@@ -250,7 +262,7 @@ int SBoardStartOverlay(void) {
                 dlsym("CFRelease", ns, 0,0,0,0,0,0,0);
             }
         }
-        r_msg2_main(container, "addSubview:", label, 0,0,0);
+        sb_perform_main(container, "addSubview:", label);
 
         // VECTOR ATTEMPT 4: add the shape layer as a SUBLAYER OF THE BANNER
         // UILabel's layer — a view that DEFINITELY renders. If the V now
@@ -261,7 +273,7 @@ int SBoardStartOverlay(void) {
         if (r_is_objc_ptr(labelLayer)) {
             double shf[4] = {0.0, 0.0, bounds[2], bounds[3]}; // extend beyond banner vertically
             r_msg2_main_raw(shape, "setFrame:", shf, 32, NULL,0,NULL,0,NULL,0);
-            r_msg2_main(labelLayer, "addSublayer:", shape, 0,0,0);
+            sb_perform_main(labelLayer, "addSublayer:", shape);
             r_msg2_main(shape, "setMasksToBounds:", 0, 0,0,0); // label doesn't clip
             NSLog(@"[SBOverlay] VECTOR ATTEMPT 4: shape attached to banner label layer");
         }
@@ -304,7 +316,7 @@ int SBoardStartOverlay(void) {
                         if (r_is_objc_ptr(iv)) {
                             r_msg2_main(iv, "setImage:", uiimg, 0,0,0);
                             r_msg2_main(iv, "setUserInteractionEnabled:", 0, 0,0,0);
-                            r_msg2_main(container, "addSubview:", iv, 0,0,0);
+                            sb_perform_main(container, "addSubview:", iv);
                             NSLog(@"[SBOverlay] SELF-TEST 3: UIImageView + uploaded image added (expect red square with white X)");
                         }
                     }
@@ -313,12 +325,10 @@ int SBoardStartOverlay(void) {
         }
     }
 
-    // lara pattern: bring our container to the front of the EXISTING window
-    uint64_t selBringFront = r_sel("bringSubviewToFront:");
-    uint64_t selAddSub = r_sel("addSubview:");
-    // container onto the EXISTING SB keyWindow (never key it — that kills SB)
-    r_msg(win, selAddSub, container, 0, 0, 0);
-    if (r_is_objc_ptr(selBringFront)) r_msg(win, selBringFront, container, 0, 0, 0);
+    // lara pattern: container onto the EXISTING SB keyWindow — but via
+    // sb_perform_main (CA main-thread assertion!) — never direct.
+    sb_perform_main(win, "addSubview:", container);
+    sb_perform_main(win, "bringSubviewToFront:", container);
     g_sbShape = shape;
 
     // retain container via associated object on the app (lara keeps remote
