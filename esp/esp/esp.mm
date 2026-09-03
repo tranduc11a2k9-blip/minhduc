@@ -3,6 +3,7 @@
 #import "offset.h"
 #import "GameOffsets.h"
 #import "../DSMemory.h"
+#import "../../app/KernelBoot.h" // kernelBootLog (diag output to Home log card)
 #import "../../remote/SpringBoardOverlay.h" // SBRemotePushESPFrame (extern "C")
 
 #import "GameLogic.h" 
@@ -3347,6 +3348,29 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         // Wall ON/OFF alike — no chest magnet when firing. LOS is geometric, not AA-list.
         DisableGameDefaultAimAssist(myPawnObject, isAimbot || isAimAssist);
         EnableCamPC(myPawnObject, isCamPC, camPCValue);
+
+        // DIAG (once per 5s): confirm the cheat apply-path is actually running
+        // and what CamPC sees — surfaces "no effect" causes without a debugger.
+        {
+            static CFTimeInterval s_lastDiag = 0;
+            CFTimeInterval nowD = CACurrentMediaTime();
+            if (nowD - s_lastDiag > 5.0) {
+                s_lastDiag = nowD;
+                uint64_t fc = isVaildPtr(myPawnObject) ? ReadAddr<uint64_t>(myPawnObject + 0x628) : 0;
+                NSLog(@"[DIAG] pawn=%llu alive=%d camPC=%d val=%.0f followCam=%llu valid=%d",
+                      (unsigned long long)myPawnObject, (int)(isVaildPtr(myPawnObject) && get_CurHP(myPawnObject) > 0),
+                      (int)isCamPC, camPCValue, (unsigned long long)fc, (int)isVaildPtr(fc));
+                void (^logFn)(NSString *) = kernelBootLog;
+                if (logFn) {
+                    NSString *line = [NSString stringWithFormat:
+                        @"[diag] pawn=%@ fc=%@ camPC=%d (%.0f)",
+                        isVaildPtr(myPawnObject) ? @"ok" : @"nil",
+                        isVaildPtr(fc) ? @"ok" : @"nil",
+                        (int)isCamPC, camPCValue];
+                    dispatch_async(dispatch_get_main_queue(), ^{ logFn(line); });
+                }
+            }
+        }
     }
 
     stats.inMatch = true;
