@@ -173,11 +173,17 @@ int SBoardStartOverlay(void) {
     r_msg2_main(win, "setUserInteractionEnabled:", 0, 0,0,0);
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
-    // ---- single CAShapeLayer (white stroke, no fill) ----
-    uint64_t white = 0;
+    // ---- colors: SEPARATE UIColor vs CGColor — CRASH FIX ----
+    // UILabel.setTextColor:/setBackgroundColor: take UIColor objects.
+    // CAShapeLayer.setStrokeColor:/setFillColor: take CGColorRefs.
+    // Passing a CGColor to setTextColor: → UILabel calls _isDynamic on
+    // __NSCFType → NSInvalidArgumentException → SpringBoard abort → respring
+    // ~1s after init (exactly the crash log: -[UILabel _resolveMaterialColor:]).
+    uint64_t whiteUIColor = 0, blackUIColor = 0, whiteCGColor = 0;
     if (r_is_objc_ptr(clsCol)) {
-        uint64_t w = r_msg2_main(clsCol, "whiteColor", 0,0,0,0);
-        if (r_is_objc_ptr(w)) white = r_msg2_main(w, "CGColor", 0,0,0,0);
+        whiteUIColor = r_msg2_main(clsCol, "whiteColor", 0,0,0,0);
+        blackUIColor = r_msg2_main(clsCol, "blackColor", 0,0,0,0);
+        if (r_is_objc_ptr(whiteUIColor)) whiteCGColor = r_msg2_main(whiteUIColor, "CGColor", 0,0,0,0);
     }
     // ---- container UIView (cyanide pattern: window MUST have a UIView
     //      subview to be composited; bare CALayers on window.layer are
@@ -192,7 +198,7 @@ int SBoardStartOverlay(void) {
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-    if (r_is_objc_ptr(white)) r_msg2_main(shape, "setStrokeColor:", white, 0,0,0);
+    if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
     double lw = 1.5;
     r_msg2_main_raw(shape, "setLineWidth:", &lw, 8, NULL,0,NULL,0,NULL,0);
@@ -207,9 +213,8 @@ int SBoardStartOverlay(void) {
         r_msg2_main_raw(label, "setFrame:", lf, 32, NULL,0,NULL,0,NULL,0);
         r_msg2_main(label, "setNumberOfLines:", 1, 0,0,0);
         r_msg2_main(label, "setTextAlignment:", 1, 0,0,0);
-        if (r_is_objc_ptr(white)) r_msg2_main(label, "setTextColor:", white, 0,0,0);
-        uint64_t black = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "blackColor", 0,0,0,0) : 0;
-        if (r_is_objc_ptr(black)) r_msg2_main(label, "setBackgroundColor:", black, 0,0,0);
+        if (r_is_objc_ptr(whiteUIColor)) r_msg2_main(label, "setTextColor:", whiteUIColor, 0,0,0);
+        if (r_is_objc_ptr(blackUIColor)) r_msg2_main(label, "setBackgroundColor:", blackUIColor, 0,0,0);
         uint64_t buf = r_alloc_str("MINHDUC ESP ACTIVE");
         if (buf) {
             uint64_t ns = r_msg2_main(r_msg2_main(r_class("NSString"), "alloc", 0,0,0,0),
