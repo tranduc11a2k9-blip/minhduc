@@ -58,7 +58,7 @@ $(APPLICATION_NAME)_FRAMEWORKS += CoreGraphics CoreServices QuartzCore IOKit UIK
 $(APPLICATION_NAME)_PRIVATE_FRAMEWORKS += BackBoardServices GraphicsServices SpringBoardServices IOSurface
 $(APPLICATION_NAME)_LIBRARIES += z compression
 
-$(APPLICATION_NAME)_LDFLAGS += JRMemory.framework/JRMemory
+
 $(APPLICATION_NAME)_CODESIGN_FLAGS += -Sapp/layout/entitlements.plist
 $(APPLICATION_NAME)_RESOURCE_DIRS = ./app/layout/Resources ./app/Font
 

@@ -19,7 +19,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
-#include "JRMemory.framework/Headers/MemScan.h"
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -2692,7 +2692,7 @@ static void ESPViewAddImageCallback(void *context, UIImage *image, CGRect frame)
     [self resetReusableLayers];
 }
 
-static JRMemoryEngine *gEngine = nullptr;
+static void *gEngine = (void *)1; // DSMemory mode
 mach_port_t task;
 
 // Brutal restore must run even when all ESP/aim toggles are off.
@@ -2720,7 +2720,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
             pid_t pid = (pid_t)GameTargetProcessPid();
             task = get_task_for_PID(pid);
 
-            gEngine = new JRMemoryEngine(task);
+            gEngine = (void *)1; // DSMemory
         });
 
         _secureTextField = [[HTHESPSecureWrapper alloc] initWithFrame:self.bounds];
@@ -3052,7 +3052,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                             delete gEngine;
                             gEngine = nullptr;
                         }
-                        gEngine = new JRMemoryEngine(task);
+                        gEngine = (void *)1; // DSMemory
                     } else {
                         // Keep previous base if any — only clear when process gone.
                         if (curPid <= 0) {
@@ -3138,7 +3138,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     if (!Norecoil) want = false;
 
     if (curPid > 0 && get_task != MACH_PORT_NULL) {
-        if (!gEngine) gEngine = new JRMemoryEngine(get_task);
+        if (!gEngine) gEngine = (void *)1; // DSMemory
         else gEngine->task = get_task;
         task = get_task;
         g_target_task = get_task;
