@@ -41,7 +41,8 @@ void kernelBootStart(void) {
     if (g_ready) {
         L(@"OK Already booted — starting overlay directly.");
         [[KeepAlive shared] start];
-        SBoardStartOverlay();
+        extern int StartDirectOverlay(void);
+        StartDirectOverlay();
         return;
     }
 
@@ -55,7 +56,8 @@ void kernelBootStart(void) {
             L(@"OK Parked state found — skipping exploit, starting overlay.");
             g_ready = YES;
             [[KeepAlive shared] start];
-            SBoardStartOverlay();
+            extern int StartDirectOverlay(void);
+            StartDirectOverlay();
             return;
         }
     }
@@ -135,17 +137,16 @@ void kernelBootStart(void) {
         // keepalive + background task prevent the exit path.
         [[KeepAlive shared] start];
 
-        // Fl0rk-style: remote call into SpringBoard to create system overlay window.
-        // This window sits above EVERY app (Free Fire, Home, etc.) — no entitlement.
-        L(@"RUN 6/6 Starting SpringBoard remote overlay");
-        int sbret = SBoardStartOverlay();
-        L(sbret == 0 ? @"OK SpringBoard overlay active."
-                     : @"WARN SBoardStartOverlay returned %d", sbret);
-        // Fallback to in-app overlay if remote fails
-        if (sbret != 0) {
-            extern int StartDirectOverlay(void);
-            StartDirectOverlay();
-        }
+        // Direct in-app overlay using HUDMainWindow + SBSAccessibilityWindowHostingController.
+        // SpringBoard remote overlay is disabled: SBOverlay creates a window with NO subviews,
+        // making it invisible. DirectOverlay has proper ESP_View + MenuView rendering.
+        // The SBSAccessibilityWindowHostingController registration at level 10000010.0 puts
+        // the window above every app (including games) — no entitlement needed.
+        L(@"RUN 6/6 Starting DirectOverlay (in-app system overlay)");
+        extern int StartDirectOverlay(void);
+        int sbret = StartDirectOverlay();
+        L(sbret == 0 ? @"OK DirectOverlay active."
+                     : @"WARN StartDirectOverlay returned %d", sbret);
         g_ready = YES;
         g_booting = NO;
         L(@"OK ESP overlay active.");
