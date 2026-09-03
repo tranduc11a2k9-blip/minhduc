@@ -3,10 +3,10 @@
 
 @implementation HUDMainWindow
 
-// All overrides REMOVED (was _isSystemWindow=YES/_isWindowServerHostingManaged=NO):
-// on a sideloaded app those flags made the window server skip rendering the
-// window entirely — ESP was invisible even in the app's own foreground.
-// A plain UIWindow with a high windowLevel renders fine while foregrounded.
++ (BOOL)_isSystemWindow { return YES; }
+- (BOOL)_isWindowServerHostingManaged { return NO; }
+- (BOOL)_isSecure { return YES; }
+- (BOOL)_shouldCreateContextAsSecure { return YES; }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
