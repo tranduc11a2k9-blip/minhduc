@@ -212,6 +212,21 @@ int SBoardStartOverlay(void) {
     double z = 100;
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
 
+    // ---- SELF-TEST line (visible proof the shape layer composites) ----
+    // A short diagonal stroke from the banner downward. If you DON'T see it,
+    // the shape layer itself is not rendering (compositing issue); if you DO
+    // see it, the layer is fine and the bug is in the mirror data path.
+    {
+        uint64_t testPath = dlsym("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+        if (r_is_objc_ptr(testPath)) {
+            dlsym("CGPathMoveToPoint", testPath, 0, dbl_bits(20.0), dbl_bits(90.0), 0,0,0,0);
+            dlsym("CGPathAddLineToPoint", testPath, 0, dbl_bits(200.0), dbl_bits(300.0), 0,0,0,0);
+            dlsym("CGPathAddLineToPoint", testPath, 0, dbl_bits(20.0), dbl_bits(500.0), 0,0,0,0);
+            r_msg2_main(shape, "setPath:", testPath, 0,0,0);
+            NSLog(@"[SBOverlay] SELF-TEST line set on shape layer (expect a V shape under the banner)");
+        }
+    }
+
     // ---- status UILabel ----
     uint64_t label = r_msg2_main(r_msg2_main(r_class("UILabel"), "alloc", 0,0,0,0), "init", 0,0,0,0);
     if (r_is_objc_ptr(label)) {
