@@ -37,6 +37,8 @@ static const CGFloat kMenuButtonSize = 56.0f;
 @property (nonatomic, strong) UISwitch *aimbotSwitch;
 @property (nonatomic, strong) UILabel *espLabel;
 @property (nonatomic, strong) UISwitch *espSwitch;
+@property (nonatomic, strong) UILabel *camLabel;
+@property (nonatomic, strong) UISwitch *camSwitch;
 
 @property (nonatomic, strong) UILabel *versionSectionLabel;
 @property (nonatomic, strong) UIButton *ffMaxCard;
@@ -378,6 +380,18 @@ static const CGFloat kMenuButtonSize = 56.0f;
     [_espSwitch addTarget:self action:@selector(espSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [_togglesCard addSubview:_espSwitch];
 
+    _camLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _camLabel.text = @"Camera Xa (CamPC)";
+    _camLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _camLabel.textColor = [UIColor whiteColor];
+    [_togglesCard addSubview:_camLabel];
+
+    _camSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    _camSwitch.onTintColor = [self accentGreen];
+    _camSwitch.on = ESPPrefsBool(@"CamPC", NO);
+    [_camSwitch addTarget:self action:@selector(camSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_camSwitch];
+
     // Boot log card (Fl0rk-style console)
     _logCard = [self makeCard];
     [_contentView addSubview:_logCard];
@@ -563,13 +577,15 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _controlSubtitleLabel.frame = CGRectMake(textX, 44, textW, 28);
     y = CGRectGetMaxY(_controlCard.frame) + 12;
 
-    // Quick toggles card (Aimbot / ESP)
-    CGFloat togglesH = 92.0f;
+    // Quick toggles card (Aimbot / ESP / CamPC)
+    CGFloat togglesH = 134.0f;
     _togglesCard.frame = CGRectMake(xPad, y, cardW, togglesH);
-    _aimbotLabel.frame = CGRectMake(16, 14, 160, 24);
+    _aimbotLabel.frame = CGRectMake(16, 14, 200, 24);
     _aimbotSwitch.frame = CGRectMake(cardW - 68, 10, 51, 31);
-    _espLabel.frame = CGRectMake(16, 54, 160, 24);
+    _espLabel.frame = CGRectMake(16, 54, 200, 24);
     _espSwitch.frame = CGRectMake(cardW - 68, 50, 51, 31);
+    _camLabel.frame = CGRectMake(16, 94, 200, 24);
+    _camSwitch.frame = CGRectMake(cardW - 68, 90, 51, 31);
     y = CGRectGetMaxY(_togglesCard.frame) + 12;
 
     // Boot log card
@@ -702,6 +718,11 @@ static const CGFloat kMenuButtonSize = 56.0f;
 
 - (void)espSwitchChanged:(UISwitch *)sender {
     ESPPrefsSetBoolLive(@"EnableESP", sender.on);
+    ESPSyncFromPrefs();
+}
+
+- (void)camSwitchChanged:(UISwitch *)sender {
+    ESPPrefsSetBoolLive(@"CamPC", sender.on);
     ESPSyncFromPrefs();
 }
 
