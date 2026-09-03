@@ -52,6 +52,8 @@ static const char *kShapeKeys[16] = {
 // ---- helpers ----
 static void dblCpy(double *d, const void *s) { memcpy(d, s, 8); }
 
+static uint64_t dbl_bits(double d) { uint64_t v; memcpy(&v, &d, 8); return v; }
+
 static uint64_t dlsym(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
                       uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
     return r_dlsym_call(R_TIMEOUT, fn, a0,a1,a2,a3,a4,a5,a6,a7);
@@ -65,24 +67,32 @@ static uint32_t hsh(const void *p, size_t n) {
     return h;
 }
 
+// CGPathApply requires a C function pointer (not a block).
+typedef struct {
+    NSMutableData *data;
+} PathSerCtx;
+
+static void pathSerFunc(void *info, const CGPathElement *e) {
+    PathSerCtx *ctx = (PathSerCtx *)info;
+    NSMutableData *dd = ctx->data;
+    if (e->type == kCGPathElementCloseSubpath) return;
+    uint8_t op = (e->type == kCGPathElementMoveToPoint) ? 1 : 2;
+    [dd appendBytes:&op length:1];
+    if (e->type == kCGPathElementMoveToPoint || e->type == kCGPathElementAddLineToPoint) {
+        [dd appendBytes:&e->points[0] length:16];
+    } else {
+        int n = (e->type == kCGPathElementAddQuadCurveToPoint) ? 1 : 2;
+        [dd appendBytes:&e->points[n] length:16];
+    }
+}
+
 // Serialize a CGPath as byte stream: for each element, [op:1][data].
 // ops: 1=moveTo(2d), 2=lineTo(2d)
 static void serializePath(CGPathRef p, NSMutableData *d) {
     [d setLength:0];
     if (!p || CGPathIsEmpty(p)) return;
-    CGPathApply(p, (__bridge void *)d, ^(void *info, const CGPathElement *e) {
-        NSMutableData *dd = (__bridge NSMutableData *)info;
-        uint8_t op = (e->type == kCGPathElementMoveToPoint) ? 1 : 2;
-        if (e->type == kCGPathElementCloseSubpath) return;
-        [dd appendBytes:&op length:1];
-        if (e->type == kCGPathElementMoveToPoint || e->type == kCGPathElementAddLineToPoint) {
-            [dd appendBytes:&e->points[0] length:16];
-        } else {
-            // curve → last point as line approx
-            int n = (e->type == kCGPathElementAddQuadCurveToPoint) ? 1 : 2;
-            [dd appendBytes:&e->points[n] length:16];
-        }
-    });
+    PathSerCtx ctx = { .data = d };
+    CGPathApply(p, &ctx, pathSerFunc);
 }
 
 // Replay ops into a remote CGMutablePath
@@ -186,7 +196,7 @@ int SBoardStartOverlay(void) {
     g_sbSettleWas = r_settle_us(500);
 
     NSLog(@"[SBOverlay] init remote call into SpringBoard...");
-    int rc = init_remote_call_with_first_exception_timeout("SpringBoard", true, 30000);
+    int rc = init_remote_call_with_first_exception_timeout("SpringBoard", true, 5000);
     if (rc != 0) return -1;
 
     uint64_t pid = do_remote_call_stable(5000, "getpid", 0,0,0,0,0,0,0,0);

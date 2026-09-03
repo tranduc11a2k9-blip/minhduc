@@ -150,22 +150,25 @@ void kernelBootStart(void) {
 
         // ---- RUN 6/6 ----
         L(@"RUN 6/6 Starting ESP overlay");
-        // Keep the process ALIVE forever — the corrupted kernel sockets must
-        // never be freed on app exit, or iOS panics (zone check).
         [[KeepAlive shared] start];
 
-        // Fl0rk-style: remote call into SpringBoard to create a system-level
-        // overlay window (cyanide statbar pattern — scene-attached UIWindow +
-        // UILabel subview). This window sits above EVERY app.
-        L(@"RUN 6/6 Starting SpringBoard remote overlay");
-        int sbret = SBoardStartOverlay();
-        L(sbret == 0 ? @"OK SpringBoard overlay active."
-                     : @"WARN SBoardStartOverlay returned %d", sbret);
-        // Fallback to in-app overlay if remote fails.
-        if (sbret != 0) {
-            extern int StartDirectOverlay(void);
-            StartDirectOverlay();
-        }
+        // DirectOverlay (in-app) starts INSTANTLY — ESP_View renders <1s.
+        // This is the primary overlay. SpringBoard remote is a background
+        // enhancement that never blocks the boot flow.
+        L(@"RUN 6/6 Starting DirectOverlay (instant)");
+        extern int StartDirectOverlay(void);
+        int dret = StartDirectOverlay();
+        L(dret == 0 ? @"OK DirectOverlay active."
+                    : @"WARN StartDirectOverlay returned %d", dret);
+
+        // SB remote overlay: non-blocking, 5s timeout, async.
+        // If it succeeds, the vector ESP layers in SpringBoard replace the
+        // in-app window; if it fails, the app-only overlay still works.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            int sbret = SBoardStartOverlay();
+            L(sbret == 0 ? @"OK SB overlay backup active."
+                        : @"WARN SB overlay unavailable.");
+        });
         g_ready = YES;
         g_booting = NO;
         L(@"OK ESP overlay active.");
