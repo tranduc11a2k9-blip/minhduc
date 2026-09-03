@@ -29,6 +29,9 @@ jobs:
           ls "$THEOS/sdks/"
           echo "THEOS=$THEOS" >> $GITHUB_ENV
 
+      - name: Install ldid
+        run: brew install ldid
+
       - name: Build
         run: |
           cd "$GITHUB_WORKSPACE"
