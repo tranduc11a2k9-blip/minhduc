@@ -2712,6 +2712,23 @@ mach_port_t task;
 static std::atomic<bool> g_brutalPatched{false};
 static std::atomic<bool> g_brutalHasAddrs{false};
 
+// DIAG_EARLY: rate-limited one-line reason why the render path stopped.
+// Shows up in the Home log card so "cheat has no effect" becomes diagnosable
+// from the user's screen (no-base = attach failed, lobby = in lobby,
+// no-matchGame = offset wrong, ok = apply path reached).
+#define DIAG_EARLY(reason) do { \
+    static CFTimeInterval s_lastDiagE = 0; \
+    CFTimeInterval nowE = CACurrentMediaTime(); \
+    if (nowE - s_lastDiagE > 5.0) { \
+        s_lastDiagE = nowE; \
+        kernel_boot_log_fn logFnE = kernelBootLog; \
+        if (logFnE) { \
+            NSString *lineE = [NSString stringWithFormat:@"[diag] stop: %@", @(reason)]; \
+            dispatch_async(dispatch_get_main_queue(), ^{ logFnE(lineE); }); \
+        } \
+    } \
+} while (0)
+
 
 
 
@@ -3208,15 +3225,18 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     CGMutablePathRef aNumRPath  = CGPathCreateMutable();
 
     if (!buffers || Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) {
+        DIAG_EARLY(@"no-base");
         return stats;
     }
     // Lobby / no match yet: skip ESP+aim cleanly (user may have enabled HUD first).
     if (IsAtLobby(Moudule_Base)) {
+        DIAG_EARLY(@"lobby");
         return stats;
     }
 
     uint64_t matchGame = getMatchGame(Moudule_Base);
     if (!isVaildPtr(matchGame)) {
+        DIAG_EARLY(@"no-matchGame");
         return stats;
     }
 
@@ -3224,6 +3244,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     uint64_t camera = CameraMain(matchGame);
     uint64_t match = getMatch(matchGame);
     if (!isVaildPtr(camera) || !isVaildPtr(match)) {
+        DIAG_EARLY(@"no-camera-or-match");
         return stats;
     }
 
