@@ -3,6 +3,7 @@
 #import "rootless.h"
 #import "pid.h"
 #import "ESPPrefs.h"
+#import "esp.h"
 #import "GameOffsets.h"
 #import "roothide/varCleanController.h"
 #import "MDTheme.h"
@@ -696,13 +697,11 @@ static const CGFloat kMenuButtonSize = 56.0f;
 // makes the change land on the next frame without waiting.
 - (void)aimbotSwitchChanged:(UISwitch *)sender {
     ESPPrefsSetBoolLive(@"Aimbot", sender.on);
-    extern void ESPSyncFromPrefs(void);
-    ESPSyncFromPrefs();
+    ESPSyncFromPrefs(); // declared in esp.h (extern "C")
 }
 
 - (void)espSwitchChanged:(UISwitch *)sender {
     ESPPrefsSetBoolLive(@"EnableESP", sender.on);
-    extern void ESPSyncFromPrefs(void);
     ESPSyncFromPrefs();
 }
 
