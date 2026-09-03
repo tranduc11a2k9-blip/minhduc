@@ -304,25 +304,19 @@ int SBoardStartOverlay(void) {
         }
     }
 
-    // shape layer onto a DEDICATED canvas UIView's layer (Fl0rk DrawView
-    // pattern: _gDrawViewCanvas). A CAShapeLayer added directly to a
-    // container's layer did NOT composite in SB window hosting — wrapping
-    // it in a UIView that is addSubview'd (like the banner label) is what
-    // makes the layer tree render.
-    uint64_t canvas = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
-                                      "initWithFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-    if (!r_is_objc_ptr(canvas)) { destroy_remote_call(); return -1; }
-    if (r_is_objc_ptr(clear)) r_msg2_main(canvas, "setBackgroundColor:", clear, 0,0,0);
-    r_msg2_main(canvas, "setUserInteractionEnabled:", 0, 0,0,0);
-    uint64_t canvasLayer = r_msg2_main(canvas, "layer", 0,0,0,0);
-    if (r_is_objc_ptr(canvasLayer)) {
-        r_msg2_main(canvasLayer, "addSublayer:", shape, 0,0,0);
-        // Fl0rk: _drawview_disable_line_layer_actions — kill implicit
-        // animations so per-frame setPath never races the render commit.
+    // VECTOR ATTEMPT 3 (Fl0rk-exact): add the shape layer DIRECTLY to the
+    // EXISTING SpringBoard keyWindow's root layer — Fl0rk's
+    // _drawview_find_or_create_view/_gDrawViewWindow suggests it reuses the
+    // live render tree rather than a fresh window. A new window's layer
+    // tree may not get shape-layer backing allocated (all our UIViews with
+    // content render, bare shape layers don't); the existing window's tree
+    // definitely renders every frame.
+    uint64_t winLayer = r_msg2_main(win, "layer", 0,0,0,0);
+    if (r_is_objc_ptr(winLayer)) {
+        r_msg2_main(winLayer, "addSublayer:", shape, 0,0,0);
         r_msg2_main(shape, "setActions:", 0, 0,0,0);
     }
-    r_msg2_main(container, "addSubview:", canvas, 0,0,0);
-    g_sbCanvas = canvas;
+    g_sbCanvas = 0; // no canvas — shape sits on the window root layer
 
     // container onto window — setHidden:NO is enough; makeKeyAndVisible on a
     // 999999-level window changed SB's key window → crash → respring.
