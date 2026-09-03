@@ -125,31 +125,27 @@ void kernelBootStart(void) {
         L(@"OK SpringBoard session pending (background).");
 
         L(@"RUN 6/6 Starting ESP renderer (offscreen data source)");
-        // ESP_View runs OFFSCREEN (no visible window): it reads the game via
-        // DSMemory at 60fps and mirrors its layers to the SpringBoard window
-        // via SBRemotePushESPFrame. NO DirectOverlay — all drawing goes to
-        // the SB window which renders above every app.
+        // ESP_View runs OFFSCREEN: StartDirectOverlay builds the in-app host
+        // window via its own inner dispatch_async(main) — so the hide pass
+        // must be queued AFTER that inner block (two main-queue hops). All
+        // visible drawing happens in the SpringBoard window.
         dispatch_async(dispatch_get_main_queue(), ^{
-            // Keep a strong ref forever — the view drives the ESP data loop.
-            static UIView *s_espSource = nil;
-            s_espSource = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
-            // Build the real ESP_View inside an hidden host window so its
-            // CADisplayLink/GCD timer runs and layers exist for the mirror.
             extern int StartDirectOverlay(void);
             StartDirectOverlay();
-            // Hide the in-app window right after creation — it exists only
-            // as the data-source host; nothing visible stays in-app.
-        });
-        dispatch_async(dispatch_get_main_queue(), ^{
-            // After StartDirectOverlay creates the window, hide it.
-            Class hudWinCls = objc_getClass("HUDMainWindow");
-            for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                if ([w isKindOfClass:hudWinCls]) {
-                    w.alpha = 0.0;      // invisible but layer tree still renders
-                    w.hidden = NO;      // must stay "shown" for layout/timers
-                    w.userInteractionEnabled = NO;
+            // Hop 2: runs after DirectOverlay's inner main-queue block,
+            // so the host window exists by now. alpha=0 keeps the layer
+            // tree rendering (hidden=YES would stop the ESP data loop).
+            dispatch_async(dispatch_get_main_queue(), ^{
+                Class hudWinCls = objc_getClass("HUDMainWindow");
+                for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                    if ([w isKindOfClass:hudWinCls]) {
+                        w.alpha = 0.0;
+                        w.hidden = NO;   // keep timer/layers alive
+                        w.userInteractionEnabled = NO;
+                    }
                 }
-            }
+                NSLog(@"[BOOT] in-app host window hidden — ESP mirrors to SpringBoard");
+            });
         });
         L(@"OK ESP data source active (mirroring to SpringBoard).");
     });
