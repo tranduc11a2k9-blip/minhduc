@@ -384,12 +384,10 @@ void SBRemotePushESPFrame(UIView *espView) {
 
     // FAST PATH (2 remote calls total):
     // ESP geometry is all straight segments (boxes, snaplines, bone lines,
-    // hp bars). Instead of replaying moveTo/AddLines per sub-path (10-30
-    // remote calls), flatten everything into ONE polyline where each
-    // sub-path break inserts a ZERO-LENGTH jump (repeat the previous end
-    // point) — the connecting stroke between sub-paths becomes invisible,
-    // so a single CGPathAddLines renders all segments correctly.
-    dlsym("CGPathClear", rp, 0,0,0,0,0,0,0);
+    // hp bars). Flatten everything into ONE polyline where each sub-path
+    // break inserts a ZERO-LENGTH jump (repeat the previous end point) —
+    // the connecting stroke between sub-paths becomes invisible, so a
+    // single CGPathAddLines renders all segments correctly.
     size_t len = ops.length;
     const uint8_t *b = (const uint8_t *)ops.bytes;
 
@@ -422,25 +420,31 @@ void SBRemotePushESPFrame(UIView *espView) {
     }
 
     // ONE remote_write into the persistent SB buffer + ONE CGPathAddLines.
+    // NOTE: mutation runs on a REMOTE worker thread while SB's main thread
+    // may be rendering the same path (setPath from the previous sync). The
+    // cached invocation's argument points at THIS path, so the swap is:
+    // mutate back-path → setPath(back-path) async. Ping-pong keeps the
+    // rendered path stable during mutation.
     if (n >= 2) {
         remote_write(ptsBuf, pts, n * 8);
+        dlsym("CGPathClear", rp, 0,0,0,0,0,0,0);
         dlsym("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
     }
 
-    // ONE setPath per sync — via the CACHED NSInvocation (Fl0rk
-    // _gDrawViewGeometryPathInvocation pattern): the invocation was built
-    // once at init targeting the shape layer; we only re-fire it with the
-    // persistent path. No per-frame NSInvocation build/retain/release —
-    // that churn raced SB's main thread and SIGBUS-crashed it.
+    // ONE setPath per sync — FIRE-AND-FORGET (waitUntilDone:NO).
+    // The previous version used waitUntilDone:YES; combined with the 5ms
+    // settle and the exception round-trip of every remote call, that
+    // starved SpringBoard's main run loop → watchdog "hung 60s" → respring
+    // (the stackshot log). Async posting never blocks SB's main thread.
     if (r_is_objc_ptr(g_sbSetPathInvocation)) {
         uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
         uint64_t invokeSel = r_sel("invoke");
         if (performSel && invokeSel) {
-            r_msg(g_sbSetPathInvocation, performSel, invokeSel, 0, 1, 0);
+            r_msg(g_sbSetPathInvocation, performSel, invokeSel, 0, 0, 0); // wait=0
         }
     } else {
-        // fallback: direct call (first frame before cache exists)
-        r_msg2_main(g_sbShape, "setPath:", rp, 0,0,0);
+        // fallback: async direct call (first frame before cache exists)
+        r_msg2_main_async(g_sbShape, "setPath:", rp, 0,0,0);
     }
 }
 
