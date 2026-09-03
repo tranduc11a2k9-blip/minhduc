@@ -3400,11 +3400,11 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     EspPawnSnap snaps[128];
     int snapN = 0;
 
-    uint64_t bestTarget = 0;
-    Vector3 bestHeadPos;
-    float bestScore = FLT_MAX;
-    float bestDistance = FLT_MAX;
-    bool isVis = false;
+    __attribute__((unused)) uint64_t bestTarget = 0;
+    __attribute__((unused)) Vector3 bestHeadPos;
+    __attribute__((unused)) float bestScore = FLT_MAX;
+    __attribute__((unused)) float bestDistance = FLT_MAX;
+    __attribute__((unused)) bool isVis = false;
 
     // Relative LOS buckets MUST live outside the player loop (reset once per frame).
     uint64_t bestAnyTarget = 0, bestLosTarget = 0;
