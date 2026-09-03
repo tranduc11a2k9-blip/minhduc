@@ -14,17 +14,17 @@ jobs:
       - name: Install Theos
         run: |
           git clone --depth 1 https://github.com/theos/theos.git "$HOME/theos"
-          # dm.pl is a separate repo that `make package` requires (not in main clone)
           git clone --depth 1 https://github.com/theos/dm.pl.git "$HOME/theos/vendor/dm.pl"
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           chmod +x "$HOME/theos/vendor/dm.pl/dm.pl" || true
+          # vendor/include and vendor/lib are needed for theos
+          "$HOME/theos/bin/update-theos" 2>&1 || true
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
       - name: Install iOS SDK
         run: |
-          cd "$HOME/theos"
-          git clone --depth 1 --filter=blob:none https://github.com/xybp888/iOS-SDKs.git sdks-tmp || \
-          git clone --depth 1 https://github.com/xybp888/iOS-SDKs.git sdks-tmp
-          cp -r sdks-tmp/iPhoneOS16.5.sdk "$HOME/theos/sdks/" 2>/dev/null || true
+          mkdir -p "$HOME/theos/sdks"
+          git clone --depth 1 https://github.com/xybp888/iOS-SDKs.git /tmp/sdks
+          cp -r /tmp/sdks/iPhoneOS16.5.sdk "$HOME/theos/sdks/" 2>/dev/null || true
           ls "$HOME/theos/sdks/"
 
       - name: Build
