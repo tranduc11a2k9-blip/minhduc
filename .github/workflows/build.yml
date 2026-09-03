@@ -20,14 +20,14 @@ jobs:
 
       - name: Install iOS SDK
         run: |
-          mkdir -p "$HOME/theos/sdks"
+          export THEOS="$GITHUB_WORKSPACE/theos"
+          mkdir -p "$THEOS/sdks"
           # Tonwalter888/iOS-SDKs has SDKs as real files (no submodules) — works with plain clone
           git clone --depth 1 https://github.com/Tonwalter888/iOS-SDKs.git /tmp/sdks
           ls /tmp/sdks/
-          cp -r /tmp/sdks/iPhoneOS18.6.sdk "$HOME/theos/sdks/" 2>/dev/null || \
-          cp -r /tmp/sdks/iPhoneOS18.6.sdk "$HOME/theos/sdks/" 2>/dev/null || true
-          ls "$HOME/theos/sdks/"
-          echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
+          cp -R /tmp/sdks/iPhoneOS18.6.sdk "$THEOS/sdks/"
+          ls "$THEOS/sdks/"
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
 
       - name: Build
         run: |
