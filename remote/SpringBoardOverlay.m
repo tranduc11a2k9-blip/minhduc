@@ -258,20 +258,49 @@ int SBoardStartOverlay(void) {
         r_msg2_main(container, "addSubview:", label, 0,0,0);
     }
 
-    // ---- SELF-TEST #2: plain UIView with a RED background ----
-    // If this red bar shows (next to the banner) but the V does not, then
-    // plain UIViews render while CAShapeLayers don't → the ESP mirror must
-    // use rect-views (line = thin colored view) instead of shape layers.
+    // ---- SELF-TEST #3: UIImageView with a static image ----
+    // Build a 64x64 white square image LOCALLY, upload its PNG/JPEG bytes,
+    // decode in SpringBoard via [UIImage imageWithData:], set on a
+    // fullscreen UIImageView. If this shows, the full ESP image mirror
+    // (ESP_View renderInContext → upload → setImage) will work.
     {
-        uint64_t redUIColor = r_msg2_main(clsCol, "redColor", 0,0,0,0);
-        uint64_t rectView = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
-                                            "initWithFrame:", (double[4]){20.0, 70.0, 120.0, 8.0}, 32,
-                                            NULL,0,NULL,0,NULL,0);
-        if (r_is_objc_ptr(rectView)) {
-            if (r_is_objc_ptr(redUIColor)) r_msg2_main(rectView, "setBackgroundColor:", redUIColor, 0,0,0);
-            r_msg2_main(rectView, "setUserInteractionEnabled:", 0, 0,0,0);
-            r_msg2_main(container, "addSubview:", rectView, 0,0,0);
-            NSLog(@"[SBOverlay] SELF-TEST red bar added (expect a red strip under the banner)");
+        // local: draw a simple white square with an X into a UIImage
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(64, 64), NO, 1.0);
+        CGContextRef lc = UIGraphicsGetCurrentContext();
+        if (lc) {
+            CGContextSetFillColorWithColor(lc, [UIColor redColor].CGColor);
+            CGContextFillRect(lc, CGRectMake(0, 0, 64, 64));
+            CGContextSetStrokeColorWithColor(lc, [UIColor whiteColor].CGColor);
+            CGContextSetLineWidth(lc, 4.0);
+            CGContextMoveToPoint(lc, 8, 8);  CGContextAddLineToPoint(lc, 56, 56);
+            CGContextMoveToPoint(lc, 56, 8); CGContextAddLineToPoint(lc, 8, 56);
+            CGContextStrokePath(lc);
+        }
+        UIImage *localImg = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        NSData *png = UIImagePNGRepresentation(localImg);
+        if (png.length > 0) {
+            uint64_t buf = dlsym("malloc", png.length, 0,0,0,0,0,0,0);
+            if (r_is_objc_ptr(buf) && remote_write(buf, png.bytes, png.length)) {
+                uint64_t dalloc = r_msg2_main(r_class("NSData"), "alloc", 0,0,0,0);
+                uint64_t data = r_msg2_main(dalloc, "initWithBytes:length:", buf, png.length, 0, 0);
+                dlsym("free", buf, 0,0,0,0,0,0,0);
+                if (r_is_objc_ptr(data)) {
+                    uint64_t uiimg = r_msg2_main(r_class("UIImage"), "imageWithData:", data, 0,0,0);
+                    dlsym("CFRelease", data, 0,0,0,0,0,0,0);
+                    if (r_is_objc_ptr(uiimg)) {
+                        double ivf[4] = {20.0, 70.0, 64.0, 64.0};
+                        uint64_t iv = r_msg2_main_raw(r_msg2_main(r_class("UIImageView"), "alloc", 0,0,0,0),
+                                                      "initWithFrame:", ivf, 32, NULL,0,NULL,0,NULL,0);
+                        if (r_is_objc_ptr(iv)) {
+                            r_msg2_main(iv, "setImage:", uiimg, 0,0,0);
+                            r_msg2_main(iv, "setUserInteractionEnabled:", 0, 0,0,0);
+                            r_msg2_main(container, "addSubview:", iv, 0,0,0);
+                            NSLog(@"[SBOverlay] SELF-TEST 3: UIImageView + uploaded image added (expect red square with white X)");
+                        }
+                    }
+                }
+            }
         }
     }
 
