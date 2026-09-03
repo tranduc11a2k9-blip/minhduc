@@ -44,6 +44,7 @@ static uint64_t g_sbSetPathInvocation = 0;
 static uint64_t g_sbPersistentPath = 0;
 static uint64_t g_sbMirrorPtsBuf = 0;
 static void sb_reset_mirror_state(void);
+static uint64_t persistentPath(void);
 
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
@@ -312,16 +313,16 @@ int SBoardStartOverlay(void) {
             uint64_t sig = r_msg(clsShape, sigSel, setPathSel, 0, 0, 0);
             if (r_is_objc_ptr(sig)) {
                 uint64_t clsInv = r_class("NSInvocation");
-                uint64_t inv = r_msg2_main(clsInv, "invocationWithMethodSignature:", sig, 0,0,0,0);
+                uint64_t inv = r_msg2_main(clsInv, "invocationWithMethodSignature:", sig, 0,0,0);
                 if (r_is_objc_ptr(inv)) {
-                    r_msg2_main(inv, "setTarget:", shape, 0,0,0,0);
-                    r_msg2_main(inv, "setSelector:", setPathSel, 0,0,0,0);
+                    r_msg2_main(inv, "setTarget:", shape, 0,0,0);
+                    r_msg2_main(inv, "setSelector:", setPathSel, 0,0,0);
                     // argument 2 = the CGPathRef (persistent — lives as long
                     // as the session; retained by the layer on each invoke)
                     uint64_t argBuf = dlsym("malloc", 8, 0,0,0,0,0,0,0);
                     if (r_is_objc_ptr(argBuf)) {
                         remote_write64(argBuf, rp);
-                        r_msg2_main(inv, "setArgument:atIndex:", argBuf, 2, 0,0,0);
+                        r_msg2_main(inv, "setArgument:atIndex:", argBuf, 2, 0,0);
                         dlsym("free", argBuf, 0,0,0,0,0,0,0);
                     }
                     r_msg2_main(inv, "retainArguments", 0,0,0,0);
