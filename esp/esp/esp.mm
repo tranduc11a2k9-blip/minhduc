@@ -2,6 +2,7 @@
 #import "ESPPrefs.h"
 #import "offset.h"
 #import "GameOffsets.h"
+#import "../DSMemory.h"
 
 #import "GameLogic.h" 
 #import <QuartzCore/QuartzCore.h>
