@@ -173,7 +173,7 @@ uint64_t ds_translate_page(uint64_t page_va) {
     page_va &= ~PAGE_MASK;
 
     // 1. find containing entry (use cache first)
-    uint64_t entry = 0, start = 0, end = 0, object = 0, obj_offset = 0;
+    uint64_t entry = 0, start = 0, __attribute__((unused)) end = 0, object = 0, obj_offset = 0;
 
     if (g_cached_entry && page_va >= g_cached_start && page_va < g_cached_end) {
         entry = g_cached_entry;
