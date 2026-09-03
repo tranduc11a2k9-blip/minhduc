@@ -45,7 +45,10 @@ $(APPLICATION_NAME)_CFLAGS += -fobjc-arc -Wno-deprecated-declarations -Wno-unuse
 $(APPLICATION_NAME)_CFLAGS += -I. -Iapp -Iapp/sources -Iesp/hud -Iapp/sources/KIF -Iapp/oxorany
 $(APPLICATION_NAME)_CFLAGS += -Iesp -Iesp/esp -Iesp/esp/espdraw
 $(APPLICATION_NAME)_CFLAGS += -I$(PWD) -I$(PWD)/XPF/src -I$(PWD)/XPF/external/ChOma/include
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
 $(APPLICATION_NAME)_CFLAGS += -I$(PWD)/utils/xpc -I$(PWD)/utils/fileport
+endif
 $(APPLICATION_NAME)_CFLAGS += -DNOTIFY_DESTROY_HUD="\"vn.vng.freefireth.hud.destroy\""
 $(APPLICATION_NAME)_CFLAGS += -DPID_PATH="@\"/var/mobile/Library/Caches/vn.vng.freefireth.pid\""
 $(APPLICATION_NAME)_CCFLAGS += -std=c++17
