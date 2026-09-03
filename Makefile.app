@@ -48,6 +48,9 @@ $(APPLICATION_NAME)_CFLAGS += -I$(PWD) -I$(PWD)/remote -I$(PWD)/XPF/src -I$(PWD)
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
 $(APPLICATION_NAME)_CFLAGS += -I$(PWD)/utils/xpc -I$(PWD)/utils/fileport
+else
+# macOS: use real SDK headers if present; otherwise our minimal stubs
+$(APPLICATION_NAME)_CFLAGS += -I$(PWD)/utils/xpc -I$(PWD)/utils/fileport
 endif
 $(APPLICATION_NAME)_CFLAGS += -DNOTIFY_DESTROY_HUD="\"vn.vng.freefireth.hud.destroy\""
 $(APPLICATION_NAME)_CFLAGS += -DPID_PATH="@\"/var/mobile/Library/Caches/vn.vng.freefireth.pid\""
