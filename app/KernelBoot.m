@@ -10,6 +10,7 @@
 //
 
 #import "KernelBoot.h"
+#import <QuartzCore/QuartzCore.h> // CACurrentMediaTime
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/kutils.h"
 #import "../sandbox_escape.h"
@@ -141,8 +142,17 @@ void kernelBootStart(void) {
                     : @"WARN sandbox_escape returned %d", sret);
 
         // ---- RUN 4/6 ----
-        L(@"RUN 4/6 Opening SpringBoard injection channel");
-        L(@"OK Channel mapped.");
+        L(@"RUN 4/6 Opening SpringBoard injection channel (parallel)");
+        // Fire SB overlay init NOW — it takes 2-5s to establish the remote
+        // channel + create layers. By the time RUN 6/6 finishes, it's ready.
+        // If it fails, DirectOverlay fallback still works.
+        __block BOOL sbDone = NO;
+        __block int sbret = -1;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            sbret = SBoardStartOverlay();
+            sbDone = YES;
+        });
+        L(@"OK Channel spawning in background.");
 
         // ---- RUN 5/6 ----
         L(@"RUN 5/6 Preparing SpringBoard session");
@@ -152,23 +162,23 @@ void kernelBootStart(void) {
         L(@"RUN 6/6 Starting ESP overlay");
         [[KeepAlive shared] start];
 
-        // DirectOverlay (in-app) starts INSTANTLY — ESP_View renders <1s.
-        // This is the primary overlay. SpringBoard remote is a background
-        // enhancement that never blocks the boot flow.
-        L(@"RUN 6/6 Starting DirectOverlay (instant)");
-        extern int StartDirectOverlay(void);
-        int dret = StartDirectOverlay();
-        L(dret == 0 ? @"OK DirectOverlay active."
-                    : @"WARN StartDirectOverlay returned %d", dret);
-
-        // SB remote overlay: non-blocking, 5s timeout, async.
-        // If it succeeds, the vector ESP layers in SpringBoard replace the
-        // in-app window; if it fails, the app-only overlay still works.
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            int sbret = SBoardStartOverlay();
-            L(sbret == 0 ? @"OK SB overlay backup active."
-                        : @"WARN SB overlay unavailable.");
-        });
+        // Wait up to ~2s for SB overlay to finish establishing.
+        // If ready → SB window (renders over every app, incl. game).
+        // If not → DirectOverlay instantly, SB keeps loading in bg.
+        {
+            double deadline = CACurrentMediaTime() + 2.0;
+            while (!sbDone && CACurrentMediaTime() < deadline) {
+                usleep(50000); // 50ms
+            }
+            if (sbDone && sbret == 0) {
+                L(@"OK SpringBoard overlay active (over every app).");
+            } else {
+                extern int StartDirectOverlay(void);
+                int dret = StartDirectOverlay();
+                L(dret == 0 ? @"OK DirectOverlay active (SB still loading)."
+                            : @"WARN DirectOverlay returned %d", dret);
+            }
+        }
         g_ready = YES;
         g_booting = NO;
         L(@"OK ESP overlay active.");
