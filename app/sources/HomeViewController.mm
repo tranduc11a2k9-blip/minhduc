@@ -39,6 +39,8 @@ static const CGFloat kMenuButtonSize = 56.0f;
 @property (nonatomic, strong) UISwitch *espSwitch;
 @property (nonatomic, strong) UILabel *camLabel;
 @property (nonatomic, strong) UISwitch *camSwitch;
+@property (nonatomic, strong) UISlider *camSlider;
+@property (nonatomic, strong) UILabel *camValueLabel;
 
 @property (nonatomic, strong) UILabel *versionSectionLabel;
 @property (nonatomic, strong) UIButton *ffMaxCard;
@@ -392,6 +394,21 @@ static const CGFloat kMenuButtonSize = 56.0f;
     [_camSwitch addTarget:self action:@selector(camSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [_togglesCard addSubview:_camSwitch];
 
+    // CamPC distance slider (0-150, default 30 — matches ESPPrefs default)
+    _camSlider = [[UISlider alloc] initWithFrame:CGRectZero];
+    _camSlider.minimumValue = 0.0f;
+    _camSlider.maximumValue = 150.0f;
+    _camSlider.value = ESPPrefsFloat(@"CamPCValue", 30.0f);
+    _camSlider.minimumTrackTintColor = [self accentGreen];
+    [_camSlider addTarget:self action:@selector(camSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    [_togglesCard addSubview:_camSlider];
+
+    _camValueLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _camValueLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightSemibold];
+    _camValueLabel.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
+    _camValueLabel.text = [NSString stringWithFormat:@"%.0f", _camSlider.value];
+    [_togglesCard addSubview:_camValueLabel];
+
     // Boot log card (Fl0rk-style console)
     _logCard = [self makeCard];
     [_contentView addSubview:_logCard];
@@ -577,8 +594,8 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _controlSubtitleLabel.frame = CGRectMake(textX, 44, textW, 28);
     y = CGRectGetMaxY(_controlCard.frame) + 12;
 
-    // Quick toggles card (Aimbot / ESP / CamPC)
-    CGFloat togglesH = 134.0f;
+    // Quick toggles card (Aimbot / ESP / CamPC + slider)
+    CGFloat togglesH = 176.0f;
     _togglesCard.frame = CGRectMake(xPad, y, cardW, togglesH);
     _aimbotLabel.frame = CGRectMake(16, 14, 200, 24);
     _aimbotSwitch.frame = CGRectMake(cardW - 68, 10, 51, 31);
@@ -586,6 +603,8 @@ static const CGFloat kMenuButtonSize = 56.0f;
     _espSwitch.frame = CGRectMake(cardW - 68, 50, 51, 31);
     _camLabel.frame = CGRectMake(16, 94, 200, 24);
     _camSwitch.frame = CGRectMake(cardW - 68, 90, 51, 31);
+    _camSlider.frame = CGRectMake(16, 128, cardW - 90, 30);
+    _camValueLabel.frame = CGRectMake(cardW - 64, 130, 48, 24);
     y = CGRectGetMaxY(_togglesCard.frame) + 12;
 
     // Boot log card
@@ -723,6 +742,13 @@ static const CGFloat kMenuButtonSize = 56.0f;
 
 - (void)camSwitchChanged:(UISwitch *)sender {
     ESPPrefsSetBoolLive(@"CamPC", sender.on);
+    ESPSyncFromPrefs();
+}
+
+- (void)camSliderChanged:(UISlider *)sender {
+    float v = sender.value;
+    _camValueLabel.text = [NSString stringWithFormat:@"%.0f", v];
+    ESPPrefsSetFloat(@"CamPCValue", v);
     ESPSyncFromPrefs();
 }
 
