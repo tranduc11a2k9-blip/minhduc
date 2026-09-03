@@ -3968,7 +3968,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                 CGPathAddArc(tempArc, NULL, edgeX, edgeY, radius, startAngle, endAngle, false);
                 CGPathAddPath(targetArc, NULL, tempArc);
                 CGPathRelease(tempArc);
-                NSData *distTextBytes = [["[%dM]"] dataUsingEncoding:NSUTF8StringEncoding];
+                NSData *distTextBytes = [@"[%dM]" dataUsingEncoding:NSUTF8StringEncoding];
                 NSString *distTextFormat = [[NSString alloc] initWithData:distTextBytes encoding:NSUTF8StringEncoding];
                 NSString *distText = [NSString stringWithFormat:distTextFormat, (int)s.dis];
                 CGRect textFrame = CGRectMake(edgeX - radius, edgeY - 4.5f, radius * 2.0f, 10.0f);
