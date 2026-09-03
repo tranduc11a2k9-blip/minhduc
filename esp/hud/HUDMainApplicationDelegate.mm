@@ -323,17 +323,33 @@ BOOL HUDFloatButtonHandleTouch(CGPoint screenPoint, UITouchPhase phase, NSIntege
     GameOffsetsReload();
     _gameMissingStreak = 0;
 
-    // ---- RUN KERNEL EXPLOIT (Fl0rk-style: child process owns exploit) ----
+    // ---- RUN KERNEL EXPLOIT (Fl0rk-style: HUD child process owns exploit) ----
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSLog(@"[HUD] Running kexploit...");
-        int kret = kexploit_opa334();
-        if (kret != 0) {
-            NSLog(@"[HUD] kexploit failed: %d", kret);
-            return;
+        // Park guard: if a previous HUD already exploited THIS boot session,
+        // re-running the race double-corrupts the socket zone → panic.
+        NSString *parkPath = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
+                              stringByAppendingPathComponent:@".minhduc_hud_parked"];
+        BOOL parked = [[NSFileManager defaultManager] fileExistsAtPath:parkPath];
+
+        if (!parked) {
+            NSLog(@"[HUD] Running kexploit (first time this boot)...");
+            int kret = kexploit_opa334();
+            if (kret != 0) {
+                NSLog(@"[HUD] kexploit failed: %d", kret);
+                return;
+            }
+            [@"1" writeToFile:parkPath atomically:YES
+                     encoding:NSUTF8StringEncoding error:nil];
+            NSLog(@"[HUD] exploit OK — parked for this boot.");
+        } else {
+            NSLog(@"[HUD] Parked state — exploit already ran this boot. Using primitives directly.");
         }
-        uint64_t self_proc = proc_self();
-        int sret = sandbox_escape(self_proc);
-        NSLog(@"[HUD] sandbox_escape: %d", sret);
+
+        // Kernel r/w globals are process-wide (early_kread64) — DSMemory and
+        // ESP_View reads work in THIS process without extra setup.
+        extern bool g_kexploit_ready;
+        NSLog(@"[HUD] g_kexploit_ready=%d (parked=%d)", g_kexploit_ready, parked);
+
         dispatch_async(dispatch_get_main_queue(), ^{
             NSLog(@"[HUD] Kernel r/w + sandbox OK — overlay active");
         });
@@ -341,20 +357,23 @@ BOOL HUDFloatButtonHandleTouch(CGPoint screenPoint, UITouchPhase phase, NSIntege
 
     _gameCheckTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     if (_gameCheckTimer) {
-        // Start sooner, poll every 1s, exit after 2 consecutive misses (~2s).
+        // Wait 10s before first game check (gives user time to switch to FF).
+        // Then poll every 2s. Require 15 consecutive misses (~30s) to exit —
+        // the user may be in lobby or between matches.
         dispatch_source_set_timer(_gameCheckTimer,
-                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                                  (uint64_t)(1.0 * NSEC_PER_SEC),
-                                  (uint64_t)(0.2 * NSEC_PER_SEC));
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                                  (uint64_t)(2.0 * NSEC_PER_SEC),
+                                  (uint64_t)(0.5 * NSEC_PER_SEC));
+        const int kHUDExitThreshold = 15;
         __weak __typeof__(self) wself = self;
         dispatch_source_set_event_handler(_gameCheckTimer, ^{
             __strong __typeof__(wself) sself = wself;
             if (!sself) return;
             if (!GameTargetIsRunning()) {
                 sself->_gameMissingStreak++;
-                if (sself->_gameMissingStreak < 2) return;
+                if (sself->_gameMissingStreak < kHUDExitThreshold) return;
 
-                // Hide overlays immediately before process exit.
+                // Game gone for too long — exit HUD.
                 if (sself.window) {
                     sself.window.hidden = YES;
                     sself.window.alpha = 0.0f;
