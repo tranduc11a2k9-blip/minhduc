@@ -342,16 +342,26 @@ BOOL HUDFloatButtonHandleTouch(CGPoint screenPoint, UITouchPhase phase, NSIntege
                      encoding:NSUTF8StringEncoding error:nil];
             NSLog(@"[HUD] exploit OK — parked for this boot.");
         } else {
-            NSLog(@"[HUD] Parked state — exploit already ran this boot. Using primitives directly.");
+            NSLog(@"[HUD] Parked state — exploit already ran this boot.");
         }
 
-        // Kernel r/w globals are process-wide (early_kread64) — DSMemory and
-        // ESP_View reads work in THIS process without extra setup.
+        // NOJB: platformize FIRST (before sandbox_escape rotates cred) so
+        // AMFI treats this process as a system app → GSInitialize +
+        // BKSDisplayServicesStart + system UI work. The window then renders
+        // above every app.
+        extern int platformize_self(uint64_t);
+        uint64_t self_proc = proc_self();
+        int pret = platformize_self(self_proc);
+        NSLog(@"[HUD] platformize_self=%d", pret);
+
+        int sret = sandbox_escape(self_proc);
+        NSLog(@"[HUD] sandbox_escape=%d", sret);
+
         extern bool g_kexploit_ready;
         NSLog(@"[HUD] g_kexploit_ready=%d (parked=%d)", g_kexploit_ready, parked);
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSLog(@"[HUD] Kernel r/w + sandbox OK — overlay active");
+            NSLog(@"[HUD] Kernel r/w + platformized + sandbox OK — overlay over every app");
         });
     });
 
