@@ -2,7 +2,7 @@
 #import "esp.h"
 #import "ESPPrefs.h"
 #import "menu.h"
-#import "../mahoa.h"
+#import "mahoa.h"
 #import <UIKit/UIKit.h>
 #import <CoreText/CoreText.h>
 #import <objc/runtime.h>

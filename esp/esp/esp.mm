@@ -3048,7 +3048,6 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                         task = get_task;
                         g_target_task = get_task;
                         s_attachedPid = curPid;
-                        }
                         gEngine = (void *)1; // DSMemory
                     } else {
                         // Keep previous base if any — only clear when process gone.
@@ -3104,39 +3103,6 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
 
 {
-    // Brutal — same as old MakeTipar (JRScan full ON/OFF).
-    //   ON : scan ORIGINAL → write HACKED
-    //   OFF: scan HACKED   → write ORIGINAL
-    // + refresh task; + leave-match forces OFF restore if still patched.
-    static std::atomic<bool> patched(false);
-    static std::atomic<bool> busy(false);
-    static pid_t s_brutalPid = -1;
-    static bool s_wasInMatch = false;
-
-    pid_t curPid = (pid_t)GameTargetProcessPid();
-    if (curPid != s_brutalPid) {
-        s_brutalPid = curPid;
-        patched.store(false);
-        g_brutalPatched.store(false);
-        g_brutalHasAddrs.store(false);
-        s_wasInMatch = false;
-    }
-
-    const bool inMatch = stats.inMatch && curPid > 0;
-    // Old source: want = Norecoil. We still only APPLY while in match;
-    // leaving match with toggle ON runs OFF restore (prevents stuck patch).
-    const bool wantApply = Norecoil && inMatch && curPid > 0;
-    const bool leftMatch = s_wasInMatch && !inMatch;
-    s_wasInMatch = inMatch;
-
-    // Effective patch target: ON only in match; OFF when toggle off OR left match while patched.
-    bool want = wantApply;
-    if (leftMatch && patched.load()) want = false;
-    if (!Norecoil) want = false;
-
-
-}
-
         if (showVisuals && stats.aimAssistPath) {
             MenuViewApplyPath(self.aimAssistLayer, stats.aimAssistPath, YES);
             CGPathRelease(stats.aimAssistPath);
@@ -4003,7 +3969,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                 CGPathAddArc(tempArc, NULL, edgeX, edgeY, radius, startAngle, endAngle, false);
                 CGPathAddPath(targetArc, NULL, tempArc);
                 CGPathRelease(tempArc);
-                NSData *distTextBytes = [NSSENCRYPT("[%dM]") dataUsingEncoding:NSUTF8StringEncoding];
+                NSData *distTextBytes = [["[%dM]"] dataUsingEncoding:NSUTF8StringEncoding];
                 NSString *distTextFormat = [[NSString alloc] initWithData:distTextBytes encoding:NSUTF8StringEncoding];
                 NSString *distText = [NSString stringWithFormat:distTextFormat, (int)s.dis];
                 CGRect textFrame = CGRectMake(edgeX - radius, edgeY - 4.5f, radius * 2.0f, 10.0f);
