@@ -6,7 +6,7 @@
 //  RUN 3/6 Racing kernel allocator for r/w primitives
 //  RUN 4/6 Opening SpringBoard injection channel
 //  RUN 5/6 Preparing SpringBoard session
-//  RUN 6/6 Starting ESP overlay
+//  RUN 6/6 Starting ESP overlay (SpringBoard remote window)
 //
 
 #import "KernelBoot.h"
@@ -33,16 +33,26 @@ static void L(NSString *fmt, ...) {
     dispatch_async(dispatch_get_main_queue(), ^{ kernelBootLog(s); });
 }
 
-// 4/6 + 5/6 — SpringBoard session prep (Direct overlay inside app session)
+// 4/6 + 5/6 — SpringBoard session prep
 #import "SpringBoardOverlay.h"
+
+// Park file lives in the APP CONTAINER (sandbox-readable for BOTH the main
+// app and the HUD subprocess). The old /var/mobile/.minhduc_parked was NOT
+// readable from a sandboxed sideload app, so the HUD always re-ran the
+// exploit → double-corrupt → panic. Guard by boot-time, not file access.
+#define PARK_PATH @"Library/Caches/.minhduc_parked"
+
+static NSString *parkFileFullPath(void) {
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    return [caches stringByAppendingPathComponent:@".minhduc_parked"];
+}
 
 void kernelBootStart(void) {
     if (g_booting) return;
     if (g_ready) {
         L(@"OK Already booted — starting overlay directly.");
         [[KeepAlive shared] start];
-        // MUST be off main thread — SBoardStartOverlay blocks up to 10s on
-        // the remote-call init; on main this froze the whole app ("đơ lag").
+        // MUST be off main thread — the remote-call init blocks.
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             if (SBoardStartOverlay() != 0) {
                 extern int StartDirectOverlay(void);
@@ -52,13 +62,12 @@ void kernelBootStart(void) {
         return;
     }
 
-    // PARKED-STATE FAST PATH (Fl0rk-style): if a previous run already
-    // exploited the kernel this boot session, skip re-running the exploit —
-    // re-running double-corrupts the socket zone and panics.
+    // PARKED-STATE FAST PATH: if the exploit already ran this boot session
+    // (park file exists AND device has not rebooted), skip re-running it —
+    // re-running double-corrupts the socket zone -> panic.
     {
-        NSString *parkFile = @"/var/mobile/.minhduc_parked";
-        if ([[NSFileManager defaultManager] fileExistsAtPath:parkFile] &&
-            [[NSString stringWithContentsOfFile:parkFile encoding:NSUTF8StringEncoding error:nil] isEqualToString:@"1"]) {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:parkFileFullPath()]) {
             L(@"OK Parked state found — skipping exploit, starting overlay.");
             g_ready = YES;
             [[KeepAlive shared] start];
@@ -94,7 +103,6 @@ void kernelBootStart(void) {
         L(@"KRW No cached state — running fresh exploit chain.");
         L(@"KRW Racing TCP socket zone allocator...");
         int kret = kexploit_opa334();
-        // debug values from exploit — hiển thị ra log card
         extern uint64_t g_dbg_rwSocketPcb;
         extern uint64_t g_dbg_socket;
         extern uint64_t g_dbg_thread;
@@ -111,12 +119,13 @@ void kernelBootStart(void) {
         L(@"OK Kernel mapped.");
         L(@"OK State parked — next run will skip the exploit chain.");
 
-        // Persist parked state to disk. Next app launch (before any reboot)
-        // skips re-running the exploit — re-running it on the same kernel
-        // session double-corrupts the socket zone -> panic. Fl0rk does the same.
+        // Persist parked state (in APP CONTAINER — sandbox-readable by both
+        // the main app and the HUD subprocess; /var/mobile was NOT).
         {
-            NSString *parkFile = @"/var/mobile/.minhduc_parked";
-            [@"1" writeToFile:parkFile atomically:YES
+            NSString *park = parkFileFullPath();
+            [[NSFileManager defaultManager] createDirectoryAtPath:[park stringByDeletingLastPathComponent]
+                                      withIntermediateDirectories:YES attributes:nil error:nil];
+            [@"1" writeToFile:park atomically:YES
                      encoding:NSUTF8StringEncoding error:nil];
         }
 
@@ -126,7 +135,6 @@ void kernelBootStart(void) {
         // On iOS 17.5.1, patching cred/AMFI triggers kernel SMR to reclaim the
         // cred object mid-write -> use-after-free kernel panic. The sandbox
         // extension patch below is sufficient: it gives full R+W filesystem.
-        // Kernel rw (early_kread64/early_kwrite64) is our real power for ESP/FF.
 
         int sret = sandbox_escape(self_proc);
         L(sret == 0 ? @"OK Sandbox escaped (R+W filesystem)."
@@ -143,28 +151,21 @@ void kernelBootStart(void) {
         // ---- RUN 6/6 ----
         L(@"RUN 6/6 Starting ESP overlay");
         // Keep the process ALIVE forever — the corrupted kernel sockets must
-        // never be freed on app exit, or iOS panics (zone check). Audio
-        // keepalive + background task prevent the exit path.
+        // never be freed on app exit, or iOS panics (zone check).
         [[KeepAlive shared] start];
 
-        // ESP_View (DirectOverlay) FIRST — in-app, appears in <1s.
-        // The 30s SBoardStartOverlay remote init was blocking RUN 6/6, which
-        // delayed ESP by up to 30s and froze the UI. Overlay-over-game works
-        // because the app keeps running in background via audio KeepAlive.
-        L(@"RUN 6/6 Starting DirectOverlay (instant in-app overlay)");
-        extern int StartDirectOverlay(void);
-        int dret = StartDirectOverlay();
-        L(dret == 0 ? @"OK DirectOverlay active."
-                    : @"WARN StartDirectOverlay returned %d", dret);
-
-        // SB-hosted window is a background enhancement (survives app kill),
-        // never a blocker: short timeout, off-main.
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            int sret = SBoardStartOverlay();
-            if (sret == 0) {
-                L(@"OK SpringBoard overlay backup active.");
-            }
-        });
+        // Fl0rk-style: remote call into SpringBoard to create a system-level
+        // overlay window (cyanide statbar pattern — scene-attached UIWindow +
+        // UILabel subview). This window sits above EVERY app.
+        L(@"RUN 6/6 Starting SpringBoard remote overlay");
+        int sbret = SBoardStartOverlay();
+        L(sbret == 0 ? @"OK SpringBoard overlay active."
+                     : @"WARN SBoardStartOverlay returned %d", sbret);
+        // Fallback to in-app overlay if remote fails.
+        if (sbret != 0) {
+            extern int StartDirectOverlay(void);
+            StartDirectOverlay();
+        }
         g_ready = YES;
         g_booting = NO;
         L(@"OK ESP overlay active.");

@@ -5,8 +5,10 @@
 
 + (BOOL)_isSystemWindow { return YES; }
 - (BOOL)_isWindowServerHostingManaged { return NO; }
-- (BOOL)_isSecure { return YES; }
-- (BOOL)_shouldCreateContextAsSecure { return YES; }
+// NOT secure — _isSecure=YES made iOS 17+ hide this window entirely
+// (secure windows are only composited into the secure display path).
+- (BOOL)_isSecure { return NO; }
+- (BOOL)_shouldCreateContextAsSecure { return NO; }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
