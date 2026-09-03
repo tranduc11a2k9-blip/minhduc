@@ -315,9 +315,10 @@ int SBoardStartOverlay(void) {
 
     // lara pattern: bring our container to the front of the EXISTING window
     uint64_t selBringFront = r_sel("bringSubviewToFront:");
+    uint64_t selAddSub = r_sel("addSubview:");
     // container onto the EXISTING SB keyWindow (never key it — that kills SB)
-    r_msg2_main(win, "addSubview:", container, 0,0,0);
-    if (r_is_objc_ptr(selBringFront)) r_msg2_main(win, selBringFront, container, 0,0,0);
+    r_msg(win, selAddSub, container, 0, 0, 0);
+    if (r_is_objc_ptr(selBringFront)) r_msg(win, selBringFront, container, 0, 0, 0);
     g_sbShape = shape;
 
     // retain container via associated object on the app (lara keeps remote
