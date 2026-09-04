@@ -3,6 +3,7 @@
 #import "GameOffsets.h"
 #import "Il2CppMatch.h"
 #import "../DSMemory.h"
+#import "../../app/KernelBoot.h"
 #import "../../remote/RemoteCall.h"
 #import <Foundation/Foundation.h>
 #import <math.h>
