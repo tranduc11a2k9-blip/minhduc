@@ -126,7 +126,7 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
  
     uint64_t entryAddr = vm_map_find_entry(map, address);
     if (!entryAddr) {
-        printf("[%s:%d] vm_map_find_entry failed\n", __FUNCTION__, __LINE__);
+        printf("[DS][%s:%d] vm_map_find_entry failed\n", __FUNCTION__, __LINE__);
         return result;
     }
  
@@ -142,7 +142,7 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
     uint32_t vme_object = entry.vme_object_or_delta;
     uint64_t vmeObject = vm_unpack_pointer((uint64_t)vme_object, &params);
     if (!is_kaddr_valid(vmeObject)) {
-        printf("[%s:%d] invalid VM object 0x%llx for user address 0x%llx\n",
+        printf("[DS][%s:%d] invalid VM object 0x%llx for user address 0x%llx\n",
                __FUNCTION__, __LINE__,
                (unsigned long long)vmeObject,
                (unsigned long long)address);
@@ -167,7 +167,7 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
 {
     struct VMShmem shmem = {0};
     if (!object || !is_kaddr_valid(object->address)) {
-        printf("[%s:%d] invalid VM object 0x%llx\n",
+        printf("[DS][%s:%d] invalid VM object 0x%llx\n",
                __FUNCTION__, __LINE__,
                object ? (unsigned long long)object->address : 0);
         return shmem;
@@ -180,7 +180,7 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
     mach_vm_address_t localAddr = 0;
     kern_return_t ret = mach_vm_allocate(mach_task_self_, &localAddr, roundedSize, VM_FLAGS_ANYWHERE);
     if (ret != KERN_SUCCESS) {
-        printf("[%s:%d] mach_vm_allocate failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
+        printf("[DS][%s:%d] mach_vm_allocate failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
         return shmem;
     }
  
@@ -188,7 +188,7 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
     memory_object_size_t entrySize = roundedSize;
     ret = mach_make_memory_entry_64(mach_task_self_, &entrySize, (memory_object_offset_t)localAddr, VM_PROT_READ | VM_PROT_WRITE, &memoryObject, MACH_PORT_NULL);
     if (ret != KERN_SUCCESS) {
-        printf("[%s:%d] mach_make_memory_entry_64 failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
+        printf("[DS][%s:%d] mach_make_memory_entry_64 failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
         mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
         return shmem;
     }
@@ -202,7 +202,7 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
     
  
     if (entry.vme_kernel_object || entry.is_sub_map) {
-        printf("[%s:%d] Entry cannot be a submap or kernel object\n", __FUNCTION__, __LINE__);
+        printf("[DS][%s:%d] Entry cannot be a submap or kernel object\n", __FUNCTION__, __LINE__);
         mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
         return shmem;
     }
@@ -232,13 +232,13 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
                        (memory_object_offset_t)object->entryOffset,
                        FALSE, curProt, maxProt, VM_INHERIT_NONE);
     if (ret != KERN_SUCCESS) {
-        printf("[%s:%d] mach_vm_map failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
+        printf("[DS][%s:%d] mach_vm_map failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
         mappedAddr = 0;
     }
  
     ret = mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
     if (ret != KERN_SUCCESS)
-        printf("[%s:%d] mach_vm_deallocate failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
+        printf("[DS][%s:%d] mach_vm_deallocate failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
  
     shmem.port          = (uint64_t)memoryObject;
     shmem.remoteAddress = object->vmAddress;
@@ -254,7 +254,7 @@ struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address)
     struct VMObject vmObject = vm_get_object(vmMap, address);
     if (!vmObject.address)
     {
-        printf("[%s:%d] Failed to get VM object for 0x%llx\n", __FUNCTION__, __LINE__, (unsigned long long)address);
+        printf("[DS][%s:%d] Failed to get VM object for 0x%llx\n", __FUNCTION__, __LINE__, (unsigned long long)address);
         return shmem;
     }
  
