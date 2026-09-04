@@ -42,20 +42,34 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
     if (!isVaildPtr((uintptr_t)Moudule_Base))
         return 0;
 
-    // PRIMARY: il2cpp runtime API (revision-proof — engine functions resolve
-    // GameFacade by name; zero hardcoded TypeInfo offsets).
-    // Needs a RemoteCall session into the FreeFire process — init once (cheap
-    // if already up), skip silently on failure (fallbacks below still run).
+    // PRIMARY (cached): il2cpp runtime API resolves MatchGame through the
+    // FreeFire process. CRITICAL SAFETY RULES learned from the kernel panic
+    // (zone 'threads' UAF):
+    //   1. RemoteCall engine has ONE global state — the SpringBoard session
+    //      (overlay) must NOT be clobbered by an FF session. Only init FF
+    //      when no other session is alive.
+    //   2. NEVER call this every frame — cache the result; game restart
+    //      (pid change) is the only re-resolve trigger.
     {
+        static uint64_t s_cachedMatch = 0;
+        static pid_t s_cachedPid = -1;
         static int s_ffRcState = 0; // 0=untried 1=ok 2=failed
+        pid_t curPid = ds_pid();
+        if (s_cachedMatch && curPid == s_cachedPid) return s_cachedMatch; // fast path
+
         if (s_ffRcState == 0) {
             s_ffRcState = (init_remote_call("FreeFire", false) == 0) ? 1 : 2;
             NSLog(@"[GL] FF RemoteCall init: %@", s_ffRcState == 1 ? @"OK" : @"failed");
         }
         if (s_ffRcState == 1) {
             uint64_t mg = Il2CppResolveMatchGame();
-            if (isVaildPtr(mg)) return mg;
+            if (isVaildPtr(mg)) {
+                s_cachedMatch = mg;
+                s_cachedPid = curPid;
+                return mg;
+            }
         }
+        // fall through to offset-based paths (SB session untouched)
     }
 
     // SECONDARY: hardcoded candidates (kept as fallback when the il2cpp path
