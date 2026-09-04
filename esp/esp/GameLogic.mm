@@ -1,6 +1,7 @@
 #import "GameLogic.h"
 #import "offset.h"
 #import "GameOffsets.h"
+#import "../../remote/RemoteCall.h"
 #import <Foundation/Foundation.h>
 #import <math.h>
 
@@ -40,6 +41,25 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
     if (!isVaildPtr((uintptr_t)Moudule_Base))
         return 0;
 
+    // PRIMARY: il2cpp runtime API (revision-proof — engine functions resolve
+    // GameFacade by name; zero hardcoded TypeInfo offsets).
+    // Needs a RemoteCall session into the FreeFire process — init once (cheap
+    // if already up), skip silently on failure (fallbacks below still run).
+    {
+        static int s_ffRcState = 0; // 0=untried 1=ok 2=failed
+        if (s_ffRcState == 0) {
+            s_ffRcState = (init_remote_call("FreeFire", false) == 0) ? 1 : 2;
+            NSLog(@"[GL] FF RemoteCall init: %@", s_ffRcState == 1 ? @"OK" : @"failed");
+        }
+        if (s_ffRcState == 1) {
+            extern uint64_t Il2CppResolveMatchGame(void);
+            uint64_t mg = Il2CppResolveMatchGame();
+            if (isVaildPtr(mg)) return mg;
+        }
+    }
+
+    // SECONDARY: hardcoded candidates (kept as fallback when the il2cpp path
+    // cannot run — e.g. RemoteCall into FF unavailable).
     // Primary TypeInfo from offset table + a few nearby candidates if season moved it.
     uint64_t primary = (uint64_t)kGameFacadeTypeInfo;
     uint64_t candidates[] = {
