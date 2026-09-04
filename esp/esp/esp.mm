@@ -4330,7 +4330,6 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     }
 
     // allowThroughWall already sampled above (aim pick + sticky resolve share it).
-    }
 
     // -------------------------------------------------------------------------
     // Drop stale locks for pawns that left this frame's processed set.
