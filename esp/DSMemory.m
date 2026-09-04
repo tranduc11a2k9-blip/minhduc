@@ -189,7 +189,16 @@ int ds_attach(void) {
     }
 
     if (!g_ff_base) {
-        NSLog(@"[DS] module base not found");
+        static int s_baseLogged = 0;
+        if (!s_baseLogged) {
+            s_baseLogged = 1;
+            NSLog(@"[DS] module base not found (nentries walk failed)");
+            kernel_boot_log_fn logFn = kernelBootLog;
+            if (logFn) {
+                NSString *line = @"[diag] thấy FF nhưng không đọc được memory (vm_map walk fail)";
+                dispatch_async(dispatch_get_main_queue(), ^{ logFn(line); });
+            }
+        }
         return -1;
     }
 
