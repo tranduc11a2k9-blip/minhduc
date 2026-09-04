@@ -1,6 +1,7 @@
 #import "GameLogic.h"
 #import "offset.h"
 #import "GameOffsets.h"
+#import "Il2CppMatch.h"
 #import "../../remote/RemoteCall.h"
 #import <Foundation/Foundation.h>
 #import <math.h>
@@ -52,7 +53,6 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
             NSLog(@"[GL] FF RemoteCall init: %@", s_ffRcState == 1 ? @"OK" : @"failed");
         }
         if (s_ffRcState == 1) {
-            extern uint64_t Il2CppResolveMatchGame(void);
             uint64_t mg = Il2CppResolveMatchGame();
             if (isVaildPtr(mg)) return mg;
         }
