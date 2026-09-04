@@ -172,6 +172,7 @@ int ds_attach(void) {
     uint64_t e = kread_ptr(hdr + off_vm_map_header_links_next);
 
     uint64_t bestStart = 0, bestSize = 0;
+    int mappedCount = 0, failCount = 0;
     for (uint32_t i = 0; i < nentries && K(e); i++) {
         uint64_t start = kread64(e + E_START);
         uint64_t end   = kread64(e + E_END);
@@ -180,18 +181,25 @@ int ds_attach(void) {
         if (start >= 0x100000000 && size > 0x400000 && start < 0x800000000) {
             struct VMShmem page = vm_map_remote_page(map, start & ~0x3FFFULL);
             if (page.localAddress) {
+                mappedCount++;
                 uint32_t magic = *(uint32_t *)(uintptr_t)(page.localAddress + (start & 0x3FFFULL));
                 if (magic == 0xFEEDFACF && size > bestSize) {
                     bestStart = start;
                     bestSize = size;
                 }
+            } else {
+                if (failCount < 5) {
+                    NSLog(@"[DS] remap FAIL region start=0x%llx size=0x%llx", start, size);
+                }
+                failCount++;
             }
         }
         e = kread_ptr(e + off_vm_map_entry_links_next);
     }
+    NSLog(@"[DS] base walk: mapped=%d fail=%d best=0x%llx size=0x%llx",
+          mappedCount, failCount, bestStart, bestSize);
     if (bestStart) {
         g_ff_base = bestStart;
-        NSLog(@"[DS] module base 0x%llx (size 0x%llx, largest Mach-O)", bestStart, bestSize);
     }
 
     if (!g_ff_base) {
