@@ -59,6 +59,47 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(statics);
         if (isVaildPtr(matchGame)) return matchGame;
     }
+
+    // SEASON DRIFT SCAN: each FF season moves TypeInfo further than ±0x2000.
+    // Scan a wide strided window around the known offsets and accept the
+    // first slot whose typeInfo→statics→matchGame chain validates. Cached so
+    // the scan pays once per attach (validated offsets repeat next frames).
+    static uint64_t s_cachedOff = 0;
+    if (s_cachedOff) {
+        uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + s_cachedOff);
+        if (isVaildPtr(typeInfo)) {
+            uint64_t statics = ReadGameFacadeStatics(typeInfo);
+            if (isVaildPtr(statics)) {
+                uint64_t mg = ReadMatchGameFromGameFacadeStatics(statics);
+                if (isVaildPtr(mg)) return mg;
+            }
+        }
+        s_cachedOff = 0; // stale — rescan
+    }
+    const uint64_t anchors[] = { primary, 0xBFD8978ULL, 0xC3299C8ULL };
+    for (size_t a = 0; a < 3; a++) {
+        uint64_t base = anchors[a];
+        if (base == 0 || base > 0x20000000ULL) continue;
+        const uint64_t span = 0x40000; // ±256KB
+        const uint64_t step = 0x8;     // 8-byte aligned slots
+        for (uint64_t d = 0; d <= span; d += step) {
+            const uint64_t tries[2] = { base + d, (d == 0) ? 0 : base - d };
+            for (int t = 0; t < 2; t++) {
+                uint64_t off = tries[t];
+                if (off == 0 || off > 0x20000000ULL) continue;
+                uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + off);
+                if (!isVaildPtr(typeInfo)) continue;
+                uint64_t statics = ReadGameFacadeStatics(typeInfo);
+                if (!isVaildPtr(statics)) continue;
+                uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(statics);
+                if (isVaildPtr(matchGame)) {
+                    s_cachedOff = off;
+                    NSLog(@"[GL] GameFacade TypeInfo found at +0x%llx (drift %+#llx from anchor)", off, (int64_t)(off - base));
+                    return matchGame;
+                }
+            }
+        }
+    }
     return 0;
 }
 
