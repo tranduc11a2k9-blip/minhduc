@@ -20,6 +20,7 @@
 
 #import "DSMemory.h"
 #import "../kexploit/kexploit_opa334.h"
+#import "../app/KernelBoot.h" // kernelBootLog (diag to Home log card)
 #import "../kexploit/krw.h"
 #import "../kexploit/kutils.h"
 #import "../kexploit/offsets.h"
@@ -105,19 +106,51 @@ int ds_attach(void) {
 
     init_physmap();
 
-    const char *names[] = { "FreeFire", "FreeFireMAX", "GarenaFreeFire" };
-    for (int i = 0; i < 3; i++) {
-        uint64_t p = proc_find_by_name(names[i]);
+    // DIAG: kernel read health check — read our own proc. If this returns
+    // garbage, the kernel primitives are dead (post-panic) and every later
+    // read is noise. Surface it instead of failing silently.
+    uint64_t selfCheck = proc_self();
+    bool kernelAlive = is_kaddr_valid(selfCheck);
+    if (!kernelAlive) {
+        static int s_deadLogged = 0;
+        if (!s_deadLogged) {
+            s_deadLogged = 1;
+            NSLog(@"[DS] KERNEL READ DEAD — self proc readback invalid (0x%llx). Re-run the exploit.", selfCheck);
+            kernel_boot_log_fn logFn = kernelBootLog;
+            if (logFn) {
+                NSString *line = @"[diag] kernel DEAD — bấm Bắt đầu lại";
+                dispatch_async(dispatch_get_main_queue(), ^{ logFn(line); });
+            }
+        }
+        return -1;
+    }
+
+    const char *names[] = { "FreeFire", "FreeFireMAX", "GarenaFreeFire", "Freefire", "freefire" };
+    uint64_t p = 0;
+    const char *foundName = NULL;
+    for (int i = 0; i < 5; i++) {
+        p = proc_find_by_name(names[i]);
         if (p && p != (uint64_t)-1 && K(p)) {
-            g_ff_proc = p;
-            g_ff_pid  = (pid_t)kread32(p + off_proc_p_pid);
+            foundName = names[i];
             break;
         }
     }
-    if (!g_ff_proc) {
-        NSLog(@"[DS] FF proc not found");
+    if (!p) {
+        static int s_notFoundLogged = 0;
+        if (!s_notFoundLogged) {
+            s_notFoundLogged = 1;
+            NSLog(@"[DS] FF proc not found (kernel alive)");
+            kernel_boot_log_fn logFn = kernelBootLog;
+            if (logFn) {
+                NSString *line = @"[diag] không thấy Free Fire — mở game rồi chờ";
+                dispatch_async(dispatch_get_main_queue(), ^{ logFn(line); });
+            }
+        }
         return -1;
     }
+    g_ff_proc = p;
+    g_ff_pid  = (pid_t)kread32(p + off_proc_p_pid);
+    NSLog(@"[DS] attached '%s' pid=%d", foundName ?: "?", g_ff_pid);
 
     g_ff_task = proc_task(g_ff_proc);
     if (!K(g_ff_task)) {
