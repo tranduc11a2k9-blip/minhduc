@@ -4330,24 +4330,6 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     }
 
     // allowThroughWall already sampled above (aim pick + sticky resolve share it).
-
-    // AIM DIAG: surfaces the whole aim pipeline state — attach, roster size,
-    // picked target. If aimbot "does nothing", this line says which stage is
-    // empty (0 snaps = attach/match fail; snaps>0 target=0 = filter kills all).
-    {
-        static CFTimeInterval s_lastAimDiag = 0;
-        CFTimeInterval nowAd = CACurrentMediaTime();
-        if (nowAd - s_lastAimDiag > 5.0) {
-            s_lastAimDiag = nowAd;
-            kernel_boot_log_fn logFnA = kernelBootLog;
-            if (logFnA) {
-                NSString *lineA = [NSString stringWithFormat:
-                    @"[aim] snaps=%d pick=%llu dis=%.0f trig=%d aimbot=%d",
-                    snapN, (unsigned long long)rawBestTarget, rawBestDist < FLT_MAX ? rawBestDist : 0.f,
-                    triggerMode, (int)isAimbot];
-                dispatch_async(dispatch_get_main_queue(), ^{ logFnA(lineA); });
-            }
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -4623,6 +4605,26 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         isVis = rawBestVis;
         s_lockHoldFrames = 0;
         s_lockScore = rawBestScore;
+    }
+
+    // AIM DIAG: surfaces the whole aim pipeline state — attach, roster size,
+    // picked target. If aimbot "does nothing", this line says which stage is
+    // empty (0 snaps = attach/match fail; snaps>0 target=0 = filter kills all).
+    {
+        static CFTimeInterval s_lastAimDiag = 0;
+        CFTimeInterval nowAd = CACurrentMediaTime();
+        if (nowAd - s_lastAimDiag > 5.0) {
+            s_lastAimDiag = nowAd;
+            kernel_boot_log_fn logFnA = kernelBootLog;
+            if (logFnA) {
+                NSString *lineA = [NSString stringWithFormat:
+                    @"[aim] snaps=%d pick=%llu dis=%.0f trig=%d aimbot=%d",
+                    snapN, (unsigned long long)bestTarget,
+                    bestDistance < FLT_MAX ? bestDistance : 0.f,
+                    triggerMode, (int)isAimbot];
+                dispatch_async(dispatch_get_main_queue(), ^{ logFnA(lineA); });
+            }
+        }
     }
 
     // Live target validity: kill / despawn / invalid bone must hard-stop aim immediately.
