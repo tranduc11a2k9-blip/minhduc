@@ -2,6 +2,7 @@
 #import "offset.h"
 #import "GameOffsets.h"
 #import "Il2CppMatch.h"
+#import "../DSMemory.h"
 #import "../../remote/RemoteCall.h"
 #import <Foundation/Foundation.h>
 #import <math.h>
@@ -59,7 +60,7 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
 
         if (s_ffRcState == 0) {
             s_ffRcState = (init_remote_call("FreeFire", false) == 0) ? 1 : 2;
-            NSLog(@"[GL] FF RemoteCall init: %@", s_ffRcState == 1 ? @"OK" : @"failed");
+            { kernel_boot_log_fn logFnG = kernelBootLog; NSString *lineG = [NSString stringWithFormat:@"[GL] FF RemoteCall init: %@", s_ffRcState == 1 ? @"OK" : @"failed"]; dispatch_async(dispatch_get_main_queue(), ^{ if (logFnG) logFnG(lineG); }); }
         }
         if (s_ffRcState == 1) {
             uint64_t mg = Il2CppResolveMatchGame();
