@@ -160,32 +160,38 @@ int ds_attach(void) {
         return -1;
     }
 
-    // module base: walk entries, find first __TEXT-exec region. Magic check
-    // via vm_map_remote_page (remaps the page into OUR process — the lara/
-    // cyanide-proven path; ds_translate_page's guessed physmap never worked).
+    // module base: walk entries, pick the LARGEST Mach-O-backed region above
+    // 4GB — the first-match heuristic kept grabbing small system frameworks
+    // (0x10ddf7000) whose header IS a valid Mach-O, so the magic check passed
+    // while base pointed at the wrong image (ti=nil downstream). UnityFramework
+    // is by far the biggest mapped binary in the FF process.
     uint64_t map = kread_ptr(g_ff_task + off_task_map);
     g_ff_map = map; // saved for ds_read/ds_write remap path
     uint64_t hdr = map + off_vm_map_hdr;
     uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
     uint64_t e = kread_ptr(hdr + off_vm_map_header_links_next);
 
+    uint64_t bestStart = 0, bestSize = 0;
     for (uint32_t i = 0; i < nentries && K(e); i++) {
         uint64_t start = kread64(e + E_START);
         uint64_t end   = kread64(e + E_END);
+        uint64_t size  = (end > start) ? (end - start) : 0;
 
-        // main binary text: first large exec region above 0x100000000
-        if (start >= 0x100000000 && (end - start) > 0x100000 && start < 0x200000000) {
+        if (start >= 0x100000000 && size > 0x400000 && start < 0x800000000) {
             struct VMShmem page = vm_map_remote_page(map, start & ~0x3FFFULL);
             if (page.localAddress) {
                 uint32_t magic = *(uint32_t *)(uintptr_t)(page.localAddress + (start & 0x3FFFULL));
-                if (magic == 0xFEEDFACF) {
-                    g_ff_base = start;
-                    NSLog(@"[DS] module base 0x%llx (remap path)", start);
-                    break;
+                if (magic == 0xFEEDFACF && size > bestSize) {
+                    bestStart = start;
+                    bestSize = size;
                 }
             }
         }
         e = kread_ptr(e + off_vm_map_entry_links_next);
+    }
+    if (bestStart) {
+        g_ff_base = bestStart;
+        NSLog(@"[DS] module base 0x%llx (size 0x%llx, largest Mach-O)", bestStart, bestSize);
     }
 
     if (!g_ff_base) {
