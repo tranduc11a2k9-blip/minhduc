@@ -3230,11 +3230,6 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         DIAG_EARLY(@"no-base");
         return stats;
     }
-    // Lobby / no match yet: skip ESP+aim cleanly (user may have enabled HUD first).
-    if (IsAtLobby(Moudule_Base)) {
-        DIAG_EARLY(@"lobby");
-        return stats;
-    }
 
     uint64_t matchGame = getMatchGame(Moudule_Base);
     if (!isVaildPtr(matchGame)) {
