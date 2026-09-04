@@ -327,7 +327,16 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     pthread_mutex_unlock(&g_pageCacheLock);
 
     struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
-    if (!page.localAddress) return 0;
+    if (!page.localAddress) {
+        // Pages not yet resident (never touched by FF since boot of the
+        // level) have no vm_page backing — the memory-entry remap returns
+        // nothing. Force-fault the page via the kernel primitive (one
+        // early_kread64 makes the kernel pager pull it in), then remap.
+        volatile uint64_t sink = early_kread64(pageVA);
+        (void)sink;
+        page = vm_map_remote_page(g_ff_map, pageVA);
+        if (!page.localAddress) return 0;
+    }
 
     pthread_mutex_lock(&g_pageCacheLock);
     g_pageCache[g_pageCacheNext].pageVA = pageVA;
