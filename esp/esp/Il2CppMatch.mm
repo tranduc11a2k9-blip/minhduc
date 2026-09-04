@@ -21,10 +21,7 @@
 #import "remote_objc.h"
 #import "GameOffsets.h"
 
-// Remote helpers re-exported by remote_objc/RemoteCall
-extern "C" uint64_t r_dlsym_call(int timeout, const char *fnName,
-                                 uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
-                                 uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
+// Remote helpers — declared in remote_objc.h (already extern "C").
 
 static inline bool kptr(uint64_t a) { return a > 0x100000000ULL; }
 
