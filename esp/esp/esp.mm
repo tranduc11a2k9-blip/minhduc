@@ -2729,6 +2729,29 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     } \
 } while (0)
 
+// LOBBY diag variant — logs the RAW first TypeInfo read so it can be
+// compared with the working TIPA build. If base+0xC012848 returns a
+// different pointer here than on TIPA, the remap reads are corrupting data;
+// if it matches, the offset chain (statics +0xB8 → matchGame) is what fails.
+#define DIAG_EARLY_LOBBY() do { \
+    static CFTimeInterval s_lastDiagL = 0; \
+    CFTimeInterval nowL = CACurrentMediaTime(); \
+    if (nowL - s_lastDiagL > 5.0) { \
+        s_lastDiagL = nowL; \
+        uint64_t ti = ReadAddr<uint64_t>(Moudule_Base + (uint64_t)kGameFacadeTypeInfo); \
+        uint64_t st = isVaildPtr(ti) ? ReadAddr<uint64_t>(ti + 0xB8) : 0; \
+        kernel_boot_log_fn logFnL = kernelBootLog; \
+        if (logFnL) { \
+            NSString *lineL = [NSString stringWithFormat: \
+                @"[diag] lobby: base=%@ ti=%@ st=%@", \
+                Moudule_Base > 0 ? [NSString stringWithFormat:@"%llx", Moudule_Base] : @"0", \
+                isVaildPtr(ti) ? [NSString stringWithFormat:@"%llx", ti] : @"nil", \
+                isVaildPtr(st) ? [NSString stringWithFormat:@"%llx", st] : @"nil"]; \
+            dispatch_async(dispatch_get_main_queue(), ^{ logFnL(lineL); }); \
+        } \
+    } \
+} while (0)
+
 
 
 
@@ -3228,6 +3251,13 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
     if (!buffers || Moudule_Base == 0 || Moudule_Base == (uint64_t)-1) {
         DIAG_EARLY(@"no-base");
+        return stats;
+    }
+    // Lobby gate (restored): matchGame invalid here means either lobby OR
+    // broken TypeInfo reads — the diag below distinguishes them by logging
+    // the raw first read so it can be compared against the working TIPA.
+    if (IsAtLobby(Moudule_Base)) {
+        DIAG_EARLY_LOBBY();
         return stats;
     }
 
