@@ -21,6 +21,7 @@
 #import "DSMemory.h"
 #import "../kexploit/kexploit_opa334.h"
 #import "../app/KernelBoot.h" // kernelBootLog (diag to Home log card)
+#import "../remote/VM.h"      // vm_map_remote_page — the WORKING page remap (lara/cyanide path)
 #import "../kexploit/krw.h"
 #import "../kexploit/kutils.h"
 #import "../kexploit/offsets.h"
@@ -44,6 +45,7 @@ extern uint64_t early_kread64(uint64_t where);
 
 static uint64_t g_ff_proc = 0;
 static uint64_t g_ff_task = 0;
+static uint64_t g_ff_map  = 0; // target's vm_map — used with vm_map_remote_page
 static pid_t    g_ff_pid  = 0;
 static uint64_t g_ff_base = 0;
 
@@ -158,9 +160,11 @@ int ds_attach(void) {
         return -1;
     }
 
-    // module base: walk entries, find first __TEXT-exec region (alias VM_PROT_EXECUTE style)
-    // simpler heuristic: first entry with end > 0x100000000 and alias region type text
+    // module base: walk entries, find first __TEXT-exec region. Magic check
+    // via vm_map_remote_page (remaps the page into OUR process — the lara/
+    // cyanide-proven path; ds_translate_page's guessed physmap never worked).
     uint64_t map = kread_ptr(g_ff_task + off_task_map);
+    g_ff_map = map; // saved for ds_read/ds_write remap path
     uint64_t hdr = map + off_vm_map_hdr;
     uint32_t nentries = kread32(hdr + off_vm_map_header_nentries);
     uint64_t e = kread_ptr(hdr + off_vm_map_header_links_next);
@@ -171,17 +175,13 @@ int ds_attach(void) {
 
         // main binary text: first large exec region above 0x100000000
         if (start >= 0x100000000 && (end - start) > 0x100000 && start < 0x200000000) {
-            uint64_t obj = kread_ptr(e + E_OBJECT);
-            if (K(obj)) {
-                // check first bytes = MH_MAGIC_64 (0xFEEDFACF)
-                uint64_t page_k = ds_translate_page(start);
-                if (page_k) {
-                    uint32_t magic = (uint32_t)kread32(page_k);
-                    if (magic == 0xFEEDFACF) {
-                        g_ff_base = start;
-                        NSLog(@"[DS] module base 0x%llx", start);
-                        break;
-                    }
+            struct VMShmem page = vm_map_remote_page(map, start & ~0x3FFFULL);
+            if (page.localAddress) {
+                uint32_t magic = *(uint32_t *)(uintptr_t)(page.localAddress + (start & 0x3FFFULL));
+                if (magic == 0xFEEDFACF) {
+                    g_ff_base = start;
+                    NSLog(@"[DS] module base 0x%llx (remap path)", start);
+                    break;
                 }
             }
         }
@@ -287,16 +287,17 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // resolved ONCE per page via ds_translate_page, BUT with a working fallback:
 // if translate fails, read via early_kread64 on the vm_map-entry-backed
 // kernel alias. In practice on 17.5.1 the reliable route is a tight 8-byte
-// read loop (exactly cyanide kreadbuf) over the target's USER addresses
-// through the kernel map alias derived from the task's map.
-bool ds_read(uint64_t va, void *buf, size_t len) {
-    if (!K(g_ff_task) || !va || !buf || !len) return false;
+// PAGE REMAP reads (the lara/cyanide-proven path): remap the target's page
+// into OUR address space via vm_map_remote_page (vm_get_object walk with
+// proper xnu pointer unpacking + mach memory entry), then memcpy. NO
+// physmap guessing, NO hardcoded vm_object offsets — VM.m does both
+// correctly. Reads/writes are then plain memory access at native speed.
+static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
+    if (!K(g_ff_map) || !va || !buf || !len) return false;
 
-    // Fast path: page-walk translate (works when physmap guess is right).
-    uint8_t *dst = (uint8_t *)buf;
+    uint8_t *p = (uint8_t *)buf;
     uint64_t cur = va;
     size_t remain = len;
-    bool usedWalk = true;
 
     while (remain > 0) {
         uint64_t page_va  = cur & ~PAGE_MASK;
@@ -304,64 +305,24 @@ bool ds_read(uint64_t va, void *buf, size_t len) {
         size_t chunk = PAGE_SIZE - page_off;
         if (chunk > remain) chunk = remain;
 
-        uint64_t kpage = ds_translate_page(page_va);
-        if (!K(kpage)) { usedWalk = false; break; }
+        struct VMShmem page = vm_map_remote_page(g_ff_map, page_va);
+        if (!page.localAddress) return false;
 
-        kreadbuf(kpage + page_off, dst, chunk);
-        dst += chunk; cur += chunk; remain -= chunk;
-    }
-    if (usedWalk) return true;
+        void *local = (void *)(uintptr_t)(page.localAddress + page_off);
+        if (isWrite) memcpy(local, p, chunk);
+        else         memcpy(p, local, chunk);
 
-    // Fallback (lara/cyanide pattern): 8-byte early_kread64 loop on the
-    // kernel-side address. early_kread64 reaches kernel virtual addresses;
-    // user pages of the target are mapped in the kernel map on arm64 XNU
-    // (user VA range is directly readable with kernel primitives when the
-    // high T1SZ window covers it — same assumption lara's provider makes).
-    dst = (uint8_t *)buf;
-    cur = va;
-    remain = len;
-    for (size_t off = 0; off < len; off += 8) {
-        uint64_t val = early_kread64(va + off);
-        size_t chunk = (len - off >= 8) ? 8 : (len - off);
-        memcpy(dst + off, &val, chunk);
+        p += chunk; cur += chunk; remain -= chunk;
     }
-    (void)cur; (void)remain;
     return true;
 }
 
+bool ds_read(uint64_t va, void *buf, size_t len) {
+    return ds_rw_remap(va, buf, len, false);
+}
+
 bool ds_write(uint64_t va, const void *buf, size_t len) {
-    if (!K(g_ff_task) || !va || !buf || !len) return false;
-
-    uint8_t *src = (uint8_t *)buf;
-    uint64_t cur = va;
-    size_t remain = len;
-    bool usedWalk = true;
-
-    while (remain > 0) {
-        uint64_t page_va  = cur & ~PAGE_MASK;
-        uint64_t page_off = cur & PAGE_MASK;
-        size_t chunk = PAGE_SIZE - page_off;
-        if (chunk > remain) chunk = remain;
-
-        uint64_t kpage = ds_translate_page(page_va);
-        if (!K(kpage)) { usedWalk = false; break; }
-
-        kwritebuf(kpage + page_off, src, chunk);
-        src += chunk; cur += chunk; remain -= chunk;
-    }
-    if (usedWalk) return true;
-
-    // Fallback: 8-byte early_kwrite loop (read-modify-write, cyanide style).
-    src = (uint8_t *)buf;
-    for (size_t off = 0; off < len; off += 8) {
-        uint64_t original = early_kread64(va + off);
-        uint64_t val = 0;
-        size_t chunk = (len - off >= 8) ? 8 : (len - off);
-        memcpy(&val, src + off, chunk);
-        uint64_t mask = (chunk == 8) ? ~0ULL : ((1ULL << (chunk * 8)) - 1);
-        early_kwrite64(va + off, (original & ~mask) | (val & mask));
-    }
-    return true;
+    return ds_rw_remap(va, buf, len, true);
 }
 
 uint8_t  ds_read8(uint64_t va)  { uint8_t v=0;  ds_read(va,&v,1); return v; }
@@ -382,6 +343,7 @@ bool ds_read_str(uint64_t va, char *out, size_t maxlen) {
 
 void ds_detach(void) {
     g_ff_proc = g_ff_task = g_ff_base = 0;
+    g_ff_map = 0;
     g_ff_pid = 0;
     g_cached_entry = 0;
 }
