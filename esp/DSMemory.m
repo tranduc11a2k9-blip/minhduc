@@ -301,11 +301,42 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // resolved ONCE per page via ds_translate_page, BUT with a working fallback:
 // if translate fails, read via early_kread64 on the vm_map-entry-backed
 // kernel alias. In practice on 17.5.1 the reliable route is a tight 8-byte
-// PAGE REMAP reads (the lara/cyanide-proven path): remap the target's page
-// into OUR address space via vm_map_remote_page (vm_get_object walk with
-// proper xnu pointer unpacking + mach memory entry), then memcpy. NO
-// physmap guessing, NO hardcoded vm_object offsets — VM.m does both
-// correctly. Reads/writes are then plain memory access at native speed.
+// PAGE REMAP reads (the lara/cyanide-proven path) + PAGE CACHE.
+// vm_map_remote_page per read is expensive (alloc + memory-entry + kernel
+// refcount bump every call) AND flaky under load — that's the "lúc được lúc
+// không". Cache mapped pages (128 slots, LRU-ish round-robin) so repeated
+// reads of the same page (the common case: HP/positions/TypeInfo) hit the
+// cache and cost a memcpy only.
+#define DS_PAGE_CACHE_SLOTS 128
+static struct {
+    uint64_t pageVA;
+    uint64_t localAddr;
+} g_pageCache[DS_PAGE_CACHE_SLOTS];
+static int g_pageCacheNext = 0;
+static pthread_mutex_t g_pageCacheLock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t ds_page_local(uint64_t pageVA) {
+    pthread_mutex_lock(&g_pageCacheLock);
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
+            uint64_t a = g_pageCache[i].localAddr;
+            pthread_mutex_unlock(&g_pageCacheLock);
+            return a;
+        }
+    }
+    pthread_mutex_unlock(&g_pageCacheLock);
+
+    struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
+    if (!page.localAddress) return 0;
+
+    pthread_mutex_lock(&g_pageCacheLock);
+    g_pageCache[g_pageCacheNext].pageVA = pageVA;
+    g_pageCache[g_pageCacheNext].localAddr = page.localAddress;
+    g_pageCacheNext = (g_pageCacheNext + 1) % DS_PAGE_CACHE_SLOTS;
+    pthread_mutex_unlock(&g_pageCacheLock);
+    return page.localAddress;
+}
+
 static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
     if (!K(g_ff_map) || !va || !buf || !len) return false;
 
@@ -319,10 +350,10 @@ static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
         size_t chunk = PAGE_SIZE - page_off;
         if (chunk > remain) chunk = remain;
 
-        struct VMShmem page = vm_map_remote_page(g_ff_map, page_va);
-        if (!page.localAddress) return false;
+        uint64_t localAddr = ds_page_local(page_va);
+        if (!localAddr) return false;
 
-        void *local = (void *)(uintptr_t)(page.localAddress + page_off);
+        void *local = (void *)(uintptr_t)(localAddr + page_off);
         if (isWrite) memcpy(local, p, chunk);
         else         memcpy(p, local, chunk);
 
@@ -356,6 +387,10 @@ bool ds_read_str(uint64_t va, char *out, size_t maxlen) {
 #pragma mark - accessors
 
 void ds_detach(void) {
+    pthread_mutex_lock(&g_pageCacheLock);
+    memset(g_pageCache, 0, sizeof(g_pageCache));
+    g_pageCacheNext = 0;
+    pthread_mutex_unlock(&g_pageCacheLock);
     g_ff_proc = g_ff_task = g_ff_base = 0;
     g_ff_map = 0;
     g_ff_pid = 0;
