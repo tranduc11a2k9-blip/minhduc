@@ -126,26 +126,28 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
  
     uint64_t entryAddr = vm_map_find_entry(map, address);
     if (!entryAddr) {
-        printf("[DS][%s:%d] vm_map_find_entry failed\n", __FUNCTION__, __LINE__);
+        printf("[DS][%s:%d] vm_map_find_entry FAILED addr=0x%llx (no entry covers it)\n",
+               __FUNCTION__, __LINE__, (unsigned long long)address);
         return result;
     }
- 
+
     struct vm_map_entry entry = {0};
     kreadbuf(entryAddr, &entry, sizeof(struct vm_map_entry));
- 
+
     struct VmPackingParams params = {0};
     params.vmpp_base  = VM_MIN_KERNEL_ADDRESS;
     params.vmpp_bits  = VM_PAGE_PACKED_PTR_BITS;
     params.vmpp_shift = VM_PAGE_PACKED_PTR_SHIFT;
     params.vmpp_base_relative = VM_PACKING_IS_BASE_RELATIVE(&params) ? 1 : 0;
- 
+
     uint32_t vme_object = entry.vme_object_or_delta;
     uint64_t vmeObject = vm_unpack_pointer((uint64_t)vme_object, &params);
     if (!is_kaddr_valid(vmeObject)) {
-        printf("[DS][%s:%d] invalid VM object 0x%llx for user address 0x%llx\n",
+        printf("[DS][%s:%d] invalid VM object 0x%llx for addr=0x%llx (raw32=0x%x unpacked=0x%llx)\n",
                __FUNCTION__, __LINE__,
                (unsigned long long)vmeObject,
-               (unsigned long long)address);
+               (unsigned long long)address,
+               vme_object, (unsigned long long)vmeObject);
         return result;
     }
  
@@ -202,7 +204,10 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
     
  
     if (entry.vme_kernel_object || entry.is_sub_map) {
-        printf("[DS][%s:%d] Entry cannot be a submap or kernel object\n", __FUNCTION__, __LINE__);
+        printf("[DS][%s:%d] REJECT submap/kernel-object: addr=0x%llx submap=%d ko=%d\n",
+               __FUNCTION__, __LINE__,
+               (unsigned long long)object->vmAddress,
+               (int)entry.is_sub_map, (int)entry.vme_kernel_object);
         mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
         return shmem;
     }
