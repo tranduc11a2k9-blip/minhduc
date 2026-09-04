@@ -29,6 +29,7 @@
 
 #import <mach/mach.h>
 #import <sys/sysctl.h>
+#import <pthread.h>
 
 // xnu page size on arm64 — guard against system header macros
 #ifndef PAGE_SHIFT
