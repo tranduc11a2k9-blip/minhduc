@@ -1,3 +1,6 @@
+#ifdef __cplusplus
+extern "C" {
+#endif
 //
 //  remote_objc.h
 //  Thin Objective-C runtime helpers built on do_remote_call_stable.
@@ -102,6 +105,10 @@ uint64_t r_session_ivar_value(RemoteCallSession *session, uint64_t obj, const ch
 uint64_t r_session_dlsym_call(RemoteCallSession *session, int timeout, const char *fnName,
                               uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                               uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif

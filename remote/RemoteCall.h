@@ -1,3 +1,6 @@
+#ifdef __cplusplus
+extern "C" {
+#endif
 //
 //  RemoteCall.h
 //  Cyanide
@@ -152,6 +155,10 @@ const char *remote_call_init_failure_description(RemoteCallInitFailure failure);
 @end
 
 void remote_call_with_session(RemoteCallSession *session, void (^block)(void));
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* RemoteCall_h */
