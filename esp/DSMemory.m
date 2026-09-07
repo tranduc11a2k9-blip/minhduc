@@ -316,6 +316,10 @@ static struct {
 static int g_pageCacheNext = 0;
 static pthread_mutex_t g_pageCacheLock = PTHREAD_MUTEX_INITIALIZER;
 
+// FIX SIGSEGV far=0x1: force-fault cũ truyền FF USER pageVA thẳng vào
+// early_kread64 — primitive từ chối (is_kaddr_valid đòi kernel pointer
+// 0xfffff000...) rồi crash CỐ Ý bằng *(int*)1 = 0. Không bao giờ force-fault
+// user VA qua primitive này: nếu trang chưa resident, bỏ qua (caller retry).
 static uint64_t ds_page_local(uint64_t pageVA) {
     pthread_mutex_lock(&g_pageCacheLock);
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
@@ -329,14 +333,10 @@ static uint64_t ds_page_local(uint64_t pageVA) {
 
     struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
     if (!page.localAddress) {
-        // Pages not yet resident (never touched by FF since boot of the
-        // level) have no vm_page backing — the memory-entry remap returns
-        // nothing. Force-fault the page via the kernel primitive (one
-        // early_kread64 makes the kernel pager pull it in), then remap.
-        volatile uint64_t sink = early_kread64(pageVA);
-        (void)sink;
-        page = vm_map_remote_page(g_ff_map, pageVA);
-        if (!page.localAddress) return 0;
+        // Trang chưa resident (FF chưa đụng từ lúc boot level) — KHÔNG force-fault
+        // qua early_kread64 (user VA ≠ kernel addr → intentional crash). Return 0,
+        // caller (ds_rw_remap) trả false, frame sau retry khi game đã touch trang.
+        return 0;
     }
 
     pthread_mutex_lock(&g_pageCacheLock);
