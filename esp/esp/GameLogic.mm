@@ -44,34 +44,22 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
     if (!isVaildPtr((uintptr_t)Moudule_Base))
         return 0;
 
-    // PRIMARY (cached): il2cpp runtime API resolves MatchGame through the
-    // FreeFire process. CRITICAL SAFETY RULES learned from the kernel panic
-    // (zone 'threads' UAF):
-    //   1. RemoteCall engine has ONE global state — the SpringBoard session
-    //      (overlay) must NOT be clobbered by an FF session. Only init FF
-    //      when no other session is alive.
-    //   2. NEVER call this every frame — cache the result; game restart
-    //      (pid change) is the only re-resolve trigger.
+    // FIX crash chain (watchdog 0x8BADF00D + kernel panic zone 'threads' UAF):
+    // PRIMARY path cũ đi qua RemoteCall (init_remote_call("FreeFire") + hàng chục
+    // lượt wait_exception/mach_msg trên MAIN THREAD):
+    //   1. App bị FrontBoard watchdog kill khi ESP loop block main >5s
+    //      (crash log: init_remote_call → wait_exception → mach_msg2_trap).
+    //   2. FF RemoteCall session clobber global state của SpringBoard overlay
+    //      session → SB side giữ con trỏ dangling → kernel UAF panic.
+    // Bỏ hẳn RemoteCall khỏi per-frame path: ds_read kernel path (offset-based
+    // bên dưới) resolve MatchGame ổn định + nhanh, không đụng SB session.
+    // Per-pid cache: offset path ghi vào đây khi resolve thành công.
+    static uint64_t s_cachedMatch = 0;
+    static pid_t s_cachedPid = -1;
     {
-        static uint64_t s_cachedMatch = 0;
-        static pid_t s_cachedPid = -1;
-        static int s_ffRcState = 0; // 0=untried 1=ok 2=failed
         pid_t curPid = ds_pid();
         if (s_cachedMatch && curPid == s_cachedPid) return s_cachedMatch; // fast path
-
-        if (s_ffRcState == 0) {
-            s_ffRcState = (init_remote_call("FreeFire", false) == 0) ? 1 : 2;
-            { kernel_boot_log_fn logFnG = kernelBootLog; NSString *lineG = [NSString stringWithFormat:@"[GL] FF RemoteCall init: %@", s_ffRcState == 1 ? @"OK" : @"failed"]; dispatch_async(dispatch_get_main_queue(), ^{ if (logFnG) logFnG(lineG); }); }
-        }
-        if (s_ffRcState == 1) {
-            uint64_t mg = Il2CppResolveMatchGame();
-            if (isVaildPtr(mg)) {
-                s_cachedMatch = mg;
-                s_cachedPid = curPid;
-                return mg;
-            }
-        }
-        // fall through to offset-based paths (SB session untouched)
+        if (curPid != s_cachedPid) { s_cachedMatch = 0; } // game restart → re-resolve
     }
 
     // SECONDARY: hardcoded candidates (kept as fallback when the il2cpp path
@@ -93,7 +81,11 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         uint64_t statics = ReadGameFacadeStatics(typeInfo);
         if (!isVaildPtr(statics)) continue;
         uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(statics);
-        if (isVaildPtr(matchGame)) return matchGame;
+        if (isVaildPtr(matchGame)) {
+            s_cachedMatch = matchGame;
+            s_cachedPid = ds_pid();
+            return matchGame;
+        }
     }
 
     // SEASON DRIFT SCAN: each FF season moves TypeInfo further than ±0x2000.
@@ -107,7 +99,11 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
             uint64_t statics = ReadGameFacadeStatics(typeInfo);
             if (isVaildPtr(statics)) {
                 uint64_t mg = ReadMatchGameFromGameFacadeStatics(statics);
-                if (isVaildPtr(mg)) return mg;
+                if (isVaildPtr(mg)) {
+                    s_cachedMatch = mg;
+                    s_cachedPid = ds_pid();
+                    return mg;
+                }
             }
         }
         s_cachedOff = 0; // stale — rescan
@@ -130,6 +126,8 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
                 uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(statics);
                 if (isVaildPtr(matchGame)) {
                     s_cachedOff = off;
+                    s_cachedMatch = matchGame;
+                    s_cachedPid = ds_pid();
                     NSLog(@"[GL] GameFacade TypeInfo found at +0x%llx (drift %+#llx from anchor)", off, (int64_t)(off - base));
                     return matchGame;
                 }
