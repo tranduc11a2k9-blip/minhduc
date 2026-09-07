@@ -364,8 +364,22 @@ static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
         if (!localAddr) return false;
 
         void *local = (void *)(uintptr_t)(localAddr + page_off);
-        if (isWrite) memcpy(local, p, chunk);
-        else         memcpy(p, local, chunk);
+        if (isWrite) {
+            memcpy(local, p, chunk);
+            // Coherency: mapped page là alias của trang kernel — ghi trực tiếp
+            // đã chạm memory thật, nhưng game cũng ghi cùng trang (AimRotation do
+            // engine update mỗi tick). Alias KHÔNG tự refresh → read sau trả giá
+            // trị cũ. Fix: bỏ cache trang sau mỗi write, lần đọc sau remap lại.
+            pthread_mutex_lock(&g_pageCacheLock);
+            for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+                if (g_pageCache[i].pageVA == page_va) {
+                    g_pageCache[i].pageVA = 0;
+                    g_pageCache[i].localAddr = 0;
+                }
+            }
+            pthread_mutex_unlock(&g_pageCacheLock);
+        }
+        else memcpy(p, local, chunk);
 
         p += chunk; cur += chunk; remain -= chunk;
     }

@@ -9,6 +9,7 @@
 #import <sys/sysctl.h>
 #import <errno.h>
 #import "pid.h"
+#import "../DSMemory.h"
 
 #pragma mark - Global task (set by GetGameModule_Base)
 
@@ -86,15 +87,22 @@ uintptr_t GetGameModule_Base(char *GameProcessName) {
 
 #pragma mark - Read/Write (dùng get_task, không leak)
 
+// FIX "aim không tác dụng": trên jailed IPA task_for_pid fail → get_task NULL →
+// mọi WriteAddr (aim rotation, AA kill, Brutal…) fail âm thầm trong khi ds_read
+// vẫn chạy tốt qua kernel remap. Nối cả read lẫn write vào DSMemory kernel path.
 bool _read(long addr, void *buffer, int len) {
-    if (!isVaildPtr(static_cast<uintptr_t>(addr)) || get_task == MACH_PORT_NULL) return false;
+    if (!isVaildPtr(static_cast<uintptr_t>(addr)) || !buffer || len <= 0) return false;
+    if (ds_attached()) return ds_read((uint64_t)addr, buffer, (size_t)len);
+    if (get_task == MACH_PORT_NULL) return false;
     mach_vm_size_t out_size = 0;
     kern_return_t kr = mach_vm_read_overwrite(get_task, (mach_vm_address_t)addr, (mach_vm_size_t)len, (mach_vm_address_t)buffer, &out_size);
     return (kr == KERN_SUCCESS && out_size == (mach_vm_size_t)len);
 }
 
 bool _write(long addr, const void *buffer, int len) {
-    if (!isVaildPtr(static_cast<uintptr_t>(addr)) || get_task == MACH_PORT_NULL) return false;
+    if (!isVaildPtr(static_cast<uintptr_t>(addr)) || !buffer || len <= 0) return false;
+    if (ds_attached()) return ds_write((uint64_t)addr, buffer, (size_t)len);
+    if (get_task == MACH_PORT_NULL) return false;
     kern_return_t kr = mach_vm_write(get_task, (mach_vm_address_t)addr, (pointer_t)buffer, (mach_msg_type_number_t)len);
     return (kr == KERN_SUCCESS);
 }
