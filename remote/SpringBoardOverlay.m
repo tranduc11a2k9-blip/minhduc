@@ -201,10 +201,9 @@ int SBoardStartOverlay(void) {
     // Passing a CGColor to setTextColor: → UILabel calls _isDynamic on
     // __NSCFType → NSInvalidArgumentException → SpringBoard abort → respring
     // ~1s after init (exactly the crash log: -[UILabel _resolveMaterialColor:]).
-    uint64_t whiteUIColor = 0, blackUIColor = 0, whiteCGColor = 0;
+    uint64_t whiteUIColor = 0, whiteCGColor = 0; // blackUIColor removed với banner
     if (r_is_objc_ptr(clsCol)) {
         whiteUIColor = r_msg2_main(clsCol, "whiteColor", 0,0,0,0);
-        blackUIColor = r_msg2_main(clsCol, "blackColor", 0,0,0,0);
         if (r_is_objc_ptr(whiteUIColor)) whiteCGColor = r_msg2_main(whiteUIColor, "CGColor", 0,0,0,0);
     }
     // ---- container UIView (cyanide pattern: window MUST have a UIView
@@ -228,40 +227,20 @@ int SBoardStartOverlay(void) {
     double z = 100;
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
 
-    // ---- SELF-TEST line (visible proof the shape layer composites) ----
-    // A short diagonal stroke from the banner downward. If you DON'T see it,
-    // the shape layer itself is not rendering (compositing issue); if you DO
-    // see it, the layer is fine and the bug is in the mirror data path.
-    {
-        uint64_t testPath = dlsym("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
-        if (r_is_objc_ptr(testPath)) {
-            dlsym("CGPathMoveToPoint", testPath, 0, dbl_bits(20.0), dbl_bits(90.0), 0,0,0,0);
-            dlsym("CGPathAddLineToPoint", testPath, 0, dbl_bits(200.0), dbl_bits(300.0), 0,0,0,0);
-            dlsym("CGPathAddLineToPoint", testPath, 0, dbl_bits(20.0), dbl_bits(500.0), 0,0,0,0);
-            r_msg2_main(shape, "setPath:", testPath, 0,0,0);
-            NSLog(@"[SBOverlay] SELF-TEST line set on shape layer (expect a V shape under the banner)");
-        }
-    }
+    // ---- SELF-TEST line REMOVED (user: banner đen + V shape hiển thị trên màn) ----
+    // Debug stroke này từng dùng để verify compositing; giờ mirror đã ổn nên bỏ.
 
-    // ---- status UILabel (also the shape-layer HOST TEST) ----
+
+    // ---- status UILabel: HOST-ONLY cho shape layer (user: xoá banner đen chữ) ----
+    // Label vẫn cần để composite (bare CALayer trên window không đảm bảo render)
+    // nhưng không chữ, không nền đen, không chặn touch.
     uint64_t label = r_msg2_main(r_msg2_main(r_class("UILabel"), "alloc", 0,0,0,0), "init", 0,0,0,0);
     if (r_is_objc_ptr(label)) {
         double lf[4] = {0, 0, bounds[2], 60};
         r_msg2_main_raw(label, "setFrame:", lf, 32, NULL,0,NULL,0,NULL,0);
         r_msg2_main(label, "setNumberOfLines:", 1, 0,0,0);
         r_msg2_main(label, "setTextAlignment:", 1, 0,0,0);
-        if (r_is_objc_ptr(whiteUIColor)) r_msg2_main(label, "setTextColor:", whiteUIColor, 0,0,0);
-        if (r_is_objc_ptr(blackUIColor)) r_msg2_main(label, "setBackgroundColor:", blackUIColor, 0,0,0);
-        uint64_t buf = r_alloc_str("MINHDUC ESP ACTIVE");
-        if (buf) {
-            uint64_t ns = r_msg2_main(r_msg2_main(r_class("NSString"), "alloc", 0,0,0,0),
-                                      "initWithUTF8String:", buf, 0,0,0);
-            r_free(buf);
-            if (r_is_objc_ptr(ns)) {
-                r_msg2_main(label, "setText:", ns, 0,0,0);
-                dlsym("CFRelease", ns, 0,0,0,0,0,0,0);
-            }
-        }
+        if (r_is_objc_ptr(clear)) r_msg2_main(label, "setBackgroundColor:", clear, 0,0,0);
         sb_perform_main(container, "addSubview:", label);
 
         // VECTOR ATTEMPT 4: add the shape layer as a SUBLAYER OF THE BANNER
@@ -279,51 +258,8 @@ int SBoardStartOverlay(void) {
         }
     }
 
-    // ---- SELF-TEST #3: UIImageView with a static image ----
-    // Build a 64x64 white square image LOCALLY, upload its PNG/JPEG bytes,
-    // decode in SpringBoard via [UIImage imageWithData:], set on a
-    // fullscreen UIImageView. If this shows, the full ESP image mirror
-    // (ESP_View renderInContext → upload → setImage) will work.
-    {
-        // local: draw a simple white square with an X into a UIImage
-        UIGraphicsBeginImageContextWithOptions(CGSizeMake(64, 64), NO, 1.0);
-        CGContextRef lc = UIGraphicsGetCurrentContext();
-        if (lc) {
-            CGContextSetFillColorWithColor(lc, [UIColor redColor].CGColor);
-            CGContextFillRect(lc, CGRectMake(0, 0, 64, 64));
-            CGContextSetStrokeColorWithColor(lc, [UIColor whiteColor].CGColor);
-            CGContextSetLineWidth(lc, 4.0);
-            CGContextMoveToPoint(lc, 8, 8);  CGContextAddLineToPoint(lc, 56, 56);
-            CGContextMoveToPoint(lc, 56, 8); CGContextAddLineToPoint(lc, 8, 56);
-            CGContextStrokePath(lc);
-        }
-        UIImage *localImg = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
-        NSData *png = UIImagePNGRepresentation(localImg);
-        if (png.length > 0) {
-            uint64_t buf = dlsym("malloc", png.length, 0,0,0,0,0,0,0);
-            if (r_is_objc_ptr(buf) && remote_write(buf, png.bytes, png.length)) {
-                uint64_t dalloc = r_msg2_main(r_class("NSData"), "alloc", 0,0,0,0);
-                uint64_t data = r_msg2_main(dalloc, "initWithBytes:length:", buf, png.length, 0, 0);
-                dlsym("free", buf, 0,0,0,0,0,0,0);
-                if (r_is_objc_ptr(data)) {
-                    uint64_t uiimg = r_msg2_main(r_class("UIImage"), "imageWithData:", data, 0,0,0);
-                    dlsym("CFRelease", data, 0,0,0,0,0,0,0);
-                    if (r_is_objc_ptr(uiimg)) {
-                        double ivf[4] = {20.0, 70.0, 64.0, 64.0};
-                        uint64_t iv = r_msg2_main_raw(r_msg2_main(r_class("UIImageView"), "alloc", 0,0,0,0),
-                                                      "initWithFrame:", ivf, 32, NULL,0,NULL,0,NULL,0);
-                        if (r_is_objc_ptr(iv)) {
-                            r_msg2_main(iv, "setImage:", uiimg, 0,0,0);
-                            r_msg2_main(iv, "setUserInteractionEnabled:", 0, 0,0,0);
-                            sb_perform_main(container, "addSubview:", iv);
-                            NSLog(@"[SBOverlay] SELF-TEST 3: UIImageView + uploaded image added (expect red square with white X)");
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // ---- SELF-TEST #3 REMOVED (user: hình vuông đỏ hiển thị trên màn) ----
+    // Debug UIImageView + red square từng dùng để verify image mirror; bỏ.
 
     // lara pattern: container onto the EXISTING SB keyWindow — but via
     // sb_perform_main (CA main-thread assertion!) — never direct.

@@ -59,8 +59,21 @@ BOOL RenderFOVCirclePath(
     float fovRadius
 ) {
     if (!path || !aimbotEnabled || fovRadius <= 0) return NO;
-    float d = fovRadius * 2.0f;
-    CGPathAddEllipseInRect(path, NULL, CGRectMake((viewWidth / 2.0f) - fovRadius, (viewHeight / 2.0f) - fovRadius, d, d));
+    // FIX "FOV hình vuông": SB mirror serializer (serFunc) flatten curve → line,
+    // AddEllipse thành gạch vuông. Vẽ polyline 72 đoạn — giữ nguyên hình tròn
+    // qua cả in-app layer lẫn mirror path (chỉ có Move/Line ops).
+    const int kSegs = 72;
+    const float cx = viewWidth / 2.0f;
+    const float cy = viewHeight / 2.0f;
+    const float kTwoPi = 6.28318530718f;
+    for (int i = 0; i <= kSegs; i++) {
+        const float a = (float)i * kTwoPi / (float)kSegs;
+        const float px = cx + cosf(a) * fovRadius;
+        const float py = cy + sinf(a) * fovRadius;
+        if (i == 0) CGPathMoveToPoint(path, NULL, px, py);
+        else        CGPathAddLineToPoint(path, NULL, px, py);
+    }
+    CGPathCloseSubpath(path);
     return YES;
 }
 

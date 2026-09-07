@@ -3186,13 +3186,14 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                     fontSize = 21.0f;
                 }
             } else {
+                // Đổi đỏ → xanh lá (user: bỏ vẽ đỏ thừa; đỏ chỉ dành cho knocked/HP thấp).
                 if (isESP2) {
                     countText = [NSString stringWithFormat:@"%d", stats.realCount + stats.botCount];
-                    countColor = [UIColor redColor];
+                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
                     fontSize = 25.0f;
                 } else {
                     countText = [NSString stringWithFormat:@"PLAYER [%d] | BOT [%d]", stats.realCount, stats.botCount];
-                    countColor = [UIColor redColor];
+                    countColor = [UIColor colorWithRed:50.0f/255.0f green:255.0f/255.0f blue:80.0f/255.0f alpha:1.0f];
                     fontSize = 16.0f;
                 }
             }
