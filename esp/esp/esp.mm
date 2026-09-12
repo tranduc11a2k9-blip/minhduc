@@ -747,8 +747,11 @@ static inline Vector3 AimCameraOrigin(uint64_t localPawn, const Vector3 &fallbac
     uint64_t camTf = ReadAddr<uint64_t>(localPawn + kMainCameraTransform);
     if (isVaildPtr(camTf)) {
         Vector3 p = getPositionExt(camTf);
-        if (!IsZeroVec(p)) return p;
+        if (looksLikeWorldPos(p)) return p;
     }
+    if (looksLikeWorldPos(fallback)) return fallback;
+    Vector3 lh = tryTransformPos(getHead(localPawn));
+    if (looksLikeWorldPos(lh)) return lh;
     return fallback;
 }
 
@@ -1455,7 +1458,7 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
     (void)bursts;
     (void)freezeOrigin;
     update_aim_assist_legit_tuning(false);
-    // Kill AA magnet strength while custom LookAt runs (wall ON/OFF). Mode stays on for LOS lists.
+    // Kill AA magnet strength while custom LookAt runs (wall ON/OFF).
     DisableGameDefaultAimAssist(localPawn, true);
 
     // Ghost-safe: live aim bone only — never invent from sticky track after death.
@@ -1473,8 +1476,11 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
     if (IsZeroVec(aimed) || !looksLikeWorldPos(aimed)) aimed = bone;
 
     Vector3 from = AimCameraOrigin(localPawn, fromFallback);
-    if (IsZeroVec(from)) from = fromFallback;
-    if (IsZeroVec(from)) {
+    if (IsZeroVec(from) || !looksLikeWorldPos(from)) from = fromFallback;
+    if (IsZeroVec(from) || !looksLikeWorldPos(from)) {
+        from = getPositionExt(getHead(localPawn));
+    }
+    if (IsZeroVec(from) || !looksLikeWorldPos(from)) {
         if (outLastAim) *outLastAim = aimed;
         return aimed;
     }
@@ -1486,7 +1492,6 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
     }
 
     // Aimbot/Assist (no Silent): lock head fast when off, smooth when on target.
-    // Fixed jitter: dt-aware exponential smoothing + angular deadzone + capped alpha.
     Quaternion cur = ReadAddr<Quaternion>(localPawn + kAimRotation);
     float n = cur.x*cur.x + cur.y*cur.y + cur.z*cur.z + cur.w*cur.w;
     Quaternion outQ = targetQ;
@@ -1499,21 +1504,26 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
             outQ = cur; // hold steady, do not copy noise
         } else {
             float dt = esp_aim_delta_time();
-            // Much higher rates for snappy tracking ("bám theo nhanh") while keeping dt-aware smooth.
-            // +25% on top of previous safe increase (bám theo nhanh hơn nhưng vẫn lọc jitter).
-            float rate = 70.0f;
-            if (ang > 0.25f)      rate = 200.0f;  // fast acquire when off
-            else if (ang > 0.10f) rate = 130.0f;
-            else if (ang > 0.04f) rate = 90.0f;
+            float rate = 90.0f;
+            if (ang > 0.25f)      rate = 240.0f;  // fast acquire when off
+            else if (ang > 0.10f) rate = 160.0f;
+            else if (ang > 0.04f) rate = 110.0f;
 
             float alpha = 1.0f - expf(-rate * fmaxf(dt, 0.004f));
-            alpha = fminf(alpha, 0.965f); // slightly tighter than 0.96, still safe (không lên 0.98+)
+            alpha = fminf(alpha, 0.985f);
 
             outQ = Quaternion::Normalized(Quaternion::Slerp(cur, targetQ, alpha));
             if (isnan(outQ.x) || isnan(outQ.y) || isnan(outQ.z) || isnan(outQ.w)) outQ = targetQ;
         }
     }
     write_aim_rotations(localPawn, outQ);
+    AimSyncFireHit(localPawn, from, aimed);
+
+    static int s_lookLiveLog = 0;
+    if (++s_lookLiveLog % 60 == 1) {
+        NSLog(@"[AIM] AimLookAtHeadLive: target=0x%llx, bone=(%.1f, %.1f, %.1f), dist=%.1f, mode=%d",
+              (unsigned long long)targetPawn, bone.x, bone.y, bone.z, distanceMeters, aimPosMode);
+    }
 
     if (outLastAim) *outLastAim = aimed;
     return aimed;
@@ -2204,7 +2214,14 @@ static void write_aim_rotations(uint64_t player, const Quaternion &out) {
     if (!isVaildPtr(player)) return;
     WriteAddr<Quaternion>(player + kAimRotation, out);
     WriteAddr<Quaternion>(player + kAimRotationAux, out);
+    if (kAimRotation != 0x5B4) {
+        WriteAddr<Quaternion>(player + 0x5B4, out);
+        WriteAddr<Quaternion>(player + 0x5C4, out);
+    }
     WriteAddr<Quaternion>(player + kCurrentAimRotation, out);
+    if (kCurrentAimRotation != 0x19A4) {
+        WriteAddr<Quaternion>(player + 0x19A4, out);
+    }
 }
 
 void set_aim(uint64_t player, Quaternion rotation, float speed, int mode, bool forceInstant) {
@@ -2579,11 +2596,6 @@ void ESPSyncFromPrefs(void) {
         isAimIgnoreBot = NO;
         isAimIgnoreKnock = YES;
         isEspCheckVisible = YES;
-        // Lite: never stay on Auto (0) — that locks cam. Default Fire&Scope (3).
-        if (triggerMode == 0) {
-            triggerMode = 3;
-            ESPPrefsSetFloat(@"TriggerMode", 3.0f);
-        }
     }
 
     boxThick = ESPPrefsFloat(@"BoxThickness", 1.0f);
@@ -4410,13 +4422,19 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
     // Resolve best target.
     // Wall-ON: FOV/sphere candidates (bestAny).
-    // Wall-OFF: only game-clear LOS candidates (bestLos / bestAny filtered above).
+    // Wall-OFF: game-clear LOS candidates preferred, fallback to on-screen FOV candidates.
     if (!allowThroughWall) {
         if (bestLosTarget != 0) {
             rawBestTarget = bestLosTarget;
             rawBestHead = bestLosHead;
             rawBestDist = bestLosDist;
             rawBestScore = bestLosScore;
+            rawBestVis = true;
+        } else if (bestAnyTarget != 0) {
+            rawBestTarget = bestAnyTarget;
+            rawBestHead = bestAnyHead;
+            rawBestDist = bestAnyDist;
+            rawBestScore = bestAnyScore;
             rawBestVis = true;
         }
     } else if (bestAnyTarget != 0) {
@@ -4950,8 +4968,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                 // bullet edges and a tiny write count.
                 //   Wall-ON  → allow dir rewrite on real shot.
                 //   Wall-OFF → no spoof (camera LookAt still works).
-                if (!useSilent && fireWindow && didLook && bestTarget != 0 && allowThroughWall &&
-                    bulletJustFired) {
+                if (!useSilent && fireWindow && didLook && bestTarget != 0) {
                     ZeroWeaponScatterForAim(myPawnObject);
                     Vector3 fromNow = AimCameraOrigin(myPawnObject, myLocation);
                     // Fire-dir spoof follows AimPos (Head/Neck/Body) — do not force skull.
@@ -4960,9 +4977,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                         hit = GetAimTargetPosMode(bestTarget, aimPosition, bestDistance);
                     if (IsZeroVec(hit) || !looksLikeWorldPos(hit))
                         hit = bestHeadPos;
-                    // NO AimTrackAndLead on bullet path — was shifting hit ~1 head off.
                     bestHeadPos = hit;
-                    // 3 writes per real bullet is enough to stick dir; 24× caused dame ảo.
                     for (int i = 0; i < 3; i++) {
                         if (i == 0) {
                             Vector3 h2 = ResolveSilentAimWorldPos(bestTarget, aimPosition);
@@ -4970,7 +4985,6 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                         }
                         AimSyncFireHit(myPawnObject, fromNow, hit);
                     }
-                    // Cam to same AimPos bone (no lead) — still once, not a spam path.
                     Vector3 from2 = AimCameraOrigin(myPawnObject, myLocation);
                     Quaternion tq = Quaternion::Normalized(GetRotationToLocation(hit, 0.0f, from2));
                     if (!(isnan(tq.x) || isnan(tq.y) || isnan(tq.z) || isnan(tq.w))) {
@@ -5072,13 +5086,19 @@ bool get_IsFiring(uint64_t player) {
 
     // 1) StartFireState enum (when offset is valid).
     int startFire = ReadAddr<int>(player + kIsFiring);
-    if (startFire >= 0 && startFire <= 9 && StartFireStateIsActive(startFire)) {
+    if (startFire > 0 && startFire <= 9) {
+        return true;
+    }
+    int startFireAlt = ReadAddr<int>(player + 0x1C14);
+    if (startFireAlt > 0 && startFireAlt <= 9) {
         return true;
     }
 
     // 2) IsPrepareAttack — true while fire button held (hipfire + ADS fire).
-    //    Needed for Pro "Bắn" / "Bắn&Ngắm"; without it hipfire never aims.
     if (ReadAddr<uint8_t>(player + kIsPrepareAttack) != 0) {
+        return true;
+    }
+    if (ReadAddr<uint8_t>(player + 0x7D8) != 0) {
         return true;
     }
 
