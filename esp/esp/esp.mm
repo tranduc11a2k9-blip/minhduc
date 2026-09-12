@@ -3255,47 +3255,26 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         DIAG_EARLY(@"no-base");
         return stats;
     }
-    // Lobby gate (restored): matchGame invalid here means either lobby OR
-    // broken TypeInfo reads — the diag below distinguishes them by logging
+
     uint64_t matchGame = getMatchGame(Moudule_Base);
     if (!isVaildPtr(matchGame)) {
         static int s_lobbyLog = 0;
-        if (++s_lobbyLog % 180 == 1) {
-            NSLog(@"[ESP] Waiting for in-game match (Lobby / matchGame not resolved, Moudule_Base=0x%llx)", (unsigned long long)Moudule_Base);
+        if (++s_lobbyLog % 300 == 1) {
+            NSLog(@"[ESP] Lobby mode: waiting for match...");
         }
-        DIAG_EARLY(@"no-matchGame");
+        DIAG_EARLY(@"lobby");
         return stats;
     }
 
     uint64_t camera = CameraMain(matchGame);
     uint64_t match = getMatch(matchGame);
-    static int s_inMatchLog = 0;
-    if (++s_inMatchLog % 90 == 1) {
-        // Dump raw slots around Match/Camera so we can see which offset is live.
-        uint64_t rawMatch90 = ReadAddr<uint64_t>(matchGame + 0x90);
-        uint64_t rawMatch88 = ReadAddr<uint64_t>(matchGame + 0x88);
-        uint64_t rawMatch98 = ReadAddr<uint64_t>(matchGame + 0x98);
-        uint64_t rawCamD8   = ReadAddr<uint64_t>(matchGame + 0xD8);
-        uint64_t rawCamD0   = ReadAddr<uint64_t>(matchGame + 0xD0);
-        uint64_t rawCamE0   = ReadAddr<uint64_t>(matchGame + 0xE0);
-        NSLog(@"[ESP] matchGame=0x%llx → match=0x%llx cam=0x%llx | raw +0x90=%llx +0x88=%llx +0x98=%llx | +0xD8=%llx +0xD0=%llx +0xE0=%llx",
-              (unsigned long long)matchGame,
-              (unsigned long long)match, (unsigned long long)camera,
-              (unsigned long long)rawMatch90, (unsigned long long)rawMatch88, (unsigned long long)rawMatch98,
-              (unsigned long long)rawCamD8, (unsigned long long)rawCamD0, (unsigned long long)rawCamE0);
-    }
     if (!isVaildPtr(camera) || !isVaildPtr(match)) {
-        static int s_camFail = 0;
-        if (++s_camFail % 60 == 1) {
-            NSLog(@"[ESP] no-camera-or-match: match=0x%llx (valid=%d) camera=0x%llx (valid=%d)",
-                  (unsigned long long)match, isVaildPtr(match),
-                  (unsigned long long)camera, isVaildPtr(camera));
-        }
-        DIAG_EARLY(@"no-camera-or-match");
+        DIAG_EARLY(@"loading-match");
         return stats;
     }
+
     static int s_okLog = 0;
-    if (++s_okLog % 180 == 1) {
+    if (++s_okLog % 300 == 1) {
         NSLog(@"[ESP] >>> IN-MATCH ACTIVE: matchGame=0x%llx, match=0x%llx, camera=0x%llx <<<",
               (unsigned long long)matchGame, (unsigned long long)match, (unsigned long long)camera);
     }

@@ -14,10 +14,9 @@ extern uint64_t Moudule_Base;
 
 static uint64_t ReadMatchGameFromGameFacadeStatics(uint64_t GameFacade_Static) {
     if (!isVaildPtr(GameFacade_Static)) return 0;
-    // Prefer CurrentMatchGame; fall back CurrentGame.
+    // CurrentMatchGame is only valid while in a match.
+    // Do NOT fall back to CurrentGame (CurrentGame is lobby UI object, has no match/camera).
     uint64_t matchGame = ReadAddr<uint64_t>(GameFacade_Static + (uint64_t)kCurrentMatchGame);
-    if (isVaildPtr(matchGame)) return matchGame;
-    matchGame = ReadAddr<uint64_t>(GameFacade_Static + (uint64_t)kCurrentGame);
     if (isVaildPtr(matchGame)) return matchGame;
     return 0;
 }
@@ -32,7 +31,7 @@ static uint64_t ReadGameFacadeStatics(uint64_t typeInfo) {
     for (size_t i = 0; i < sizeof(staticOffs) / sizeof(staticOffs[0]); i++) {
         uint64_t st = ReadAddr<uint64_t>(typeInfo + staticOffs[i]);
         if (!isVaildPtr(st)) continue;
-        // Valid if either CurrentMatchGame or CurrentGame looks like a heap ptr.
+        // Valid if either CurrentMatchGame (in match) or CurrentGame (in lobby) is a valid heap ptr.
         uint64_t mg = ReadAddr<uint64_t>(st + (uint64_t)kCurrentMatchGame);
         uint64_t cg = ReadAddr<uint64_t>(st + (uint64_t)kCurrentGame);
         if (isVaildPtr(mg) || isVaildPtr(cg)) return st;
@@ -40,31 +39,37 @@ static uint64_t ReadGameFacadeStatics(uint64_t typeInfo) {
     return 0;
 }
 
+static uint64_t s_cachedStatics = 0;
+static pid_t s_cachedPid = -1;
+
 uint64_t getMatchGame(uint64_t Moudule_Base) {
     if (!isVaildPtr((uintptr_t)Moudule_Base))
         return 0;
 
-    // FIX crash chain (watchdog 0x8BADF00D + kernel panic zone 'threads' UAF):
-    // PRIMARY path cũ đi qua RemoteCall (init_remote_call("FreeFire") + hàng chục
-    // lượt wait_exception/mach_msg trên MAIN THREAD):
-    //   1. App bị FrontBoard watchdog kill khi ESP loop block main >5s
-    //      (crash log: init_remote_call → wait_exception → mach_msg2_trap).
-    //   2. FF RemoteCall session clobber global state của SpringBoard overlay
-    //      session → SB side giữ con trỏ dangling → kernel UAF panic.
-    // Bỏ hẳn RemoteCall khỏi per-frame path: ds_read kernel path (offset-based
-    // bên dưới) resolve MatchGame ổn định + nhanh, không đụng SB session.
-    // Per-pid cache: offset path ghi vào đây khi resolve thành công.
-    static uint64_t s_cachedMatch = 0;
-    static pid_t s_cachedPid = -1;
-    {
-        pid_t curPid = ds_pid();
-        if (s_cachedMatch && curPid == s_cachedPid) return s_cachedMatch; // fast path
-        if (curPid != s_cachedPid) { s_cachedMatch = 0; } // game restart → re-resolve
+    pid_t curPid = ds_pid();
+    if (curPid != s_cachedPid) {
+        s_cachedStatics = 0;
+        s_cachedPid = curPid;
     }
 
-    // SECONDARY: hardcoded candidates (kept as fallback when the il2cpp path
-    // cannot run — e.g. RemoteCall into FF unavailable).
-    // Primary TypeInfo from offset table + a few nearby candidates if season moved it.
+    // Fast path: if GameFacade statics address is already resolved, read CurrentMatchGame directly!
+    // GameFacade statics address NEVER changes during the game process run, but CurrentMatchGame
+    // becomes 0 when in lobby and non-null when in match.
+    if (isVaildPtr(s_cachedStatics)) {
+        uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(s_cachedStatics);
+        if (isVaildPtr(matchGame)) {
+            return matchGame;
+        }
+        // In lobby: check if statics is still valid (cg non-null)
+        uint64_t cg = ReadAddr<uint64_t>(s_cachedStatics + (uint64_t)kCurrentGame);
+        if (isVaildPtr(cg)) {
+            return 0; // cleanly in lobby
+        }
+        // If neither is valid, statics pointer died (game restart/reload), re-resolve
+        s_cachedStatics = 0;
+    }
+
+    // Resolve GameFacade Statics
     uint64_t primary = (uint64_t)kGameFacadeTypeInfo;
     uint64_t candidates[] = {
         primary,
@@ -74,52 +79,41 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         0xC3299C8ULL, // known MAX dump
     };
 
-    static int s_probeLog = 0;
-    bool shouldLog = (++s_probeLog % 90 == 1);
-
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
         uint64_t off = candidates[i];
         if (off == 0 || off > 0x20000000ULL) continue;
         uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + off);
-
-        if (shouldLog && i == 0) {
-            NSLog(@"[GameLogic] Probing GameFacade TypeInfo at Base 0x%llx + 0x%llx = 0x%llx -> typeInfo=0x%llx (valid=%d)",
-                  Moudule_Base, off, Moudule_Base + off, typeInfo, isVaildPtr(typeInfo));
-        }
-
         if (!isVaildPtr(typeInfo)) continue;
         uint64_t statics = ReadGameFacadeStatics(typeInfo);
         if (!isVaildPtr(statics)) continue;
+
+        s_cachedStatics = statics;
+        s_cachedPid = curPid;
+        NSLog(@"[GameLogic] GameFacade statics resolved at 0x%llx (off=0x%llx)", statics, off);
+
         uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(statics);
         if (isVaildPtr(matchGame)) {
-            s_cachedMatch = matchGame;
-            s_cachedPid = ds_pid();
-            NSLog(@"[GameLogic] >>> OFFSET HIT SUCCESS: matchGame = 0x%llx (Candidate off=0x%llx, statics=0x%llx) <<<",
-                  matchGame, off, statics);
+            NSLog(@"[GameLogic] >>> IN MATCH: matchGame = 0x%llx <<<", matchGame);
             return matchGame;
         }
+        return 0; // In lobby
     }
 
-    // SEASON DRIFT SCAN: each FF season moves TypeInfo further than ±0x2000.
-    // Scan a wide strided window around the known offsets and accept the
-    // first slot whose typeInfo→statics→matchGame chain validates. Cached so
-    // the scan pays once per attach (validated offsets repeat next frames).
+    // SEASON DRIFT SCAN: only if candidates failed completely
     static uint64_t s_cachedOff = 0;
     if (s_cachedOff) {
         uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + s_cachedOff);
         if (isVaildPtr(typeInfo)) {
             uint64_t statics = ReadGameFacadeStatics(typeInfo);
             if (isVaildPtr(statics)) {
-                uint64_t mg = ReadMatchGameFromGameFacadeStatics(statics);
-                if (isVaildPtr(mg)) {
-                    s_cachedMatch = mg;
-                    s_cachedPid = ds_pid();
-                    return mg;
-                }
+                s_cachedStatics = statics;
+                s_cachedPid = curPid;
+                return ReadMatchGameFromGameFacadeStatics(statics);
             }
         }
         s_cachedOff = 0; // stale — rescan
     }
+
     const uint64_t anchors[] = { primary, 0xBFD8978ULL, 0xC3299C8ULL };
     for (size_t a = 0; a < 3; a++) {
         uint64_t base = anchors[a];
@@ -135,15 +129,12 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
                 if (!isVaildPtr(typeInfo)) continue;
                 uint64_t statics = ReadGameFacadeStatics(typeInfo);
                 if (!isVaildPtr(statics)) continue;
-                uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(statics);
-                if (isVaildPtr(matchGame)) {
-                    s_cachedOff = off;
-                    s_cachedMatch = matchGame;
-                    s_cachedPid = ds_pid();
-                    NSLog(@"[GL] GameFacade TypeInfo found at +0x%llx (drift %+#llx from anchor)", off, (int64_t)(off - base));
-                    NSLog(@"[GameLogic] >>> DRIFT OFFSET HIT SUCCESS: matchGame = 0x%llx (off=0x%llx) <<<", matchGame, off);
-                    return matchGame;
-                }
+
+                s_cachedOff = off;
+                s_cachedStatics = statics;
+                s_cachedPid = curPid;
+                NSLog(@"[GL] GameFacade TypeInfo found at +0x%llx (drift %+#llx from anchor)", off, (int64_t)(off - base));
+                return ReadMatchGameFromGameFacadeStatics(statics);
             }
         }
     }
@@ -152,22 +143,7 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
 
 uint64_t getMatch(uint64_t matchgame) {
     if (!isVaildPtr((uintptr_t)matchgame)) return 0;
-    // Primary + nearby candidates — season dumps sometimes shift Match field.
-    const uint64_t offs[] = {
-        (uint64_t)kMatch,
-        0x90, 0x88, 0x98, 0xA0, 0x80, 0x78, 0xA8, 0xB0
-    };
-    for (size_t i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
-        uint64_t m = ReadAddr<uint64_t>(matchgame + offs[i]);
-        if (isVaildPtr(m)) {
-            if (i != 0) {
-                NSLog(@"[GameLogic] getMatch: primary 0x%llx miss, hit at +0x%llx → match=0x%llx",
-                      (unsigned long long)kMatch, (unsigned long long)offs[i], (unsigned long long)m);
-            }
-            return m;
-        }
-    }
-    return 0;
+    return ReadAddr<uint64_t>(matchgame + kMatch);
 }
 
 uint64_t getLocalPlayer(uint64_t match) {
@@ -177,31 +153,9 @@ uint64_t getLocalPlayer(uint64_t match) {
 
 uint64_t CameraMain(uint64_t matchgame) {
     if (!isVaildPtr((uintptr_t)matchgame)) return 0;
-    // CameraControllerManager candidates on MatchGame.
-    const uint64_t mgrOffs[] = {
-        (uint64_t)kCameraControllerManager,
-        0xD8, 0xD0, 0xE0, 0xC8, 0xE8, 0xF0, 0xC0, 0xB8
-    };
-    const uint64_t camOffs[] = {
-        (uint64_t)kMainCamera,
-        0x20, 0x18, 0x28, 0x10, 0x30, 0x38
-    };
-    for (size_t i = 0; i < sizeof(mgrOffs) / sizeof(mgrOffs[0]); i++) {
-        uint64_t mgr = ReadAddr<uint64_t>(matchgame + mgrOffs[i]);
-        if (!isVaildPtr(mgr)) continue;
-        for (size_t j = 0; j < sizeof(camOffs) / sizeof(camOffs[0]); j++) {
-            uint64_t cam = ReadAddr<uint64_t>(mgr + camOffs[j]);
-            if (isVaildPtr(cam)) {
-                if (i != 0 || j != 0) {
-                    NSLog(@"[GameLogic] CameraMain: hit mgr+0x%llx cam+0x%llx → cam=0x%llx",
-                          (unsigned long long)mgrOffs[i], (unsigned long long)camOffs[j],
-                          (unsigned long long)cam);
-                }
-                return cam;
-            }
-        }
-    }
-    return 0;
+    uint64_t CameraControllerManager = ReadAddr<uint64_t>(matchgame + kCameraControllerManager);
+    if (!isVaildPtr((uintptr_t)CameraControllerManager)) return 0;
+    return ReadAddr<uint64_t>(CameraControllerManager + kMainCamera);
 }
 
 // Bulk-read 16 floats (64 bytes) so view/proj don't tear across 16 remote reads
