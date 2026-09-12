@@ -152,7 +152,22 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
 
 uint64_t getMatch(uint64_t matchgame) {
     if (!isVaildPtr((uintptr_t)matchgame)) return 0;
-    return ReadAddr<uint64_t>(matchgame + kMatch);
+    // Primary + nearby candidates — season dumps sometimes shift Match field.
+    const uint64_t offs[] = {
+        (uint64_t)kMatch,
+        0x90, 0x88, 0x98, 0xA0, 0x80, 0x78, 0xA8, 0xB0
+    };
+    for (size_t i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
+        uint64_t m = ReadAddr<uint64_t>(matchgame + offs[i]);
+        if (isVaildPtr(m)) {
+            if (i != 0) {
+                NSLog(@"[GameLogic] getMatch: primary 0x%llx miss, hit at +0x%llx → match=0x%llx",
+                      (unsigned long long)kMatch, (unsigned long long)offs[i], (unsigned long long)m);
+            }
+            return m;
+        }
+    }
+    return 0;
 }
 
 uint64_t getLocalPlayer(uint64_t match) {
@@ -162,9 +177,31 @@ uint64_t getLocalPlayer(uint64_t match) {
 
 uint64_t CameraMain(uint64_t matchgame) {
     if (!isVaildPtr((uintptr_t)matchgame)) return 0;
-    uint64_t CameraControllerManager = ReadAddr<uint64_t>(matchgame + kCameraControllerManager);
-    if (!isVaildPtr((uintptr_t)CameraControllerManager)) return 0;
-    return ReadAddr<uint64_t>(CameraControllerManager + kMainCamera);
+    // CameraControllerManager candidates on MatchGame.
+    const uint64_t mgrOffs[] = {
+        (uint64_t)kCameraControllerManager,
+        0xD8, 0xD0, 0xE0, 0xC8, 0xE8, 0xF0, 0xC0, 0xB8
+    };
+    const uint64_t camOffs[] = {
+        (uint64_t)kMainCamera,
+        0x20, 0x18, 0x28, 0x10, 0x30, 0x38
+    };
+    for (size_t i = 0; i < sizeof(mgrOffs) / sizeof(mgrOffs[0]); i++) {
+        uint64_t mgr = ReadAddr<uint64_t>(matchgame + mgrOffs[i]);
+        if (!isVaildPtr(mgr)) continue;
+        for (size_t j = 0; j < sizeof(camOffs) / sizeof(camOffs[0]); j++) {
+            uint64_t cam = ReadAddr<uint64_t>(mgr + camOffs[j]);
+            if (isVaildPtr(cam)) {
+                if (i != 0 || j != 0) {
+                    NSLog(@"[GameLogic] CameraMain: hit mgr+0x%llx cam+0x%llx → cam=0x%llx",
+                          (unsigned long long)mgrOffs[i], (unsigned long long)camOffs[j],
+                          (unsigned long long)cam);
+                }
+                return cam;
+            }
+        }
+    }
+    return 0;
 }
 
 // Bulk-read 16 floats (64 bytes) so view/proj don't tear across 16 remote reads
