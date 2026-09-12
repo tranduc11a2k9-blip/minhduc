@@ -1491,21 +1491,21 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
         return aimed;
     }
 
-    // Aimbot/Assist (no Silent): lock head fast when off, smooth when on target.
+    // Aimbot: snap direct to targetQ; Legit: smooth blend
     Quaternion cur = ReadAddr<Quaternion>(localPawn + kAimRotation);
     float n = cur.x*cur.x + cur.y*cur.y + cur.z*cur.z + cur.w*cur.w;
     Quaternion outQ = targetQ;
-    if (n > 0.0001f && !isnan(n)) {
+    if (isAimLegit && n > 0.0001f && !isnan(n)) {
         cur = Quaternion::Normalized(cur);
         float ang = Quaternion::Angle(cur, targetQ);
 
-        const float kDeadzoneRad = 0.0035f; // ~0.2° — smaller to stay sticky while still filtering micro jitter
+        const float kDeadzoneRad = 0.0035f; // ~0.2°
         if (ang < kDeadzoneRad) {
             outQ = cur; // hold steady, do not copy noise
         } else {
             float dt = esp_aim_delta_time();
             float rate = 90.0f;
-            if (ang > 0.25f)      rate = 240.0f;  // fast acquire when off
+            if (ang > 0.25f)      rate = 240.0f;
             else if (ang > 0.10f) rate = 160.0f;
             else if (ang > 0.04f) rate = 110.0f;
 
@@ -1516,6 +1516,7 @@ static inline Vector3 AimLookAtHeadLive(uint64_t localPawn, uint64_t targetPawn,
             if (isnan(outQ.x) || isnan(outQ.y) || isnan(outQ.z) || isnan(outQ.w)) outQ = targetQ;
         }
     }
+    write_aim_rotations(localPawn, outQ);
     write_aim_rotations(localPawn, outQ);
     AimSyncFireHit(localPawn, from, aimed);
 
@@ -3293,7 +3294,8 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
     uint64_t myPawnObject = getLocalPlayer(match);
 
-    bool iAmAlive = isVaildPtr(myPawnObject) && (get_CurHP(myPawnObject) > 0);
+    int curHp = isVaildPtr(myPawnObject) ? get_CurHP(myPawnObject) : 0;
+    bool iAmAlive = isVaildPtr(myPawnObject) && (curHp >= 0);
 
     // Speed — Brutal run scale (slider) + menu Speed.
     // Brutal ON: hold BrutalSpeed (default 0.16). Menu Speed only when Brutal OFF.
@@ -4794,10 +4796,20 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         default: shouldActivate = true; break;                    // Auto
     }
 
+    if (useAssistOnly) {
+        shouldActivate = true; // Aim Assist should assist when near target without waiting for fire
+    }
+
     // Silent (AimSilent.h style): keep a locked target for a high-freq direction-rewrite
     // thread. Camera aim (Aimbot/Assist) stays independent via LookAt.
     const bool cameraAimActive = (isAimbot || useAssist) && shouldActivate;
     const bool silentActive = useSilent && iAmAlive && isVaildPtr(myPawnObject);
+
+    static int s_aimDiagLog = 0;
+    if ((isAimbot || useAssist) && (++s_aimDiagLog % 120 == 1)) {
+        NSLog(@"[AIM-DIAG] isAimbot=%d useAssist=%d trig=%d isFiring=%d isScoping=%d act=%d target=0x%llx",
+              (int)isAimbot, (int)useAssist, trig, (int)isFiring, (int)isScoping, (int)shouldActivate, (unsigned long long)bestTarget);
+    }
 
     // Hard-stop camera path the instant trigger is off or no aim mode.
     // (Prevents "nhả nút vẫn aim thêm 1 xíu" + cam lắc từ lock thread.)

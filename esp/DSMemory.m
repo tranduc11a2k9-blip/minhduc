@@ -308,7 +308,7 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // không". Cache mapped pages (128 slots, LRU-ish round-robin) so repeated
 // reads of the same page (the common case: HP/positions/TypeInfo) hit the
 // cache and cost a memcpy only.
-#define DS_PAGE_CACHE_SLOTS 128
+#define DS_PAGE_CACHE_SLOTS 1024
 static struct {
     uint64_t pageVA;
     uint64_t localAddr;
@@ -333,9 +333,6 @@ static uint64_t ds_page_local(uint64_t pageVA) {
 
     struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
     if (!page.localAddress) {
-        // Trang chưa resident (FF chưa đụng từ lúc boot level) — KHÔNG force-fault
-        // qua early_kread64 (user VA ≠ kernel addr → intentional crash). Return 0,
-        // caller (ds_rw_remap) trả false, frame sau retry khi game đã touch trang.
         return 0;
     }
 
@@ -366,18 +363,6 @@ static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
         void *local = (void *)(uintptr_t)(localAddr + page_off);
         if (isWrite) {
             memcpy(local, p, chunk);
-            // Coherency: mapped page là alias của trang kernel — ghi trực tiếp
-            // đã chạm memory thật, nhưng game cũng ghi cùng trang (AimRotation do
-            // engine update mỗi tick). Alias KHÔNG tự refresh → read sau trả giá
-            // trị cũ. Fix: bỏ cache trang sau mỗi write, lần đọc sau remap lại.
-            pthread_mutex_lock(&g_pageCacheLock);
-            for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-                if (g_pageCache[i].pageVA == page_va) {
-                    g_pageCache[i].pageVA = 0;
-                    g_pageCache[i].localAddr = 0;
-                }
-            }
-            pthread_mutex_unlock(&g_pageCacheLock);
         }
         else memcpy(p, local, chunk);
 
