@@ -3103,6 +3103,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                         Moudule_Base = (uint64_t)base;
                         s_attachedPid = ds_pid();
                         gEngine = (void *)1; // DSMemory
+                        NSLog(@"[ESP] Attached to game PID=%d, Moudule_Base=0x%llx", ds_pid(), (unsigned long long)Moudule_Base);
                     } else {
                         Moudule_Base = 0;
                         s_attachedPid = -1;
@@ -3256,21 +3257,23 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     }
     // Lobby gate (restored): matchGame invalid here means either lobby OR
     // broken TypeInfo reads — the diag below distinguishes them by logging
-    // the raw first read so it can be compared against the working TIPA.
-    if (IsAtLobby(Moudule_Base)) {
-        DIAG_EARLY_LOBBY();
-        return stats;
-    }
-
     uint64_t matchGame = getMatchGame(Moudule_Base);
     if (!isVaildPtr(matchGame)) {
+        static int s_lobbyLog = 0;
+        if (++s_lobbyLog % 180 == 1) {
+            NSLog(@"[ESP] Waiting for in-game match (Lobby / matchGame not resolved, Moudule_Base=0x%llx)", (unsigned long long)Moudule_Base);
+        }
         DIAG_EARLY(@"no-matchGame");
         return stats;
     }
 
-
     uint64_t camera = CameraMain(matchGame);
     uint64_t match = getMatch(matchGame);
+    static int s_inMatchLog = 0;
+    if (++s_inMatchLog % 180 == 1) {
+        NSLog(@"[ESP] >>> IN-MATCH ACTIVE: matchGame=0x%llx, match=0x%llx, camera=0x%llx <<<",
+              (unsigned long long)matchGame, (unsigned long long)match, (unsigned long long)camera);
+    }
     if (!isVaildPtr(camera) || !isVaildPtr(match)) {
         DIAG_EARLY(@"no-camera-or-match");
         return stats;

@@ -333,19 +333,38 @@ const char *GameTargetProcessName(void) {
 
 int GameTargetProcessPid(void) {
     if (ds_attached()) {
-        return ds_pid();
+        pid_t p = ds_pid();
+        if (p > 0) return p;
     }
-    return -1;
+    const char *pName = GameTargetProcessName();
+    pid_t sysctlPid = GetGameProcesspidExact(pName);
+    if (sysctlPid > 0) {
+        static pid_t s_lastLogPid = -1;
+        if (sysctlPid != s_lastLogPid) {
+            s_lastLogPid = sysctlPid;
+            NSLog(@"[GameOffsets] Game '%s' detected via sysctl: PID=%d", pName, sysctlPid);
+        }
+    }
+    return sysctlPid;
 }
 
 bool GameTargetIsRunning(void) {
-    // KHÔNG probe attach ở đây — probe gây crash/nút xám vì nó chạy kernel reads
-    // trong viewDidLoad/poll timer trước khi exploit chạy.
-    // Attach chỉ xảy ra khi ESP loop gọi GameTargetModuleBase().
-    return ds_attached();
+    if (ds_attached()) return true;
+    return (GameTargetProcessPid() > 0);
 }
 
 uintptr_t GameTargetModuleBase(void) {
-    if (!ds_attached() && ds_attach() != 0) return 0;
+    if (!ds_attached()) {
+        NSLog(@"[GameOffsets] GameTargetModuleBase: Attaching to '%s' via ds_attach()...", GameTargetProcessName());
+        int ret = ds_attach();
+        if (ret != 0) {
+            static int s_failCount = 0;
+            if (++s_failCount % 30 == 1) {
+                NSLog(@"[GameOffsets] ds_attach() failed: code %d", ret);
+            }
+            return 0;
+        }
+        NSLog(@"[GameOffsets] ds_attach() SUCCESS: PID=%d, base=0x%llx", ds_pid(), ds_base());
+    }
     return (uintptr_t)ds_base();
 }

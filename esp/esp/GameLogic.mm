@@ -73,10 +73,20 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         0xBFD8978ULL, // known FFTH dump
         0xC3299C8ULL, // known MAX dump
     };
+
+    static int s_probeLog = 0;
+    bool shouldLog = (++s_probeLog % 90 == 1);
+
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
         uint64_t off = candidates[i];
         if (off == 0 || off > 0x20000000ULL) continue;
         uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + off);
+
+        if (shouldLog && i == 0) {
+            NSLog(@"[GameLogic] Probing GameFacade TypeInfo at Base 0x%llx + 0x%llx = 0x%llx -> typeInfo=0x%llx (valid=%d)",
+                  Moudule_Base, off, Moudule_Base + off, typeInfo, isVaildPtr(typeInfo));
+        }
+
         if (!isVaildPtr(typeInfo)) continue;
         uint64_t statics = ReadGameFacadeStatics(typeInfo);
         if (!isVaildPtr(statics)) continue;
@@ -84,6 +94,8 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         if (isVaildPtr(matchGame)) {
             s_cachedMatch = matchGame;
             s_cachedPid = ds_pid();
+            NSLog(@"[GameLogic] >>> OFFSET HIT SUCCESS: matchGame = 0x%llx (Candidate off=0x%llx, statics=0x%llx) <<<",
+                  matchGame, off, statics);
             return matchGame;
         }
     }
@@ -129,6 +141,7 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
                     s_cachedMatch = matchGame;
                     s_cachedPid = ds_pid();
                     NSLog(@"[GL] GameFacade TypeInfo found at +0x%llx (drift %+#llx from anchor)", off, (int64_t)(off - base));
+                    NSLog(@"[GameLogic] >>> DRIFT OFFSET HIT SUCCESS: matchGame = 0x%llx (off=0x%llx) <<<", matchGame, off);
                     return matchGame;
                 }
             }
