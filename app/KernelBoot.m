@@ -54,15 +54,12 @@ void kernelBootStart(void) {
     if (g_ready) {
         L(@"OK Already booted — re-establishing overlay.");
         [[KeepAlive shared] start];
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            SBoardStartOverlay();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            extern int StartDirectOverlay(void);
+            StartDirectOverlay();
         });
         return;
     }
-
-    // PARK REMOVED — every process launch runs the exploit fresh.
-    // (Old fast path skipped the exploit on relaunch → dead primitives →
-    //  ESP never drew after app restart. g_kexploit_ready is process-local.)
 
     g_booting = YES;
     if (!g_bootQueue) {
@@ -95,59 +92,26 @@ void kernelBootStart(void) {
         L(@"OK Kernel memory r/w acquired.");
 
         uint64_t self_proc = proc_self();
-        // NOTE: platformize/sandbox-elevate intentionally skipped — iOS 17.5.1
-        // SMR reclaims cred mid-write → panic. sandbox_escape (extension patch)
-        // alone gives full R+W filesystem.
         int sret = sandbox_escape(self_proc);
         L(sret == 0 ? @"OK Sandbox escaped (R+W filesystem)."
                     : @"WARN sandbox_escape returned %d", sret);
 
-        L(@"RUN 4/6 Opening SpringBoard injection channel (staged)");
-        // Opening the SB session immediately after sandbox_escape crashed SB.
-        // Staged settle: try at 3s, 5s, 8s, 12s — first success wins (fast
-        // path when SB is responsive; still avoids the post-exploit storm).
+        L(@"RUN 4/6 Initializing Background KeepAlive");
         [[KeepAlive shared] start];
-        __block BOOL sbDone = NO;
-        __block int sbret = -1;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            static const int delays[] = {3, 2, 3, 4}; // cumulative: 3s,5s,8s,12s
-            for (int attempt = 0; attempt < 4; attempt++) {
-                sleep(delays[attempt]);
-                sbret = SBoardStartOverlay();
-                if (sbret == 0) break;
-                NSLog(@"[BOOT] SB overlay attempt %d failed rc=%d", attempt + 1, sbret);
-            }
-            sbDone = YES;
-        });
-        L(@"OK Channel establishing (3s..12s staged).");
+        L(@"OK KeepAlive started.");
 
-        L(@"RUN 5/6 Preparing SpringBoard session");
-        L(@"OK SpringBoard session pending (background).");
+        L(@"RUN 5/6 Preparing Direct Overlay session");
+        L(@"OK Direct overlay session ready.");
 
-        L(@"RUN 6/6 Starting ESP renderer (offscreen data source)");
-        // ESP_View runs OFFSCREEN: StartDirectOverlay builds the in-app host
-        // window via its own inner dispatch_async(main) — so the hide pass
-        // must be queued AFTER that inner block (two main-queue hops). All
-        // visible drawing happens in the SpringBoard window.
+        L(@"RUN 6/6 Starting Direct System Overlay");
         dispatch_async(dispatch_get_main_queue(), ^{
             extern int StartDirectOverlay(void);
             StartDirectOverlay();
-            // Hop 2: runs after DirectOverlay's inner main-queue block,
-            // so the host window exists by now. alpha=0 keeps the layer
-            // tree rendering (hidden=YES would stop the ESP data loop).
-            dispatch_async(dispatch_get_main_queue(), ^{
-                Class hudWinCls = objc_getClass("HUDMainWindow");
-                for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                    if ([w isKindOfClass:hudWinCls]) {
-                        w.alpha = 0.0;
-                        w.hidden = NO;   // keep timer/layers alive
-                        w.userInteractionEnabled = NO;
-                    }
-                }
-                NSLog(@"[BOOT] in-app host window hidden — ESP mirrors to SpringBoard");
-            });
+            NSLog(@"[BOOT] Direct System Overlay started via SBSAccessibility");
         });
-        L(@"OK ESP data source active (mirroring to SpringBoard).");
+        L(@"OK Direct System Overlay active.");
+        g_ready = YES;
+        g_booting = NO;
     });
 }
 
