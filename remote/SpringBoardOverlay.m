@@ -1,27 +1,23 @@
 //
-//  SpringBoardOverlay.m — Fl0rk DrawView session-scoped paint
+//  SpringBoardOverlay.m — Fl0rk DrawView long session + 20fps publish
 //
-//  From fl0rk_drawview_symbols.txt (DrawView.o):
-//    drawview_start_esp_renderer_in_session
-//    drawview_publish_frame_options_in_session
-//    drawview_stop_in_session
+//  Fl0rk symbols (DrawView.o):
+//    drawview_start_esp_renderer_in_session   ← open session, build host
+//    drawview_publish_frame_options_in_session ← paint while session live
+//    drawview_stop_in_session                 ← hide + destroy
 //    drawview_forget_remote_state
-//    drawview_release_all_cached_main_invocations
-//    gDrawViewGeometryPathInvocation + drawview_invoke_cached_main_raw
+//    gDrawViewGeometryPathInvocation + invoke_cached_main_raw
 //    gDrawViewNextPlayerOverlayUS
-//    gDrawViewWindow / Canvas / GeometryLayer (associated retain)
 //
-//  Binary dig (Fl0rkFF arm64): DrawView strings oxorany-stripped; no
-//  persistent CADisplayLink in SB; RemoteCallSession destroy/abandon present.
-//  Symbol contract = work happens *_in_session, then forget — NOT a 30fps
-//  permanent trojan on SpringBoard main (that WATCHDOG'd us).
+//  Correct reading of *_in_session:
+//    Session stays OPEN for the whole ESP lifetime (start→stop).
+//    Not open/destroy per frame. Per-frame work is publish only.
 //
-//  Paint contract:
-//    Start:  short session → create passthrough UIWindow+CAShapeLayer once
-//            → objc_setAssociatedObject retain → destroy_remote_call
-//    Frame:  rate gate → short session → CGPathClear/AddLines → setPath
-//            → destroy_remote_call (release trojan every publish)
-//    Stop:   short session → hide → forget → destroy
+//  WATCHDOG lesson: 30fps + heavy IPC killed SB. This build:
+//    - persistent session (Fl0rk)
+//    - cached setPath NSInvocation (Fl0rk)
+//    - persistent remote path + pts buf (Fl0rk)
+//    - 20fps gate (50ms) + hash skip + in-flight drop
 //
 
 #import "SpringBoardOverlay.h"
@@ -34,18 +30,24 @@
 #import <mach/mach_time.h>
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
-// Fl0rk has gDrawViewNextPlayerOverlayUS; our RemoteCall is heavier than
-// theirs while reverse is incomplete — 2Hz keeps SB main responsive.
-#define SB_MIN_PUBLISH_INTERVAL_US 500000ULL
+// 20fps — user pick; safer than 30fps WATCHDOG build.
+#define SB_MIN_PUBLISH_INTERVAL_US 50000ULL
 
 static BOOL g_sbOverlayOn = NO;
 static uint64_t g_sbWin = 0;
 static uint64_t g_sbShape = 0;
 static uint64_t g_sbCanvas = 0;
+
 static uint64_t g_sbPersistentPath = 0;
 static uint64_t g_sbMirrorPtsBuf = 0;
 static uint32_t g_sbPathHash = 0;
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
+
+// Fl0rk: gDrawViewGeometryPathInvocation + invoke_cached_main_raw
+static uint64_t g_sbSetPathInv = 0;
+static uint64_t g_sbSetPathArgBuf = 0;
+static uint64_t g_sbPerformMainSel = 0;
+static uint64_t g_sbInvokeSel = 0;
 
 static uint64_t g_sbSummaryAttempts = 0;
 static uint64_t g_sbSummarySkips = 0;
@@ -112,31 +114,22 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     return YES;
 }
 
-// Fl0rk: open RemoteCall only for the duration of *_in_session work.
-static int sb_session_begin(void) {
-    if (!g_kexploit_ready) return -1;
-    if (remote_call_has_local_state()) {
-        abandon_remote_call();
+static void sb_forget_local_paint_state(void) {
+    // Fl0rk: release_all_cached_main_invocations / forget_remote_state (local side)
+    if (r_is_objc_ptr(g_sbSetPathInv) && remote_call_has_local_state()) {
+        r_msg2(g_sbSetPathInv, "release", 0,0,0,0);
     }
-    r_settle_us(2000);
-    int rc = init_remote_call_original_thread_only_with_first_exception_timeout(
-        "SpringBoard", false, 8000);
-    if (rc != 0) {
-        rc = init_remote_call_with_first_exception_timeout("SpringBoard", false, 8000);
+    if (g_sbSetPathArgBuf && remote_call_has_local_state()) {
+        dlsym_remote("free", g_sbSetPathArgBuf, 0,0,0,0,0,0,0);
     }
-    if (rc != 0) return -1;
-    uint64_t pid = do_remote_call_stable(3000, "getpid", 0,0,0,0,0,0,0,0);
-    if (pid == 0) {
-        destroy_remote_call();
-        return -1;
-    }
-    return 0;
-}
-
-static void sb_session_end(void) {
-    if (remote_call_has_local_state()) {
-        destroy_remote_call();
-    }
+    g_sbSetPathInv = 0;
+    g_sbSetPathArgBuf = 0;
+    g_sbPerformMainSel = 0;
+    g_sbInvokeSel = 0;
+    g_sbPersistentPath = 0;
+    g_sbMirrorPtsBuf = 0;
+    g_sbPathHash = 0;
+    g_sbNextPublishUS = 0;
 }
 
 static void sb_disable_layer_actions(uint64_t layer) {
@@ -153,14 +146,92 @@ static void sb_disable_layer_actions(uint64_t layer) {
     }
 }
 
-static uint64_t sb_ensure_path(void) {
+static uint64_t persistentPath(void) {
+    if (g_sbPersistentPath) return g_sbPersistentPath;
     g_sbPersistentPath = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
     return g_sbPersistentPath;
 }
 
-static uint64_t sb_ensure_pts(void) {
+static uint64_t ptsBuffer(void) {
+    if (g_sbMirrorPtsBuf) return g_sbMirrorPtsBuf;
     g_sbMirrorPtsBuf = dlsym_remote("malloc", 65536, 0,0,0,0,0,0,0);
     return g_sbMirrorPtsBuf;
+}
+
+static BOOL sb_ensure_setpath_invocation(void) {
+    if (r_is_objc_ptr(g_sbSetPathInv) && g_sbSetPathArgBuf) return YES;
+    if (!r_is_objc_ptr(g_sbShape)) return NO;
+
+    uint64_t rp = persistentPath();
+    if (!rp) return NO;
+
+    uint64_t setPathSel = r_sel("setPath:");
+    if (!setPathSel) return NO;
+
+    uint64_t sigSel = r_sel("methodSignatureForSelector:");
+    uint64_t sig = r_msg(g_sbShape, sigSel, setPathSel, 0, 0, 0);
+    if (!r_is_objc_ptr(sig)) return NO;
+
+    uint64_t NSInvocation = r_class("NSInvocation");
+    if (!r_is_objc_ptr(NSInvocation)) return NO;
+
+    uint64_t inv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+    if (!r_is_objc_ptr(inv)) return NO;
+    r_msg2(inv, "retain", 0, 0, 0, 0);
+
+    r_msg2(inv, "setTarget:", g_sbShape, 0, 0, 0);
+    r_msg2(inv, "setSelector:", setPathSel, 0, 0, 0);
+
+    uint64_t argBuf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+    if (!argBuf) {
+        r_msg2(inv, "release", 0, 0, 0, 0);
+        return NO;
+    }
+    remote_write64(argBuf, rp);
+    r_msg2(inv, "setArgument:atIndex:", argBuf, 2, 0, 0);
+    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
+
+    g_sbSetPathInv = inv;
+    g_sbSetPathArgBuf = argBuf;
+    g_sbPerformMainSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+    g_sbInvokeSel = r_sel("invoke");
+    NSLog(@"[SBOverlay] GeometryPathInvocation=0x%llx path=0x%llx", inv, rp);
+    return YES;
+}
+
+static void sb_invoke_cached_main_raw(void) {
+    if (!sb_ensure_setpath_invocation()) {
+        uint64_t rp = persistentPath();
+        if (rp) r_msg2_main_async(g_sbShape, "setPath:", rp, 0,0,0);
+        return;
+    }
+    remote_write64(g_sbSetPathArgBuf, persistentPath());
+    r_msg2(g_sbSetPathInv, "setArgument:atIndex:", g_sbSetPathArgBuf, 2, 0, 0);
+    if (g_sbPerformMainSel && g_sbInvokeSel) {
+        r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    }
+}
+
+static int sb_open_session(void) {
+    if (!g_kexploit_ready) return -1;
+    if (remote_call_has_local_state()) {
+        // Already in session (re-entry / retry).
+        if (remote_call_current_success()) return 0;
+        abandon_remote_call();
+    }
+    r_settle_us(3000);
+    int rc = init_remote_call_original_thread_only_with_first_exception_timeout(
+        "SpringBoard", false, 15000);
+    if (rc != 0) {
+        rc = init_remote_call_with_first_exception_timeout("SpringBoard", false, 15000);
+    }
+    if (rc != 0) return -1;
+    uint64_t pid = do_remote_call_stable(5000, "getpid", 0,0,0,0,0,0,0,0);
+    if (pid == 0) {
+        destroy_remote_call();
+        return -1;
+    }
+    return 0;
 }
 
 int SBoardStartOverlay(void) {
@@ -170,14 +241,14 @@ int SBoardStartOverlay(void) {
 
     if (!g_kexploit_ready) return -1;
 
-    NSLog(@"[SBOverlay] Fl0rk start_esp_renderer_in_session...");
-    if (sb_session_begin() != 0) {
-        NSLog(@"[SBOverlay] session begin failed");
+    NSLog(@"[SBOverlay] Fl0rk start_esp_renderer_in_session (keep open, 20fps)...");
+    if (sb_open_session() != 0) {
+        NSLog(@"[SBOverlay] session open failed");
         return -1;
     }
 
     uint64_t app = r_msg2_main(r_class("UIApplication"), "sharedApplication", 0,0,0,0);
-    if (!r_is_objc_ptr(app)) { sb_session_end(); return -1; }
+    if (!r_is_objc_ptr(app)) { destroy_remote_call(); return -1; }
 
     uint64_t keyWin = r_msg2_main(app, "keyWindow", 0,0,0,0);
     if (!r_is_objc_ptr(keyWin)) {
@@ -187,14 +258,14 @@ int SBoardStartOverlay(void) {
     }
     if (!r_is_objc_ptr(keyWin)) {
         NSLog(@"[SBOverlay] no SB window");
-        sb_session_end();
+        destroy_remote_call();
         return -1;
     }
 
     uint64_t scene = r_msg2_main(keyWin, "windowScene", 0,0,0,0);
     if (!r_is_objc_ptr(scene)) {
         NSLog(@"[SBOverlay] no UIWindowScene");
-        sb_session_end();
+        destroy_remote_call();
         return -1;
     }
 
@@ -211,12 +282,12 @@ int SBoardStartOverlay(void) {
     uint64_t whiteCGColor = r_is_objc_ptr(whiteColor) ? r_msg2_main(whiteColor, "CGColor", 0,0,0,0) : 0;
 
     uint64_t winAlloc = r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0);
-    if (!r_is_objc_ptr(winAlloc)) { sb_session_end(); return -1; }
+    if (!r_is_objc_ptr(winAlloc)) { destroy_remote_call(); return -1; }
 
     uint64_t win = r_msg2_main(winAlloc, "initWithWindowScene:", scene, 0,0,0);
     if (!r_is_objc_ptr(win)) {
         NSLog(@"[SBOverlay] initWithWindowScene failed");
-        sb_session_end();
+        destroy_remote_call();
         return -1;
     }
 
@@ -228,14 +299,14 @@ int SBoardStartOverlay(void) {
 
     uint64_t container = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
                                          "initWithFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
-    if (!r_is_objc_ptr(container)) { sb_session_end(); return -1; }
+    if (!r_is_objc_ptr(container)) { destroy_remote_call(); return -1; }
     if (r_is_objc_ptr(clear)) r_msg2_main(container, "setBackgroundColor:", clear, 0,0,0);
     r_msg2_main(container, "setUserInteractionEnabled:", 0, 0,0,0);
     r_msg2_main(container, "setOpaque:", 0, 0,0,0);
     r_msg2_main(win, "addSubview:", container, 0,0,0);
 
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
-    if (!r_is_objc_ptr(shape)) { sb_session_end(); return -1; }
+    if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
     if (r_is_objc_ptr(whiteCGColor)) r_msg2_main(shape, "setStrokeColor:", whiteCGColor, 0,0,0);
     r_msg2_main(shape, "setFillColor:", 0, 0,0,0);
@@ -261,20 +332,26 @@ int SBoardStartOverlay(void) {
     g_sbShape = shape;
     g_sbCanvas = container;
     g_sbOverlayOn = YES;
-    g_sbPersistentPath = 0;
-    g_sbMirrorPtsBuf = 0;
-    g_sbPathHash = 0;
-    g_sbNextPublishUS = 0;
     pthread_mutex_unlock(&g_sbLock);
 
-    NSLog(@"[SBOverlay] Fl0rk DrawView host ready win=0x%llx geom=0x%llx — ending session",
-          win, shape);
-    sb_session_end();
+    sb_forget_local_paint_state();
+    (void)persistentPath();
+    (void)ptsBuffer();
+    (void)sb_ensure_setpath_invocation();
+
+    // Session STAYS OPEN — Fl0rk start_in_session until stop_in_session.
+    NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @20fps",
+          win, shape, r_is_objc_ptr(g_sbSetPathInv) ? "OK" : "NO");
     return 0;
 }
 
 void SBRemotePushESPFrame(UIView *espView) {
     if (!g_sbOverlayOn || !espView) return;
+    if (!remote_call_has_local_state() || !remote_call_current_success()) {
+        // Session died (SB respawn?). Drop until restart.
+        g_sbSummarySkips++;
+        return;
+    }
 
     g_sbSummaryAttempts++;
 
@@ -300,22 +377,15 @@ void SBRemotePushESPFrame(UIView *espView) {
 
     g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
     NSData *frameBytes = [ops copy];
-    uint64_t shape = g_sbShape;
 
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @try {
-            if (sb_session_begin() != 0) return;
-            if (!r_is_objc_ptr(shape)) {
-                sb_session_end();
-                return;
-            }
+            if (!remote_call_has_local_state() || !remote_call_current_success()) return;
+            if (!r_is_objc_ptr(g_sbShape)) return;
 
-            uint64_t rp = sb_ensure_path();
-            uint64_t ptsBuf = sb_ensure_pts();
-            if (!rp || !ptsBuf) {
-                sb_session_end();
-                return;
-            }
+            uint64_t rp = persistentPath();
+            uint64_t ptsBuf = ptsBuffer();
+            if (!rp || !ptsBuf) return;
 
             size_t len = frameBytes.length;
             const uint8_t *b = (const uint8_t *)frameBytes.bytes;
@@ -350,21 +420,14 @@ void SBRemotePushESPFrame(UIView *espView) {
                 remote_write(ptsBuf, pts, n * 8);
                 dlsym_remote("CGPathClear", rp, 0,0,0,0,0,0,0);
                 dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
-                r_msg2_main_async(shape, "setPath:", rp, 0,0,0);
+                sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
-                if ((g_sbSummaryUpdates & 0xf) == 0) {
-                    NSLog(@"[SBOverlay] Fl0rk in_session updates=%llu skips=%llu attempts=%llu",
+                if ((g_sbSummaryUpdates & 0x3f) == 0) {
+                    NSLog(@"[SBOverlay] 20fps updates=%llu skips=%llu attempts=%llu",
                           g_sbSummaryUpdates, g_sbSummarySkips, g_sbSummaryAttempts);
                 }
             }
-
-            g_sbPersistentPath = 0;
-            g_sbMirrorPtsBuf = 0;
-            sb_session_end();
         } @finally {
-            if (remote_call_has_local_state()) {
-                destroy_remote_call();
-            }
             __sync_lock_release(&s_remoteBusy);
         }
     });
@@ -380,13 +443,15 @@ void SBoardStopOverlay(void) {
     g_sbWin = 0;
     g_sbShape = 0;
     g_sbCanvas = 0;
-    g_sbPersistentPath = 0;
-    g_sbMirrorPtsBuf = 0;
-    g_sbPathHash = 0;
     pthread_mutex_unlock(&g_sbLock);
 
-    if (sb_session_begin() == 0) {
+    // Fl0rk stop_in_session
+    if (remote_call_has_local_state()) {
         if (r_is_objc_ptr(win)) r_msg2_main(win, "setHidden:", 1, 0,0,0);
-        sb_session_end();
+        if (g_sbPersistentPath) dlsym_remote("CGPathRelease", g_sbPersistentPath, 0,0,0,0,0,0,0);
+        sb_forget_local_paint_state();
+        destroy_remote_call();
+    } else {
+        sb_forget_local_paint_state();
     }
 }
