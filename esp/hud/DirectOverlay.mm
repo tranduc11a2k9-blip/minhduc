@@ -71,7 +71,7 @@ int StartDirectOverlay(void) {
         menuView.userInteractionEnabled = YES;
         [vc.view addSubview:menuView];
 
-        // 4. Create Host Window for offscreen ESP_View CADisplayLink loop
+        // 4. System window — high level so it can sit above other UI in-process.
         g_systemWindow = [[HUDMainWindow alloc] initWithFrame:screen];
         g_systemWindow.rootViewController = vc;
         g_systemWindow.backgroundColor = [UIColor clearColor];
@@ -80,7 +80,43 @@ int StartDirectOverlay(void) {
         g_systemWindow.userInteractionEnabled = YES;
         [g_systemWindow makeKeyAndVisible];
 
-        NSLog(@"[Overlay] Host window started for SpringBoard ESP mirror");
+        // 5. Register with SBSAccessibilityWindowHostingController when available.
+        // On jailed sideload this often only keeps the window in OUR process
+        // (in-app). Still safer than SpringBoard RemoteCall (WATCHDOG/respring).
+        Class hostingClass = objc_getClass("SBSAccessibilityWindowHostingController");
+        g_hostingController = hostingClass ? [[hostingClass alloc] init] : nil;
+        SEL registerSel = NSSelectorFromString(@"registerWindowWithContextID:atLevel:");
+        SEL contextSel = NSSelectorFromString(@"_contextId");
+        if (g_hostingController &&
+            [g_hostingController respondsToSelector:registerSel] &&
+            [g_systemWindow respondsToSelector:contextSel]) {
+            unsigned int ctxId = 0;
+            NSMethodSignature *sig = [g_systemWindow methodSignatureForSelector:contextSel];
+            if (sig) {
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                [inv setTarget:g_systemWindow];
+                [inv setSelector:contextSel];
+                [inv invoke];
+                [inv getReturnValue:&ctxId];
+                if (ctxId != 0) {
+                    double lvl = [g_systemWindow windowLevel];
+                    NSMethodSignature *regSig = [g_hostingController methodSignatureForSelector:registerSel];
+                    if (regSig) {
+                        NSInvocation *regInv = [NSInvocation invocationWithMethodSignature:regSig];
+                        [regInv setTarget:g_hostingController];
+                        [regInv setSelector:registerSel];
+                        [regInv setArgument:&ctxId atIndex:2];
+                        [regInv setArgument:&lvl atIndex:3];
+                        [regInv invoke];
+                        NSLog(@"[Overlay] SBSAccessibility registered ctx=%u level=%f", ctxId, lvl);
+                    }
+                }
+            }
+        } else {
+            NSLog(@"[Overlay] SBSAccessibility unavailable — in-app window only");
+        }
+
+        NSLog(@"[Overlay] Direct Overlay started (no SpringBoard RemoteCall)");
     });
     return 0;
 }

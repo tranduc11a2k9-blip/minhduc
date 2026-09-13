@@ -3229,7 +3229,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
         [CATransaction commit];
 
-        // Mirror this frame to the SpringBoard-hosted overlay (if active).
+        // Mirror this frame to the SpringBoard dedicated overlay (if active).
         extern void SBRemotePushESPFrame(UIView *espView);
         SBRemotePushESPFrame(self);
     }
