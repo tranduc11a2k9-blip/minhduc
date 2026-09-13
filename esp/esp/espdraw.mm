@@ -156,23 +156,27 @@ static void ESPRenderPawnCore(
     if (headX == 0.0f && headY == 0.0f && headZ == 0.0f) return;
 
     int MaxHP = get_MaxHP(PawnObject);
-    if (MaxHP <= 0 || MaxHP > 300) return;
+    if (MaxHP <= 0 || MaxHP > 2000) MaxHP = 200;
 
     const bool isKnocked = (isKnockedFlag != 0);
     const bool isBot = (isBotFlag != 0);
     NSString *Name = GetNickName(PawnObject);
-    if (!isBot && (!Name || Name.length == 0)) return;
+    if (!Name || Name.length == 0) Name = isBot ? @"BOT" : @"Player";
 
     Vector3 HeadPos; HeadPos.x = headX; HeadPos.y = headY; HeadPos.z = headZ;
     Vector3 HipPos;  HipPos.x = hipX;  HipPos.y = hipY;  HipPos.z = hipZ;
     Vector3 RightToePos = getPositionExt(getRightToeNode(PawnObject));
-    // [FIX BOX LÙN KHI CHẠY]: Lấy thêm chân trái để so sánh
     Vector3 LeftToePos  = getPositionExt(getLeftAnkle(PawnObject));
 
-    float worldHeight = fabsf(HeadPos.y - RightToePos.y);
+    if (fabsf(RightToePos.x) < 0.1f && fabsf(RightToePos.y) < 0.1f && fabsf(RightToePos.z) < 0.1f) {
+        RightToePos = HeadPos;
+        RightToePos.y -= 1.65f;
+    }
+    if (fabsf(LeftToePos.x) < 0.1f && fabsf(LeftToePos.y) < 0.1f && fabsf(LeftToePos.z) < 0.1f) {
+        LeftToePos = RightToePos;
+    }
 
-    // [FIX 0 HP & KNOCKED]: Không ẩn ESP nếu đang gục hoặc vừa chết
-    if (!isKnocked && CurHP > 0 && (worldHeight < 0.2f || worldHeight > 4.0f)) return;
+    float worldHeight = fabsf(HeadPos.y - RightToePos.y);
 
     Vector3 L_Ankle      = getPositionExt(getLeftAnkle(PawnObject));
     Vector3 R_Ankle      = getPositionExt(getRightAnkle(PawnObject));
@@ -187,7 +191,7 @@ static void ESPRenderPawnCore(
     Vector3 w2sLeftToe = WorldToScreenLayer(LeftToePos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
     Vector3 w2sHip     = WorldToScreenLayer(HipPos, matrix, matrixVpWidth, matrixVpHeight, layerWidth, layerHeight);
 
-    if (w2sHead.z < 0.001f || w2sToe.z < 0.001f) return;
+    if (w2sHead.z < 0.001f) return;
     const float margin = layerWidth * 0.6f;
     if (w2sHead.x < -margin || w2sHead.x > layerWidth + margin || w2sHead.y < -margin || w2sHead.y > layerHeight + margin) return;
 

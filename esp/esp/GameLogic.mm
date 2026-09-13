@@ -14,9 +14,10 @@ extern uint64_t Moudule_Base;
 
 static uint64_t ReadMatchGameFromGameFacadeStatics(uint64_t GameFacade_Static) {
     if (!isVaildPtr(GameFacade_Static)) return 0;
-    // CurrentMatchGame is only valid while in a match.
-    // Do NOT fall back to CurrentGame (CurrentGame is lobby UI object, has no match/camera).
+    // Prefer CurrentMatchGame; fall back CurrentGame.
     uint64_t matchGame = ReadAddr<uint64_t>(GameFacade_Static + (uint64_t)kCurrentMatchGame);
+    if (isVaildPtr(matchGame)) return matchGame;
+    matchGame = ReadAddr<uint64_t>(GameFacade_Static + (uint64_t)kCurrentGame);
     if (isVaildPtr(matchGame)) return matchGame;
     return 0;
 }
@@ -31,7 +32,7 @@ static uint64_t ReadGameFacadeStatics(uint64_t typeInfo) {
     for (size_t i = 0; i < sizeof(staticOffs) / sizeof(staticOffs[0]); i++) {
         uint64_t st = ReadAddr<uint64_t>(typeInfo + staticOffs[i]);
         if (!isVaildPtr(st)) continue;
-        // Valid if either CurrentMatchGame (in match) or CurrentGame (in lobby) is a valid heap ptr.
+        // Valid if either CurrentMatchGame or CurrentGame looks like a heap ptr.
         uint64_t mg = ReadAddr<uint64_t>(st + (uint64_t)kCurrentMatchGame);
         uint64_t cg = ReadAddr<uint64_t>(st + (uint64_t)kCurrentGame);
         if (isVaildPtr(mg) || isVaildPtr(cg)) return st;
@@ -39,37 +40,11 @@ static uint64_t ReadGameFacadeStatics(uint64_t typeInfo) {
     return 0;
 }
 
-static uint64_t s_cachedStatics = 0;
-static pid_t s_cachedPid = -1;
-
 uint64_t getMatchGame(uint64_t Moudule_Base) {
     if (!isVaildPtr((uintptr_t)Moudule_Base))
         return 0;
 
-    pid_t curPid = ds_pid();
-    if (curPid != s_cachedPid) {
-        s_cachedStatics = 0;
-        s_cachedPid = curPid;
-    }
-
-    // Fast path: if GameFacade statics address is already resolved, read CurrentMatchGame directly!
-    // GameFacade statics address NEVER changes during the game process run, but CurrentMatchGame
-    // becomes 0 when in lobby and non-null when in match.
-    if (isVaildPtr(s_cachedStatics)) {
-        uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(s_cachedStatics);
-        if (isVaildPtr(matchGame)) {
-            return matchGame;
-        }
-        // In lobby: check if statics is still valid (cg non-null)
-        uint64_t cg = ReadAddr<uint64_t>(s_cachedStatics + (uint64_t)kCurrentGame);
-        if (isVaildPtr(cg)) {
-            return 0; // cleanly in lobby
-        }
-        // If neither is valid, statics pointer died (game restart/reload), re-resolve
-        s_cachedStatics = 0;
-    }
-
-    // Resolve GameFacade Statics
+    // Primary TypeInfo from offset table + a few nearby candidates if season moved it.
     uint64_t primary = (uint64_t)kGameFacadeTypeInfo;
     uint64_t candidates[] = {
         primary,
@@ -78,7 +53,6 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         0xBFD8978ULL, // known FFTH dump
         0xC3299C8ULL, // known MAX dump
     };
-
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
         uint64_t off = candidates[i];
         if (off == 0 || off > 0x20000000ULL) continue;
@@ -86,57 +60,8 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         if (!isVaildPtr(typeInfo)) continue;
         uint64_t statics = ReadGameFacadeStatics(typeInfo);
         if (!isVaildPtr(statics)) continue;
-
-        s_cachedStatics = statics;
-        s_cachedPid = curPid;
-        NSLog(@"[GameLogic] GameFacade statics resolved at 0x%llx (off=0x%llx)", statics, off);
-
         uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(statics);
-        if (isVaildPtr(matchGame)) {
-            NSLog(@"[GameLogic] >>> IN MATCH: matchGame = 0x%llx <<<", matchGame);
-            return matchGame;
-        }
-        return 0; // In lobby
-    }
-
-    // SEASON DRIFT SCAN: only if candidates failed completely
-    static uint64_t s_cachedOff = 0;
-    if (s_cachedOff) {
-        uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + s_cachedOff);
-        if (isVaildPtr(typeInfo)) {
-            uint64_t statics = ReadGameFacadeStatics(typeInfo);
-            if (isVaildPtr(statics)) {
-                s_cachedStatics = statics;
-                s_cachedPid = curPid;
-                return ReadMatchGameFromGameFacadeStatics(statics);
-            }
-        }
-        s_cachedOff = 0; // stale — rescan
-    }
-
-    const uint64_t anchors[] = { primary, 0xBFD8978ULL, 0xC3299C8ULL };
-    for (size_t a = 0; a < 3; a++) {
-        uint64_t base = anchors[a];
-        if (base == 0 || base > 0x20000000ULL) continue;
-        const uint64_t span = 0x40000; // ±256KB
-        const uint64_t step = 0x8;     // 8-byte aligned slots
-        for (uint64_t d = 0; d <= span; d += step) {
-            const uint64_t tries[2] = { base + d, (d == 0) ? 0 : base - d };
-            for (int t = 0; t < 2; t++) {
-                uint64_t off = tries[t];
-                if (off == 0 || off > 0x20000000ULL) continue;
-                uint64_t typeInfo = ReadAddr<uint64_t>(Moudule_Base + off);
-                if (!isVaildPtr(typeInfo)) continue;
-                uint64_t statics = ReadGameFacadeStatics(typeInfo);
-                if (!isVaildPtr(statics)) continue;
-
-                s_cachedOff = off;
-                s_cachedStatics = statics;
-                s_cachedPid = curPid;
-                NSLog(@"[GL] GameFacade TypeInfo found at +0x%llx (drift %+#llx from anchor)", off, (int64_t)(off - base));
-                return ReadMatchGameFromGameFacadeStatics(statics);
-            }
-        }
+        if (isVaildPtr(matchGame)) return matchGame;
     }
     return 0;
 }

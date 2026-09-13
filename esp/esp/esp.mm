@@ -3457,8 +3457,8 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     uint64_t playerDict = ReadAddr<uint64_t>(match + kMatchPlayerDict);
     if (!isVaildPtr(playerDict)) {
         // Fallback other known dict slots if primary empty.
-        const uint64_t alts[] = { 0x130, 0x140, 0x150 };
-        for (size_t ai = 0; ai < 3 && !isVaildPtr(playerDict); ai++) {
+        const uint64_t alts[] = { 0x148, 0x130, 0x138, 0x140, 0x150, 0x120 };
+        for (size_t ai = 0; ai < sizeof(alts)/sizeof(alts[0]) && !isVaildPtr(playerDict); ai++) {
             playerDict = ReadAddr<uint64_t>(match + alts[ai]);
         }
     }
@@ -3469,11 +3469,17 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     int dictCount = ReadAddr<int>(playerDict + kDictCount);
     uint64_t entriesArr = ReadAddr<uint64_t>(playerDict + kDictEntries);
     if (!isVaildPtr(entriesArr)) {
+        const uint64_t eOffs[] = { 0x10, 0x20 };
+        for (size_t ei = 0; ei < 2 && !isVaildPtr(entriesArr); ei++) {
+            entriesArr = ReadAddr<uint64_t>(playerDict + eOffs[ei]);
+        }
+    }
+    if (!isVaildPtr(entriesArr)) {
         return stats;
     }
 
     int slotCap = ReadAddr<int>(entriesArr + kIl2CppArrayMaxLength);
-    if (slotCap <= 0 || slotCap > 256) {
+    if (slotCap <= 0 || slotCap > 2048) {
         return stats;
     }
     // dictCount can be 0 briefly; still allow walk if array exists.
@@ -3534,7 +3540,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     const uint64_t entryStride = kDictEntryStrideBytePlayer ? kDictEntryStrideBytePlayer : 0x28;
     const uint64_t entryValueOff = kDictEntryValueOffByte ? kDictEntryValueOffByte : 0x20;
     int loopCount = slotCap;
-    if (loopCount > 128) loopCount = 128;
+    if (loopCount > 512) loopCount = 512;
 
     for (int i = 0; i < loopCount; i++) {
         uint64_t ent = entriesBase + entryStride * (uint64_t)i;
@@ -3543,6 +3549,16 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         if (hc == 0 || hc == -1) continue;
 
         uint64_t PawnObject = ReadAddr<uint64_t>(ent + entryValueOff);
+        if (!isVaildPtr(PawnObject)) {
+            const uint64_t vOffs[] = { 0x10, 0x18, 0x20, 0x28 };
+            for (size_t vo = 0; vo < 4; vo++) {
+                uint64_t cand = ReadAddr<uint64_t>(ent + vOffs[vo]);
+                if (isVaildPtr(cand)) {
+                    PawnObject = cand;
+                    break;
+                }
+            }
+        }
         if (!isVaildPtr(PawnObject)) continue;
         // Skip self: pointer, UserID, or PlayerID (local pointer can mismatch after death/rejoin).
         if (isSamePlayerAsLocal(myPawnObject, PawnObject)) continue;
@@ -3962,6 +3978,12 @@ static std::atomic<bool> g_brutalHasAddrs{false};
             s.canAim = canAimThisPawn;
             s.wantDraw = wantDraw;
         }
+    }
+
+    static int s_countDiagLog = 0;
+    if (++s_countDiagLog % 180 == 1) {
+        NSLog(@"[ESP-COUNT] match=0x%llx dict=0x%llx cap=%d snapN=%d (real=%d, bot=%d)",
+              (unsigned long long)match, (unsigned long long)playerDict, slotCap, snapN, stats.realCount, stats.botCount);
     }
 
     // -------------------------------------------------------------------------
