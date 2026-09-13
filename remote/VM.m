@@ -6,6 +6,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <pthread.h>
 #import "RemoteCall.h"
 #import "VM.h"
 #import "../../kexploit/krw.h"
@@ -21,6 +22,11 @@
 extern kern_return_t mach_vm_allocate(task_t task, mach_vm_address_t *addr, mach_vm_size_t size, int flags);
 extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t addr, mach_vm_size_t size);
 extern kern_return_t mach_vm_map(vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t size, mach_vm_offset_t mask, int flags, mem_entry_name_port_t object, memory_object_offset_t offset, boolean_t copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t inheritance);
+
+// Serialize kwrite_zone_element on vm_map_entry. Concurrent remap from ESP
+// bone reads raced XNU's non-sleepable RW lock → kernel panic
+// "Taking non-sleepable RW lock with preemption enabled".
+static pthread_mutex_t g_vmRemapLock = PTHREAD_MUTEX_INITIALIZER;
 
 uint64_t vm_map_get_header(uint64_t vm_map_ptr)
 {
@@ -182,7 +188,7 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
 }
  
 
-struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
+static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object)
 {
     struct VMShmem shmem = {0};
     if (!object || !is_kaddr_valid(object->address)) {
@@ -191,18 +197,18 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
                object ? (unsigned long long)object->address : 0);
         return shmem;
     }
-    
+
     uint64_t size = kread64(object->address + off_vm_object_vo_un1_vou_size);
     size = mach_vm_round_page(size);
     uint64_t roundedSize = mach_vm_round_page(size);
- 
+
     mach_vm_address_t localAddr = 0;
     kern_return_t ret = mach_vm_allocate(mach_task_self_, &localAddr, roundedSize, VM_FLAGS_ANYWHERE);
     if (ret != KERN_SUCCESS) {
         printf("[DS][%s:%d] mach_vm_allocate failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
         return shmem;
     }
- 
+
     mach_port_t memoryObject = MACH_PORT_NULL;
     memory_object_size_t entrySize = roundedSize;
     ret = mach_make_memory_entry_64(mach_task_self_, &entrySize, (memory_object_offset_t)localAddr, VM_PROT_READ | VM_PROT_WRITE, &memoryObject, MACH_PORT_NULL);
@@ -211,48 +217,47 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
         mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
         return shmem;
     }
- 
+
     uint64_t shmemNamedEntry = task_get_ipc_port_kobject(task_self(), memoryObject);
     uint64_t shmemVMCopyAddr = kread64(shmemNamedEntry + off_vm_named_entry_backing_copy);
     uint64_t nextAddr        = kread64(shmemVMCopyAddr + off_vm_named_entry_size);
- 
+
     struct vm_map_entry entry = {0};
     kreadbuf(nextAddr, &entry, sizeof(struct vm_map_entry));
-    
- 
+
     if (entry.vme_kernel_object || entry.is_sub_map) {
         printf("[DS][%s:%d] REJECT submap/kernel-object: addr=0x%llx submap=%d ko=%d\n",
                __FUNCTION__, __LINE__,
                (unsigned long long)object->vmAddress,
                (int)entry.is_sub_map, (int)entry.vme_kernel_object);
         mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
-        // Previously leaked memoryObject → PORT_SPACE kill under ESP bone spam.
         if (MACH_PORT_VALID(memoryObject)) {
             mach_port_deallocate(mach_task_self_, memoryObject);
         }
         return shmem;
     }
- 
+
     struct VmPackingParams params = {0};
     params.vmpp_base  = VM_MIN_KERNEL_ADDRESS;
     params.vmpp_bits  = VM_PAGE_PACKED_PTR_BITS;
     params.vmpp_shift = VM_PAGE_PACKED_PTR_SHIFT;
     params.vmpp_base_relative = VM_PACKING_IS_BASE_RELATIVE(&params) ? 1 : 0;
     uint64_t packedPointer = vm_pack_pointer(object->address, &params);
- 
+
     uint32_t refCount = kread32(object->address + off_vm_object_ref_count);
     refCount++;
     kwrite32(object->address + off_vm_object_ref_count, refCount);
-    
+
     entry.vme_object_or_delta = (uint32_t)packedPointer;
     entry.vme_offset = object->objectOffset;
- 
+
+    // Exclusive: concurrent kwrite_zone_element raced XNU RW lock → panic.
     kwrite_zone_element(nextAddr, &entry, sizeof(struct vm_map_entry));
- 
+
     mach_vm_address_t mappedAddr = 0;
     vm_prot_t curProt = VM_PROT_ALL | VM_PROT_IS_MASK;
     vm_prot_t maxProt = VM_PROT_ALL | VM_PROT_IS_MASK;
- 
+
     ret = mach_vm_map(mach_task_self_, &mappedAddr, PAGE_SIZE, 0,
                        VM_FLAGS_ANYWHERE, memoryObject,
                        (memory_object_offset_t)object->entryOffset,
@@ -260,7 +265,6 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
     if (ret != KERN_SUCCESS) {
         printf("[DS][%s:%d] mach_vm_map failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
         mappedAddr = 0;
-        // Drop the memory_entry — caller cannot use an unmapped entry.
         if (MACH_PORT_VALID(memoryObject)) {
             mach_port_deallocate(mach_task_self_, memoryObject);
             memoryObject = MACH_PORT_NULL;
@@ -279,6 +283,14 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
     return shmem;
 }
 
+struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
+{
+    pthread_mutex_lock(&g_vmRemapLock);
+    struct VMShmem shmem = vm_create_shmem_with_object_locked(object);
+    pthread_mutex_unlock(&g_vmRemapLock);
+    return shmem;
+}
+
 struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address)
 {
     struct VMShmem shmem = {0};
@@ -288,6 +300,6 @@ struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address)
         printf("[DS][%s:%d] Failed to get VM object for 0x%llx\n", __FUNCTION__, __LINE__, (unsigned long long)address);
         return shmem;
     }
- 
+
     return vm_create_shmem_with_object(&vmObject);
 }

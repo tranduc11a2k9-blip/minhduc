@@ -1,27 +1,23 @@
 //
-//  DirectOverlay.m — Starts full-screen system overlay in current app session
-//  Registers HUDMainWindow with SBSAccessibilityWindowHostingController (Level 10000010.0)
-//  so it stays on top of ALL APPS, HOME SCREEN, and GAME permanently.
+//  DirectOverlay.mm — ESP offscreen host (NOT Direct/SBSAccessibility overlay)
+//
+//  User direction: this build draws ONLY via SpringBoard RemoteCall.
+//  Local window exists solely so ESP_View's GCD timer runs and mirrors
+//  paths through SBRemotePushESPFrame. Window stays hidden/alpha=0.
 //
 #import "DirectOverlay.h"
-#import "HUDMainWindow.h"
-#import "SBSAccessibilityWindowHostingController.h"
-#import "UIWindow+Private.h"
 #import "../esp/esp.h"
 #import "../esp/ESPPrefs.h"
 #import "../esp/GameOffsets.h"
 #import "../esp/menu.h"
-#import "../esp/pid.h"
-#import "UIView+SecureView.h"
 #import "../../app/KeepAlive.h"
 #import <objc/runtime.h>
 
-static HUDMainWindow *g_systemWindow = nil;
-static SBSAccessibilityWindowHostingController *g_hostingController = nil;
+static UIWindow *g_espHostWindow = nil;
 
-@interface DirectPassThroughView : UIView
+@interface ESPHostPassThroughView : UIView
 @end
-@implementation DirectPassThroughView
+@implementation ESPHostPassThroughView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     if (hit == self) return nil;
@@ -29,11 +25,11 @@ static SBSAccessibilityWindowHostingController *g_hostingController = nil;
 }
 @end
 
-@interface DirectLandscapeVC : UIViewController
+@interface ESPHostVC : UIViewController
 @end
-@implementation DirectLandscapeVC
+@implementation ESPHostVC
 - (void)loadView {
-    self.view = [[DirectPassThroughView alloc] initWithFrame:CGRectZero];
+    self.view = [[ESPHostPassThroughView alloc] initWithFrame:CGRectZero];
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -46,20 +42,16 @@ static SBSAccessibilityWindowHostingController *g_hostingController = nil;
 - (BOOL)shouldAutorotate { return YES; }
 @end
 
-int StartDirectOverlay(void) {
+int StartESPHost(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_systemWindow) return;
+        if (g_espHostWindow) return;
 
-        // 1. Start audio background keepalive so overlay never sleeps
         [[KeepAlive shared] start];
-
-        // 2. Load prefs
         ESPPrefsSync();
         ESPSyncFromPrefs();
         GameOffsetsReload();
 
-        // 3. Build UI
-        DirectLandscapeVC *vc = [[DirectLandscapeVC alloc] init];
+        ESPHostVC *vc = [[ESPHostVC alloc] init];
         CGRect screen = [UIScreen mainScreen].bounds;
 
         ESP_View *espView = [[ESP_View alloc] initWithFrame:screen];
@@ -67,56 +59,25 @@ int StartDirectOverlay(void) {
         espView.userInteractionEnabled = NO;
         [vc.view addSubview:espView];
 
+        // Menu stays local for toggles; not an all-apps overlay.
         MenuView *menuView = [[MenuView alloc] initWithFrame:screen];
         menuView.userInteractionEnabled = YES;
         [vc.view addSubview:menuView];
 
-        // 4. System window — high level so it can sit above other UI in-process.
-        g_systemWindow = [[HUDMainWindow alloc] initWithFrame:screen];
-        g_systemWindow.rootViewController = vc;
-        g_systemWindow.backgroundColor = [UIColor clearColor];
-        g_systemWindow.windowLevel = 10000010.0;
-        g_systemWindow.hidden = NO;
-        g_systemWindow.userInteractionEnabled = YES;
-        [g_systemWindow makeKeyAndVisible];
+        g_espHostWindow = [[UIWindow alloc] initWithFrame:screen];
+        g_espHostWindow.rootViewController = vc;
+        g_espHostWindow.backgroundColor = [UIColor clearColor];
+        g_espHostWindow.windowLevel = UIWindowLevelNormal - 1;
+        g_espHostWindow.alpha = 0.0;
+        g_espHostWindow.hidden = NO; // must be in hierarchy for timer/views
+        g_espHostWindow.userInteractionEnabled = YES;
+        [g_espHostWindow makeKeyAndVisible];
 
-        // 5. Register with SBSAccessibilityWindowHostingController when available.
-        // On jailed sideload this often only keeps the window in OUR process
-        // (in-app). Still safer than SpringBoard RemoteCall (WATCHDOG/respring).
-        Class hostingClass = objc_getClass("SBSAccessibilityWindowHostingController");
-        g_hostingController = hostingClass ? [[hostingClass alloc] init] : nil;
-        SEL registerSel = NSSelectorFromString(@"registerWindowWithContextID:atLevel:");
-        SEL contextSel = NSSelectorFromString(@"_contextId");
-        if (g_hostingController &&
-            [g_hostingController respondsToSelector:registerSel] &&
-            [g_systemWindow respondsToSelector:contextSel]) {
-            unsigned int ctxId = 0;
-            NSMethodSignature *sig = [g_systemWindow methodSignatureForSelector:contextSel];
-            if (sig) {
-                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                [inv setTarget:g_systemWindow];
-                [inv setSelector:contextSel];
-                [inv invoke];
-                [inv getReturnValue:&ctxId];
-                if (ctxId != 0) {
-                    double lvl = [g_systemWindow windowLevel];
-                    NSMethodSignature *regSig = [g_hostingController methodSignatureForSelector:registerSel];
-                    if (regSig) {
-                        NSInvocation *regInv = [NSInvocation invocationWithMethodSignature:regSig];
-                        [regInv setTarget:g_hostingController];
-                        [regInv setSelector:registerSel];
-                        [regInv setArgument:&ctxId atIndex:2];
-                        [regInv setArgument:&lvl atIndex:3];
-                        [regInv invoke];
-                        NSLog(@"[Overlay] SBSAccessibility registered ctx=%u level=%f", ctxId, lvl);
-                    }
-                }
-            }
-        } else {
-            NSLog(@"[Overlay] SBSAccessibility unavailable — in-app window only");
-        }
-
-        NSLog(@"[Overlay] Direct Overlay started (no SpringBoard RemoteCall)");
+        NSLog(@"[ESPHost] offscreen ESP_View host started (draw via SpringBoard only)");
     });
     return 0;
+}
+
+int StartDirectOverlay(void) {
+    return StartESPHost();
 }
