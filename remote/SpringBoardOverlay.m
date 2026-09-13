@@ -381,7 +381,17 @@ void SBRemotePushESPFrame(UIView *espView) {
 
             uint64_t rp = persistentPath();
             uint64_t ptsBuf = ptsBuffer();
-            if (!rp || !ptsBuf) return;
+            if (!rp || !ptsBuf || !remote_call_current_success()) {
+                // PAC/exception failure mid-publish — stop hammering SB.
+                if (remote_call_has_local_state() && !remote_call_current_success()) {
+                    NSLog(@"[SBOverlay] RemoteCall failed — abandon session (avoid 0x401)");
+                    abandon_remote_call();
+                    pthread_mutex_lock(&g_sbLock);
+                    g_sbOverlayOn = NO;
+                    pthread_mutex_unlock(&g_sbLock);
+                }
+                return;
+            }
 
             size_t len = frameBytes.length;
             const uint8_t *b = (const uint8_t *)frameBytes.bytes;

