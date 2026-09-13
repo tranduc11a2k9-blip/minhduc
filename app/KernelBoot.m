@@ -1,29 +1,23 @@
 //
-//  KernelBoot.m — Fl0rk-style kernel boot (verified from Fl0rkFF binary)
+//  KernelBoot.m — Fl0rk-style kernel boot
 //
-//  Fl0rkFF architecture (from strings analysis of Fl0rkFF-1.0.ipa):
-//    - exploit runs in the MAIN app (no HUD subprocess, no persona spawn)
-//    - remote call into SpringBoard (g_springboard_rc_ready)
-//    - DSKeepAlive (AVAudioPlayer) keeps the app alive in background
-//    - SB-blanked notify token: if SpringBoard restarts, re-establish
-//    - ESP drawn via CADisplayLink in-app + remote SB UI
-//
-//  Our port follows the same flow. The earlier HUD-subprocess experiment
-//  failed (spawn EPERM — sandboxed app cannot set persona uid 0 without
-//  platformization) and is removed.
+//  Exploit in MAIN app. Direct Overlay = offscreen ESP data source
+//  (CADisplayLink + CAShapeLayers). SpringBoard hosts a CADisplayLink
+//  that paints the mirrored path over every app (including Free Fire).
+//  App only pushes geometry sparsely — SB DisplayLink does setPath locally
+//  so SB main is not starved by remote IPC (WATCHDOG fix).
 //
 
 #import "KernelBoot.h"
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
-#import <sys/time.h>
-#import <sys/sysctl.h>
 #import <unistd.h>
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/kutils.h"
 #import "../sandbox_escape.h"
 #import "../esp/DSMemory.h"
 #import "KeepAlive.h"
+#import "../remote/SpringBoardOverlay.h"
 
 kernel_boot_log_fn kernelBootLog = NULL;
 
@@ -41,14 +35,6 @@ static void L(NSString *fmt, ...) {
     dispatch_async(dispatch_get_main_queue(), ^{ kernelBootLog(s); });
 }
 
-// SpringBoard overlay session
-#import "SpringBoardOverlay.h"
-
-// Park file REMOVED. Kernel primitives (early_kread64 via the corrupted
-// socket) live in THIS process only — a fresh process launch always needs a
-// fresh exploit. The old park file made relaunches skip the exploit and use
-// dead primitives (nothing drew). g_kexploit_ready (process-local) is truth.
-
 void kernelBootStart(void) {
     if (g_booting) return;
     if (g_ready) {
@@ -56,6 +42,10 @@ void kernelBootStart(void) {
         [[KeepAlive shared] start];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             SBoardStartOverlay();
+        });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            extern int StartDirectOverlay(void);
+            StartDirectOverlay();
         });
         return;
     }
@@ -95,26 +85,26 @@ void kernelBootStart(void) {
         L(sret == 0 ? @"OK Sandbox escaped (R+W filesystem)."
                     : @"WARN sandbox_escape returned %d", sret);
 
-        L(@"RUN 4/6 Opening SpringBoard injection channel (staged)");
+        L(@"RUN 4/6 Opening SpringBoard DisplayLink overlay (staged)");
         [[KeepAlive shared] start];
-        __block BOOL sbDone = NO;
-        __block int sbret = -1;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            static const int delays[] = {3, 2, 3, 4}; // cumulative: 3s,5s,8s,12s
+            static const int delays[] = {3, 2, 3, 4}; // 3s,5s,8s,12s
             for (int attempt = 0; attempt < 4; attempt++) {
                 sleep(delays[attempt]);
-                sbret = SBoardStartOverlay();
-                if (sbret == 0) break;
+                int sbret = SBoardStartOverlay();
+                if (sbret == 0) {
+                    NSLog(@"[BOOT] SB DisplayLink overlay OK on attempt %d", attempt + 1);
+                    break;
+                }
                 NSLog(@"[BOOT] SB overlay attempt %d failed rc=%d", attempt + 1, sbret);
             }
-            sbDone = YES;
         });
-        L(@"OK Channel establishing (3s..12s staged).");
+        L(@"OK SB overlay establishing (3s..12s).");
 
-        L(@"RUN 5/6 Preparing SpringBoard session");
-        L(@"OK SpringBoard session pending (background).");
+        L(@"RUN 5/6 Preparing ESP data-source session");
+        L(@"OK SpringBoard DisplayLink will paint; app only feeds geometry.");
 
-        L(@"RUN 6/6 Starting ESP renderer (offscreen data source)");
+        L(@"RUN 6/6 Starting ESP renderer (offscreen host)");
         dispatch_async(dispatch_get_main_queue(), ^{
             extern int StartDirectOverlay(void);
             StartDirectOverlay();
@@ -123,14 +113,14 @@ void kernelBootStart(void) {
                 for (UIWindow *w in [UIApplication sharedApplication].windows) {
                     if ([w isKindOfClass:hudWinCls]) {
                         w.alpha = 0.0;
-                        w.hidden = NO;   // keep timer/layers alive
+                        w.hidden = NO;
                         w.userInteractionEnabled = NO;
                     }
                 }
-                NSLog(@"[BOOT] in-app host window hidden — ESP mirrors to SpringBoard");
+                NSLog(@"[BOOT] host window hidden — geometry mirrors to SB DisplayLink");
             });
         });
-        L(@"OK ESP data source active (mirroring to SpringBoard).");
+        L(@"OK ESP data source active.");
         g_ready = YES;
         g_booting = NO;
     });

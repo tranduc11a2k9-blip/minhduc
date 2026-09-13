@@ -38,6 +38,9 @@ static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
 // performSelectorOnMainThread). No per-frame NSInvocation build/release —
 // that churn raced SB's main thread (SIGBUS 0x401 crashes).
 static uint64_t g_sbSetPathInvocation = 0;
+// SB-local CADisplayLink: fires NSInvocation setPath: inside SpringBoard so
+// the app only mutates the remote CGPath (no performSelector IPC per frame).
+static uint64_t g_sbDisplayLink = 0;
 
 // Per-SB-session mirror state (forward declarations — SBoardStartOverlay
 // resets these at the end of init; definitions live below).
@@ -318,9 +321,33 @@ int SBoardStartOverlay(void) {
         }
     }
 
-    NSLog(@"[SBOverlay] vector overlay ACTIVE (canvas %s, cached invocation %s)",
+    // ---- SB-local DisplayLink paints setPath (~5 FPS) without remote IPC ----
+    // Target = cached NSInvocation (invoke → shape setPath: persistentPath).
+    // Preferred frames-per-second 5: enough for ESP readability, light on SB main.
+    if (r_is_objc_ptr(g_sbSetPathInvocation)) {
+        uint64_t clsDL = r_class("CADisplayLink");
+        uint64_t dl = r_msg2_main(clsDL, "displayLinkWithTarget:selector:",
+                                  g_sbSetPathInvocation, r_sel("invoke"), 0, 0);
+        if (r_is_objc_ptr(dl)) {
+            // iOS 15+: preferredFrameRateRange unavailable via simple msg — use
+            // preferredFramesPerSecond = 5 (int).
+            r_msg2_main(dl, "setPreferredFramesPerSecond:", 5, 0, 0, 0);
+            // NSRunLoopCommonModes == @"kCFRunLoopCommonModes"
+            uint64_t mode = r_nsstr_retained("kCFRunLoopCommonModes");
+            r_msg2_main(dl, "addToRunLoop:forMode:",
+                        r_msg2_main(r_class("NSRunLoop"), "mainRunLoop", 0,0,0,0),
+                        mode, 0, 0);
+            g_sbDisplayLink = dl;
+            NSLog(@"[SBOverlay] SB CADisplayLink ACTIVE @5fps (local setPath)");
+        } else {
+            NSLog(@"[SBOverlay] CADisplayLink create failed — sparse push fallback");
+        }
+    }
+
+    NSLog(@"[SBOverlay] vector overlay ACTIVE (canvas %s, inv %s, dl %s)",
           r_is_objc_ptr(g_sbCanvas) ? "OK" : "NO",
-          r_is_objc_ptr(g_sbSetPathInvocation) ? "OK" : "fallback");
+          r_is_objc_ptr(g_sbSetPathInvocation) ? "OK" : "NO",
+          r_is_objc_ptr(g_sbDisplayLink) ? "OK" : "NO");
     return 0;
 }
 
@@ -336,6 +363,10 @@ static uint64_t persistentPath(void) {
 
 static void sb_reset_mirror_state(void) {
     // per-SB-session caches — stale across sessions (new SB = new addrs)
+    if (r_is_objc_ptr(g_sbDisplayLink)) {
+        r_msg2_main(g_sbDisplayLink, "invalidate", 0, 0, 0, 0);
+    }
+    g_sbDisplayLink = 0;
     g_sbPersistentPath = 0;
     g_sbMirrorPtsBuf = 0;
     g_sbPathHash = 0;
@@ -345,7 +376,10 @@ static void sb_reset_mirror_state(void) {
 
 void SBRemotePushESPFrame(UIView *espView) {
     if (!g_sbOverlayOn || !espView) return;
-    if (++g_sbMirrorCount % 6 != 0) return;
+    // With SB DisplayLink painting locally, app only needs to refresh geometry
+    // ~2–3×/s. Without DisplayLink, fall back to sparse push (~5×/s).
+    const int stride = r_is_objc_ptr(g_sbDisplayLink) ? 20 : 12; // ~3fps / ~5fps @60
+    if (++g_sbMirrorCount % stride != 0) return;
 
     static NSMutableData *ops = nil;
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
@@ -354,7 +388,7 @@ void SBRemotePushESPFrame(UIView *espView) {
 
     static int s_remoteBusy = 0;
     if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
-        return; // Drop frame if previous remote call is still in flight (prevents 0x401 race)
+        return; // Drop if previous remote mutate still in flight
     }
 
     NSData *frameBytes = [ops copy];
@@ -365,7 +399,7 @@ void SBRemotePushESPFrame(UIView *espView) {
 
             uint64_t ptsBuf = g_sbMirrorPtsBuf;
             if (!r_is_objc_ptr(ptsBuf)) {
-                ptsBuf = dlsym("malloc", 65536, 0,0,0,0,0,0,0); // 4096 points
+                ptsBuf = dlsym("malloc", 65536, 0,0,0,0,0,0,0);
                 if (!r_is_objc_ptr(ptsBuf)) return;
                 g_sbMirrorPtsBuf = ptsBuf;
             }
@@ -383,12 +417,12 @@ void SBRemotePushESPFrame(UIView *espView) {
                 uint8_t op = b[i++];
                 if (i + 16 > len) break;
                 double x, y; memcpy(&x, b+i, 8); memcpy(&y, b+i+8, 8); i += 16;
-                if (op == 1) { // moveTo → sub-path break
+                if (op == 1) {
                     if (n > 0 && havePrevEnd) {
                         pts[n++] = lastX; pts[n++] = lastY;
                     }
                     lastX = x; lastY = y; haveLast = YES;
-                } else {       // lineTo from last point
+                } else {
                     if (!haveLast) { lastX = x; lastY = y; haveLast = YES; havePrevEnd = NO; continue; }
                     if (n == 0) {
                         pts[n++] = lastX; pts[n++] = lastY;
@@ -399,20 +433,24 @@ void SBRemotePushESPFrame(UIView *espView) {
                 }
             }
 
+            // Mutate remote path ONLY — SB DisplayLink calls setPath locally.
+            // Fallback (no DisplayLink): one async setPath after mutate.
             if (n >= 2) {
                 remote_write(ptsBuf, pts, n * 8);
                 dlsym("CGPathClear", rp, 0,0,0,0,0,0,0);
                 dlsym("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
             }
 
-            if (r_is_objc_ptr(g_sbSetPathInvocation)) {
-                uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
-                uint64_t invokeSel = r_sel("invoke");
-                if (performSel && invokeSel) {
-                    r_msg(g_sbSetPathInvocation, performSel, invokeSel, 0, 0, 0); // wait=0
+            if (!r_is_objc_ptr(g_sbDisplayLink)) {
+                if (r_is_objc_ptr(g_sbSetPathInvocation)) {
+                    uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+                    uint64_t invokeSel = r_sel("invoke");
+                    if (performSel && invokeSel) {
+                        r_msg(g_sbSetPathInvocation, performSel, invokeSel, 0, 0, 0);
+                    }
+                } else {
+                    r_msg2_main_async(g_sbShape, "setPath:", rp, 0,0,0);
                 }
-            } else {
-                r_msg2_main_async(g_sbShape, "setPath:", rp, 0,0,0);
             }
         } @finally {
             __sync_lock_release(&s_remoteBusy);
