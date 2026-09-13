@@ -226,6 +226,10 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
                (unsigned long long)object->vmAddress,
                (int)entry.is_sub_map, (int)entry.vme_kernel_object);
         mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
+        // Previously leaked memoryObject → PORT_SPACE kill under ESP bone spam.
+        if (MACH_PORT_VALID(memoryObject)) {
+            mach_port_deallocate(mach_task_self_, memoryObject);
+        }
         return shmem;
     }
  
@@ -256,17 +260,22 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
     if (ret != KERN_SUCCESS) {
         printf("[DS][%s:%d] mach_vm_map failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
         mappedAddr = 0;
+        // Drop the memory_entry — caller cannot use an unmapped entry.
+        if (MACH_PORT_VALID(memoryObject)) {
+            mach_port_deallocate(mach_task_self_, memoryObject);
+            memoryObject = MACH_PORT_NULL;
+        }
     }
- 
+
     ret = mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
     if (ret != KERN_SUCCESS)
         printf("[DS][%s:%d] mach_vm_deallocate failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
- 
+
     shmem.port          = (uint64_t)memoryObject;
     shmem.remoteAddress = object->vmAddress;
     shmem.localAddress  = (uint64_t)mappedAddr;
     shmem.used          = (mappedAddr != 0);
- 
+
     return shmem;
 }
 

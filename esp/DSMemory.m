@@ -312,11 +312,33 @@ uint64_t ds_translate_page(uint64_t page_va) {
 static struct {
     uint64_t pageVA;
     uint64_t localAddr;
+    uint64_t port;     // memory_entry from mach_make_memory_entry_64 — MUST deallocate
     uint32_t useCount; // Fl0rk _pageUseCounter — prefer hot slots on eviction
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
 static int g_pageCacheNext = 0;
 static pthread_mutex_t g_pageCacheLock = PTHREAD_MUTEX_INITIALIZER;
 static int g_readTxnDepth = 0;
+
+// Evict one cache slot: free BOTH the mapped page AND the memory_entry port.
+// Forgetting the port was the MINHDUC PORT_SPACE kill (limit ~114k) — every
+// bone/ESP read called vm_map_remote_page → new mach_make_memory_entry_64
+// while eviction only mach_vm_deallocate'd the mapping.
+static void ds_release_page_slot_locked(int i) {
+    if (i < 0 || i >= DS_PAGE_CACHE_SLOTS) return;
+    if (g_pageCache[i].localAddr) {
+        mach_vm_deallocate(mach_task_self_,
+                           (mach_vm_address_t)g_pageCache[i].localAddr,
+                           PAGE_SIZE);
+    }
+    if (g_pageCache[i].port) {
+        mach_port_deallocate(mach_task_self_,
+                             (mach_port_name_t)g_pageCache[i].port);
+    }
+    g_pageCache[i].pageVA = 0;
+    g_pageCache[i].localAddr = 0;
+    g_pageCache[i].port = 0;
+    g_pageCache[i].useCount = 0;
+}
 
 void ds_begin_read_transaction(void) {
     pthread_mutex_lock(&g_pageCacheLock);
@@ -365,12 +387,21 @@ static uint64_t ds_page_local(uint64_t pageVA) {
 
     struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
     if (!page.localAddress) {
+        // Map failed — still drop any leaked entry port from the attempt.
+        if (page.port) {
+            mach_port_deallocate(mach_task_self_, (mach_port_name_t)page.port);
+        }
         return 0;
     }
 
     pthread_mutex_lock(&g_pageCacheLock);
+    // Evict previous occupant (frees its port + mapping).
+    if (g_pageCache[victim].localAddr || g_pageCache[victim].port) {
+        ds_release_page_slot_locked(victim);
+    }
     g_pageCache[victim].pageVA = pageVA;
     g_pageCache[victim].localAddr = page.localAddress;
+    g_pageCache[victim].port = page.port;
     g_pageCache[victim].useCount = 1;
     g_pageCacheNext = (victim + 1) % DS_PAGE_CACHE_SLOTS;
     pthread_mutex_unlock(&g_pageCacheLock);
@@ -430,7 +461,9 @@ bool ds_read_str(uint64_t va, char *out, size_t maxlen) {
 
 void ds_detach(void) {
     pthread_mutex_lock(&g_pageCacheLock);
-    memset(g_pageCache, 0, sizeof(g_pageCache));
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        ds_release_page_slot_locked(i);
+    }
     g_pageCacheNext = 0;
     pthread_mutex_unlock(&g_pageCacheLock);
     g_ff_proc = g_ff_task = g_ff_base = 0;

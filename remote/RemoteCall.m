@@ -937,11 +937,10 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     exc.threadState.__x[5] = x5;
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
-    // Signing thread for EXTRA path must be the synthetic call thread when live.
-    uint64_t signThread = is_kaddr_valid(g_RC_callThreadAddr)
-                            ? g_RC_callThreadAddr
-                            : g_RC_trojanThreadAddr;
-    sign_state(signThread, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
+    // Cyanide/Fl0rk: ALWAYS sign with trojanThreadAddr (PAC gadget context),
+    // even though the exception arrives on the synthetic call thread.
+    // Signing with callThreadAddr produced uncatchable RET→0x401 SIGBUS.
+    sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
     reply_with_state(&exc, &exc.threadState);
 
     if (timeout < 0) {
