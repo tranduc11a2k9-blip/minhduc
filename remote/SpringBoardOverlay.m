@@ -343,93 +343,79 @@ static void sb_reset_mirror_state(void) {
 
 void SBRemotePushESPFrame(UIView *espView) {
     if (!g_sbOverlayOn || !espView) return;
-    // 60fps / 6 = ~10fps mirror. The 20fps rate crashed SpringBoard's
-    // main thread (NSInvocation retain race on the performSelector path —
-    // crash thread 32286: dead in objc retain inside NSInvocation setup).
-    // 10fps keeps ESP readable and the remote channel calm.
     if (++g_sbMirrorCount % 6 != 0) return;
-    uint64_t rp = persistentPath();
-    if (!r_is_objc_ptr(rp)) return;
-
-    // Fl0rk DrawView pattern: ONE persistent remote point buffer (allocated
-    // once per SB session, never freed) + ONE batched CGPathAddLines per
-    // sync. No per-frame malloc/free in SpringBoard — that churn killed SB.
-    uint64_t ptsBuf = g_sbMirrorPtsBuf;
-    if (!r_is_objc_ptr(ptsBuf)) {
-        ptsBuf = dlsym("malloc", 65536, 0,0,0,0,0,0,0); // 4096 points
-        if (!r_is_objc_ptr(ptsBuf)) return;
-        g_sbMirrorPtsBuf = ptsBuf;
-    }
 
     static NSMutableData *ops = nil;
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
 
     if (!mergePaths(espView, ops)) return; // unchanged → 0 remote calls
 
-    // FAST PATH (2 remote calls total):
-    // ESP geometry is all straight segments (boxes, snaplines, bone lines,
-    // hp bars). Flatten everything into ONE polyline where each sub-path
-    // break inserts a ZERO-LENGTH jump (repeat the previous end point) —
-    // the connecting stroke between sub-paths becomes invisible, so a
-    // single CGPathAddLines renders all segments correctly.
-    size_t len = ops.length;
-    const uint8_t *b = (const uint8_t *)ops.bytes;
+    static int s_remoteBusy = 0;
+    if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
+        return; // Drop frame if previous remote call is still in flight (prevents 0x401 race)
+    }
 
-    double pts[4096];
-    int n = 0;
-    double lastX = 0, lastY = 0;
-    BOOL haveLast = NO;
-    BOOL havePrevEnd = NO;
-    size_t i = 0;
-    while (i < len && n < 4090) {
-        uint8_t op = b[i++];
-        if (i + 16 > len) break;
-        double x, y; memcpy(&x, b+i, 8); memcpy(&y, b+i+8, 8); i += 16;
-        if (op == 1) { // moveTo → sub-path break
-            // Zero-length jump: repeat previous end point if a run is open.
-            if (n > 0 && havePrevEnd) {
-                pts[n++] = lastX; pts[n++] = lastY; // close the run at its end
+    NSData *frameBytes = [ops copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @try {
+            uint64_t rp = persistentPath();
+            if (!r_is_objc_ptr(rp)) return;
+
+            uint64_t ptsBuf = g_sbMirrorPtsBuf;
+            if (!r_is_objc_ptr(ptsBuf)) {
+                ptsBuf = dlsym("malloc", 65536, 0,0,0,0,0,0,0); // 4096 points
+                if (!r_is_objc_ptr(ptsBuf)) return;
+                g_sbMirrorPtsBuf = ptsBuf;
             }
-            lastX = x; lastY = y; haveLast = YES;
-        } else {       // lineTo from last point
-            if (!haveLast) { lastX = x; lastY = y; haveLast = YES; havePrevEnd = NO; continue; }
-            if (n == 0) {
-                // open a new run at the sub-path start
-                pts[n++] = lastX; pts[n++] = lastY;
+
+            size_t len = frameBytes.length;
+            const uint8_t *b = (const uint8_t *)frameBytes.bytes;
+
+            double pts[4096];
+            int n = 0;
+            double lastX = 0, lastY = 0;
+            BOOL haveLast = NO;
+            BOOL havePrevEnd = NO;
+            size_t i = 0;
+            while (i < len && n < 4090) {
+                uint8_t op = b[i++];
+                if (i + 16 > len) break;
+                double x, y; memcpy(&x, b+i, 8); memcpy(&y, b+i+8, 8); i += 16;
+                if (op == 1) { // moveTo → sub-path break
+                    if (n > 0 && havePrevEnd) {
+                        pts[n++] = lastX; pts[n++] = lastY;
+                    }
+                    lastX = x; lastY = y; haveLast = YES;
+                } else {       // lineTo from last point
+                    if (!haveLast) { lastX = x; lastY = y; haveLast = YES; havePrevEnd = NO; continue; }
+                    if (n == 0) {
+                        pts[n++] = lastX; pts[n++] = lastY;
+                    }
+                    pts[n++] = x; pts[n++] = y;
+                    lastX = x; lastY = y;
+                    havePrevEnd = YES;
+                }
             }
-            pts[n++] = x; pts[n++] = y;
-            lastX = x; lastY = y;
-            havePrevEnd = YES;
-        }
-    }
 
-    // ONE remote_write into the persistent SB buffer + ONE CGPathAddLines.
-    // NOTE: mutation runs on a REMOTE worker thread while SB's main thread
-    // may be rendering the same path (setPath from the previous sync). The
-    // cached invocation's argument points at THIS path, so the swap is:
-    // mutate back-path → setPath(back-path) async. Ping-pong keeps the
-    // rendered path stable during mutation.
-    if (n >= 2) {
-        remote_write(ptsBuf, pts, n * 8);
-        dlsym("CGPathClear", rp, 0,0,0,0,0,0,0);
-        dlsym("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
-    }
+            if (n >= 2) {
+                remote_write(ptsBuf, pts, n * 8);
+                dlsym("CGPathClear", rp, 0,0,0,0,0,0,0);
+                dlsym("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
+            }
 
-    // ONE setPath per sync — FIRE-AND-FORGET (waitUntilDone:NO).
-    // The previous version used waitUntilDone:YES; combined with the 5ms
-    // settle and the exception round-trip of every remote call, that
-    // starved SpringBoard's main run loop → watchdog "hung 60s" → respring
-    // (the stackshot log). Async posting never blocks SB's main thread.
-    if (r_is_objc_ptr(g_sbSetPathInvocation)) {
-        uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
-        uint64_t invokeSel = r_sel("invoke");
-        if (performSel && invokeSel) {
-            r_msg(g_sbSetPathInvocation, performSel, invokeSel, 0, 0, 0); // wait=0
+            if (r_is_objc_ptr(g_sbSetPathInvocation)) {
+                uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+                uint64_t invokeSel = r_sel("invoke");
+                if (performSel && invokeSel) {
+                    r_msg(g_sbSetPathInvocation, performSel, invokeSel, 0, 0, 0); // wait=0
+                }
+            } else {
+                r_msg2_main_async(g_sbShape, "setPath:", rp, 0,0,0);
+            }
+        } @finally {
+            __sync_lock_release(&s_remoteBusy);
         }
-    } else {
-        // fallback: async direct call (first frame before cache exists)
-        r_msg2_main_async(g_sbShape, "setPath:", rp, 0,0,0);
-    }
+    });
 }
 
 void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }

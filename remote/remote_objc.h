@@ -16,7 +16,7 @@ extern "C" {
 #import "RemoteCall.h"
 #endif
 
-#define R_TIMEOUT 5
+#define R_TIMEOUT 500
 
 uint64_t r_alloc_str(const char *s);
 void     r_free(uint64_t ptr);

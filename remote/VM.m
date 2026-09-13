@@ -89,6 +89,10 @@ uint64_t vm_map_find_entry(uint64_t vm_map_ptr, uint64_t address)
             s_cached_end = end;
             s_cached_map = vm_map_ptr;
             *stop = YES;
+        } else if (start > address) {
+            // XNU vm_map entries are strictly sorted by start address.
+            // If start > address, this address is unmapped. Stop searching immediately!
+            *stop = YES;
         }
     });
     return found_entry;
