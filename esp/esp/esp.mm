@@ -2455,7 +2455,7 @@ void ESPSyncFromPrefs(void) {
     // "Distance" is ESP toggle (bool). Aim range uses dedicated "AimDistance".
     isDis      = ESPPrefsBool(@"Distance", YES);
     isLine     = ESPPrefsBool(@"Line", YES);
-    isEspBot   = ESPPrefsBool(@"EspBot", NO);
+    isEspBot   = ESPPrefsBool(@"EspBot", YES);
     isWeapon   = ESPPrefsBool(@"Weapon", NO);
     isCount    = ESPPrefsBool(@"Count", YES);
     isAlert360 = ESPPrefsBool(@"Alert360", NO);
@@ -3461,7 +3461,8 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     uint64_t playerDict = ReadAddr<uint64_t>(match + kMatchPlayerDict);
     if (!isVaildPtr(playerDict)) {
         // Fallback other known dict slots if primary empty.
-        const uint64_t alts[] = { 0x148, 0x130, 0x138, 0x140, 0x150, 0x120 };
+        // NOTE: 0x148 is Dictionary<byte,Player> — WRONG for ESP (GameOffsets comment).
+        const uint64_t alts[] = { 0x130, 0x138, 0x140, 0x150, 0x120, 0x118 };
         for (size_t ai = 0; ai < sizeof(alts)/sizeof(alts[0]) && !isVaildPtr(playerDict); ai++) {
             playerDict = ReadAddr<uint64_t>(match + alts[ai]);
         }

@@ -1,23 +1,18 @@
 //
-//  SpringBoardOverlay.m — Fl0rk DrawView long session + 20fps publish
+//  SpringBoardOverlay.m — Fl0rk DrawView: EXTRA trojan thread + 15fps
 //
-//  Fl0rk symbols (DrawView.o):
-//    drawview_start_esp_renderer_in_session   ← open session, build host
-//    drawview_publish_frame_options_in_session ← paint while session live
-//    drawview_stop_in_session                 ← hide + destroy
-//    drawview_forget_remote_state
-//    gDrawViewGeometryPathInvocation + invoke_cached_main_raw
-//    gDrawViewNextPlayerOverlayUS
+//  Fl0rk RemoteCallSession initWithProcess: defaults originalThreadOnly=NO
+//  → creatingExtraThread=YES. Path mutate (CGPath*) runs on that EXTRA
+//  thread; only performSelectorOnMainThread:invoke wait:NO touches SB main.
 //
-//  Correct reading of *_in_session:
-//    Session stays OPEN for the whole ESP lifetime (start→stop).
-//    Not open/destroy per frame. Per-frame work is publish only.
+//  Our prior WATCHDOG: originalThreadOnly forced EVERY RemoteCall onto SB
+//  main (CGPathClear/AddLines + setArgument + invoke) @20fps → main stuck.
 //
-//  WATCHDOG lesson: 30fps + heavy IPC killed SB. This build:
-//    - persistent session (Fl0rk)
-//    - cached setPath NSInvocation (Fl0rk)
-//    - persistent remote path + pts buf (Fl0rk)
-//    - 20fps gate (50ms) + hash skip + in-flight drop
+//  This build matches Fl0rk:
+//    - persistent session on EXTRA thread (not originalThreadOnly)
+//    - cached setPath NSInvocation + invoke_cached_main_raw
+//    - persistent remote path + pts buf
+//    - 15fps gate + hash skip + in-flight drop
 //
 
 #import "SpringBoardOverlay.h"
@@ -30,8 +25,8 @@
 #import <mach/mach_time.h>
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
-// 20fps — user pick; safer than 30fps WATCHDOG build.
-#define SB_MIN_PUBLISH_INTERVAL_US 50000ULL
+// 15fps — Fl0rk-smooth with extra-thread IPC; safer than 20/30 on main.
+#define SB_MIN_PUBLISH_INTERVAL_US 66666ULL
 
 static BOOL g_sbOverlayOn = NO;
 static uint64_t g_sbWin = 0;
@@ -215,15 +210,16 @@ static void sb_invoke_cached_main_raw(void) {
 static int sb_open_session(void) {
     if (!g_kexploit_ready) return -1;
     if (remote_call_has_local_state()) {
-        // Already in session (re-entry / retry).
         if (remote_call_current_success()) return 0;
         abandon_remote_call();
     }
     r_settle_us(3000);
-    int rc = init_remote_call_original_thread_only_with_first_exception_timeout(
-        "SpringBoard", false, 15000);
+    // Fl0rk: EXTRA trojan thread (originalThreadOnly=NO). Path IPC stays off SB main.
+    int rc = init_remote_call_with_first_exception_timeout("SpringBoard", false, 15000);
     if (rc != 0) {
-        rc = init_remote_call_with_first_exception_timeout("SpringBoard", false, 15000);
+        NSLog(@"[SBOverlay] extra-thread init failed rc=%d — fallback originalThreadOnly", rc);
+        rc = init_remote_call_original_thread_only_with_first_exception_timeout(
+            "SpringBoard", false, 15000);
     }
     if (rc != 0) return -1;
     uint64_t pid = do_remote_call_stable(5000, "getpid", 0,0,0,0,0,0,0,0);
@@ -241,7 +237,7 @@ int SBoardStartOverlay(void) {
 
     if (!g_kexploit_ready) return -1;
 
-    NSLog(@"[SBOverlay] Fl0rk start_esp_renderer_in_session (keep open, 20fps)...");
+    NSLog(@"[SBOverlay] Fl0rk start_esp_renderer_in_session (extra thread, 15fps)...");
     if (sb_open_session() != 0) {
         NSLog(@"[SBOverlay] session open failed");
         return -1;
@@ -340,7 +336,7 @@ int SBoardStartOverlay(void) {
     (void)sb_ensure_setpath_invocation();
 
     // Session STAYS OPEN — Fl0rk start_in_session until stop_in_session.
-    NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @20fps",
+    NSLog(@"[SBOverlay] Fl0rk session LIVE win=0x%llx geom=0x%llx inv=%s @15fps extraThread",
           win, shape, r_is_objc_ptr(g_sbSetPathInv) ? "OK" : "NO");
     return 0;
 }
@@ -423,7 +419,7 @@ void SBRemotePushESPFrame(UIView *espView) {
                 sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {
-                    NSLog(@"[SBOverlay] 20fps updates=%llu skips=%llu attempts=%llu",
+                    NSLog(@"[SBOverlay] 15fps updates=%llu skips=%llu attempts=%llu",
                           g_sbSummaryUpdates, g_sbSummarySkips, g_sbSummaryAttempts);
                 }
             }

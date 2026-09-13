@@ -44,14 +44,17 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
     if (!isVaildPtr((uintptr_t)Moudule_Base))
         return 0;
 
-    // Primary TypeInfo from offset table + a few nearby candidates if season moved it.
+    // Primary TypeInfo from offset table + nearby + known dumps.
+    // MAX current (offsetmax.h 2026-08): 0xC361EB0 — old 0xC3299C8 kept as fallback.
     uint64_t primary = (uint64_t)kGameFacadeTypeInfo;
     uint64_t candidates[] = {
         primary,
         primary - 0x1000, primary + 0x1000,
         primary - 0x2000, primary + 0x2000,
         0xBFD8978ULL, // known FFTH dump
-        0xC3299C8ULL, // known MAX dump
+        0xC361EB0ULL, // current MAX GameFacade_TypeInfo
+        0xC3299C8ULL, // older MAX dump
+        0xC012848ULL, // FFTH table default
     };
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
         uint64_t off = candidates[i];
@@ -63,6 +66,11 @@ uint64_t getMatchGame(uint64_t Moudule_Base) {
         uint64_t matchGame = ReadMatchGameFromGameFacadeStatics(statics);
         if (isVaildPtr(matchGame)) return matchGame;
     }
+
+    // Il2CppResolveMatchGame needs a FreeFire RemoteCall session. While the
+    // SpringBoard overlay owns the global RemoteCall, calling it would dlsym
+    // into SB (useless) and add IPC load. Skip here; TypeInfo candidates above
+    // cover FF + current MAX.
     return 0;
 }
 
