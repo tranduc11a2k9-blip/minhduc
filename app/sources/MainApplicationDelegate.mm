@@ -7,6 +7,8 @@
 #import "MDTheme.h"
 #import "HUDHelper.h"
 #import "ESPPrefs.h"
+#import "KeepAlive.h"
+#import "SpringBoardOverlay.h"
 #import "../../kexploit/kexploit_opa334.h" // krw_sockets_restore (extern "C")
 
 @implementation MainApplicationDelegate {
@@ -89,6 +91,8 @@
 }
 
 - (void)applicationDidBecomeActive:(UIApplication *)application {
+    // KeepAlive must survive audio interruptions / media-server resets.
+    [[KeepAlive shared] start];
     dispatch_async(dispatch_get_main_queue(), ^{
         ESPPrefsSync();
         MDThemeLoadFromPrefs();
@@ -96,11 +100,19 @@
     });
 }
 
+- (void)applicationDidEnterBackground:(UIApplication *)application {
+    // Re-assert silent audio + bg task so process is not jetsammed.
+    [[KeepAlive shared] start];
+}
+
 - (void)applicationWillTerminate:(UIApplication *)application {
     // Do NOT restore krw sockets — the exploit bumps so_usecount to
     // astronomically high values so sodealloc never fires. Restoring
     // (hacking usecount back) triggers sodealloc on the corrupted
     // socket → kernel panic → device respring. The leak IS the fix.
+    //
+    // Hide SB overlay so a killed app does not leave a ghost DrawView.
+    SBoardStopOverlay();
 }
 
 @end
