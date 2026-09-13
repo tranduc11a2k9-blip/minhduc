@@ -31,6 +31,9 @@
 #import <sys/sysctl.h>
 #import <pthread.h>
 
+// Same declares as remote/VM.m — mach/mach_vm.h is not always public in the SDK.
+extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t addr, mach_vm_size_t size);
+
 // xnu page size on arm64 — guard against system header macros
 #ifndef PAGE_SHIFT
 #define PAGE_SHIFT 14
