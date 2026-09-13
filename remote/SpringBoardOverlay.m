@@ -1,15 +1,14 @@
 //
 //  SpringBoardOverlay.m — Fl0rk/Cyanide-style SpringBoard overlay
 //
-//  Architecture (proven stable across Fl0rkFF and Cyanide StatBar):
-//    1. Dedicated UIWindow with -initWithWindowScene: (scene from keyWindow).
-//       NEVER addSubview directly to keyWindow — that causes layout fighting
-//       when fullscreen games (Free Fire) switch scenes, leading to WATCHDOG 60s.
-//    2. Window level 999999.0 (statbar level — stays above all apps/games).
-//    3. userInteractionEnabled = NO — passes all touches through to the game.
-//    4. Dual ping-pong CGMutablePath (Path A / Path B) to eliminate render race:
-//       background thread writes to alternate path, then async setPath: on main.
-//    5. Non-blocking async queue with atomic in-flight guard (skips dropped frames).
+//  Architecture:
+//    1. Dedicated UIWindow via -initWithWindowScene: (NEVER keyWindow addSubview).
+//    2. Window level 999999.0, userInteractionEnabled = NO.
+//    3. Dual ping-pong CGMutablePath (Path A / Path B).
+//    4. Cached NSInvocation for setPath: (Fl0rk: gDrawViewGeometryPathInvocation).
+//       Creating a fresh NSInvocation each frame = ~10 remote IPC hijacks → WATCHDOG.
+//       Cached invoke = 2 IPC (setArgument + performSelector) → safe at ~8 FPS.
+//    5. Atomic in-flight drop + path hash skip.
 //
 
 #import "SpringBoardOverlay.h"
@@ -21,6 +20,9 @@
 #import <string.h>
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
+// 60fps displayLink / 8 ≈ 7.5 FPS. Cyanide updates ~1Hz; Fl0rk caches.
+// Higher rates flood original-thread RemoteCall → SpringBoard WATCHDOG 60s.
+#define SB_MIRROR_EVERY_N 8
 
 static BOOL g_sbOverlayOn = NO;
 static uint64_t g_sbWin = 0;
@@ -34,6 +36,12 @@ static uint64_t g_sbMirrorPtsBuf = 0;
 static uint32_t g_sbPathHash = 0;
 static int g_sbMirrorCount = 0;
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
+
+// Cached NSInvocation for -[CAShapeLayer setPath:] — Fl0rk pattern.
+static uint64_t g_sbSetPathInv = 0;      // NSInvocation*
+static uint64_t g_sbSetPathArgBuf = 0;   // remote malloc(8) holding path ptr
+static uint64_t g_sbPerformMainSel = 0;  // performSelectorOnMainThread:withObject:waitUntilDone:
+static uint64_t g_sbInvokeSel = 0;       // invoke
 
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
@@ -95,6 +103,64 @@ static void sb_reset_mirror_state(void) {
     g_sbMirrorPtsBuf = 0;
     g_sbPathHash = 0;
     g_sbMirrorCount = 0;
+    g_sbSetPathInv = 0;
+    g_sbSetPathArgBuf = 0;
+    g_sbPerformMainSel = 0;
+    g_sbInvokeSel = 0;
+}
+
+// Build once: NSInvocation for [shape setPath:] retained forever.
+// Fl0rk: _gDrawViewGeometryPathInvocation + _drawview_invoke_cached_main_raw
+static BOOL sb_ensure_setpath_invocation(void) {
+    if (r_is_objc_ptr(g_sbSetPathInv) && r_is_objc_ptr(g_sbSetPathArgBuf)) return YES;
+    if (!r_is_objc_ptr(g_sbShape)) return NO;
+
+    uint64_t setPathSel = r_sel("setPath:");
+    if (!setPathSel) return NO;
+
+    uint64_t sigSel = r_sel("methodSignatureForSelector:");
+    uint64_t sig = r_msg(g_sbShape, sigSel, setPathSel, 0, 0, 0);
+    if (!r_is_objc_ptr(sig)) return NO;
+
+    uint64_t NSInvocation = r_class("NSInvocation");
+    if (!r_is_objc_ptr(NSInvocation)) return NO;
+
+    // retained return — keep alive across frames
+    uint64_t inv = r_msg(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+    if (!r_is_objc_ptr(inv)) return NO;
+    r_msg2(inv, "retain", 0, 0, 0, 0);
+
+    r_msg2(inv, "setTarget:", g_sbShape, 0, 0, 0);
+    r_msg2(inv, "setSelector:", setPathSel, 0, 0, 0);
+    r_msg2(inv, "retainArguments", 0, 0, 0, 0);
+
+    uint64_t argBuf = dlsym_remote("malloc", 8, 0,0,0,0,0,0,0);
+    if (!argBuf) {
+        r_msg2(inv, "release", 0, 0, 0, 0);
+        return NO;
+    }
+
+    g_sbSetPathInv = inv;
+    g_sbSetPathArgBuf = argBuf;
+    g_sbPerformMainSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+    g_sbInvokeSel = r_sel("invoke");
+    NSLog(@"[SBOverlay] Cached setPath: NSInvocation=0x%llx (Fl0rk-style)", inv);
+    return YES;
+}
+
+// Swap path with 2 IPC only: write arg + async perform invoke.
+static void sb_cached_setpath_async(uint64_t path) {
+    if (!sb_ensure_setpath_invocation()) {
+        // Fallback once — still better than nothing
+        r_msg2_main_async(g_sbShape, "setPath:", path, 0,0,0);
+        return;
+    }
+    remote_write64(g_sbSetPathArgBuf, path);
+    r_msg2(g_sbSetPathInv, "setArgument:atIndex:", g_sbSetPathArgBuf, 2, 0, 0);
+    // waitUntilDone:NO — fire and forget on SpringBoard main
+    if (g_sbPerformMainSel && g_sbInvokeSel) {
+        r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
+    }
 }
 
 // ======================== public ========================
@@ -156,7 +222,6 @@ int SBoardStartOverlay(void) {
     uint64_t whiteCGColor = r_is_objc_ptr(whiteColor) ? r_msg2_main(whiteColor, "CGColor", 0,0,0,0) : 0;
 
     // ---- Cyanide / Fl0rk DEDICATED UIWindow pattern ----
-    // Create dedicated UIWindow with windowScene. Never touch keyWindow.addSubview:
     uint64_t winAlloc = r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0);
     if (!r_is_objc_ptr(winAlloc)) { destroy_remote_call(); return -1; }
 
@@ -218,8 +283,10 @@ int SBoardStartOverlay(void) {
     sb_reset_mirror_state();
     g_sbPathA = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
     g_sbPathB = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
+    // Warm the cached setPath invocation now (setup time, not per-frame)
+    sb_ensure_setpath_invocation();
 
-    NSLog(@"[SBOverlay] Dedicated pass-through window ACTIVE (win=0x%llx, shape=0x%llx, ping-pong OK)",
+    NSLog(@"[SBOverlay] Dedicated pass-through window ACTIVE (win=0x%llx, shape=0x%llx, cached-inv OK)",
           win, shape);
     return 0;
 }
@@ -227,8 +294,8 @@ int SBoardStartOverlay(void) {
 void SBRemotePushESPFrame(UIView *espView) {
     if (!g_sbOverlayOn || !espView) return;
 
-    // 60fps / 3 = ~20 FPS. Smooth, zero jitter, safe for SpringBoard main thread.
-    if (++g_sbMirrorCount % 3 != 0) return;
+    // ~7.5 FPS. Enough for ESP readability; safe for SpringBoard main thread.
+    if (++g_sbMirrorCount % SB_MIRROR_EVERY_N != 0) return;
 
     static NSMutableData *ops = nil;
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
@@ -237,7 +304,7 @@ void SBRemotePushESPFrame(UIView *espView) {
 
     static int s_remoteBusy = 0;
     if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
-        return; // Drop frame if previous IPC still in flight (non-blocking skip)
+        return; // Drop frame if previous IPC still in flight
     }
 
     NSData *frameBytes = [ops copy];
@@ -248,12 +315,12 @@ void SBRemotePushESPFrame(UIView *espView) {
                 g_sbPathB = dlsym_remote("CGPathCreateMutable", 0,0,0,0,0,0,0,0);
             }
             uint64_t activePath = (g_sbPathIndex++ & 1) ? g_sbPathB : g_sbPathA;
-            if (!r_is_objc_ptr(activePath)) return;
+            if (!activePath) return;
 
             uint64_t ptsBuf = g_sbMirrorPtsBuf;
-            if (!r_is_objc_ptr(ptsBuf)) {
+            if (!ptsBuf) {
                 ptsBuf = dlsym_remote("malloc", 65536, 0,0,0,0,0,0,0);
-                if (!r_is_objc_ptr(ptsBuf)) return;
+                if (!ptsBuf) return;
                 g_sbMirrorPtsBuf = ptsBuf;
             }
 
@@ -286,15 +353,14 @@ void SBRemotePushESPFrame(UIView *espView) {
                 }
             }
 
-            // Fill active ping-pong path in background worker
             if (n >= 2) {
                 remote_write(ptsBuf, pts, n * 8);
+                // Path rebuild on remote (2 IPC) — NOT on SpringBoard main thread.
                 dlsym_remote("CGPathClear", activePath, 0,0,0,0,0,0,0);
                 dlsym_remote("CGPathAddLines", activePath, 0, ptsBuf, n / 2, 0,0,0,0);
+                // Cached setPath: = 2 IPC (setArgument + async perform). Was ~10 before.
+                sb_cached_setpath_async(activePath);
             }
-
-            // Instant async swap on SpringBoard main thread (<0.01ms, non-blocking)
-            r_msg2_main_async(g_sbShape, "setPath:", activePath, 0,0,0);
         } @finally {
             __sync_lock_release(&s_remoteBusy);
         }
@@ -309,11 +375,15 @@ void SBoardStopOverlay(void) {
     if (r_is_objc_ptr(g_sbWin)) r_msg2_main(g_sbWin, "setHidden:", 1, 0,0,0);
     if (r_is_objc_ptr(g_sbPathA)) dlsym_remote("CGPathRelease", g_sbPathA, 0,0,0,0,0,0,0);
     if (r_is_objc_ptr(g_sbPathB)) dlsym_remote("CGPathRelease", g_sbPathB, 0,0,0,0,0,0,0);
+    if (r_is_objc_ptr(g_sbSetPathInv)) r_msg2(g_sbSetPathInv, "release", 0,0,0,0);
+    if (g_sbSetPathArgBuf) dlsym_remote("free", g_sbSetPathArgBuf, 0,0,0,0,0,0,0);
     g_sbOverlayOn = NO;
     g_sbWin = 0;
     g_sbShape = 0;
     g_sbCanvas = 0;
     g_sbPathHash = 0;
+    g_sbSetPathInv = 0;
+    g_sbSetPathArgBuf = 0;
     pthread_mutex_unlock(&g_sbLock);
     destroy_remote_call();
 }
