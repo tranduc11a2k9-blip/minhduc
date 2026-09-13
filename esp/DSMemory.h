@@ -56,6 +56,12 @@ mach_port_t ds_task_port(void);
 uint64_t ds_translate_page(uint64_t page_va);
 bool     ds_write(uint64_t va, const void *buf, size_t len);
 
+// Fl0rk DarkSwordMemoryProvider: nestable read transaction.
+// begin bumps depth; end at depth 0 can optionally compact cold page slots.
+// Keeps remapped pages hot across one ESP frame (many getPositionExt reads).
+void ds_begin_read_transaction(void);
+void ds_end_read_transaction(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -3130,8 +3130,12 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         CGPoint screenCenter = CGPointMake(halfWidth, halfHeight);
 
         ESPGeometryBuffers buffers = ESPGeometryBuffersCreate();
-        g_PlayerDrawIndex = 1; 
+        g_PlayerDrawIndex = 1;
+        // Fl0rk DarkSwordMemoryProvider beginReadTransaction / endReadTransaction:
+        // keep remapped pages hot across the whole frame (bones/HP/dict).
+        ds_begin_read_transaction();
         ESPFrameStats stats = [self renderESPWithBuffers:&buffers viewWidth:viewWidth viewHeight:viewHeight matrixVpWidth:matrixVpW matrixVpHeight:matrixVpH screenCenter:screenCenter];
+        ds_end_read_transaction();
 
         bool showVisuals = (isESP || isESP2);
         

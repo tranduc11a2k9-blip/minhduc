@@ -312,9 +312,29 @@ uint64_t ds_translate_page(uint64_t page_va) {
 static struct {
     uint64_t pageVA;
     uint64_t localAddr;
+    uint32_t useCount; // Fl0rk _pageUseCounter — prefer hot slots on eviction
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
 static int g_pageCacheNext = 0;
 static pthread_mutex_t g_pageCacheLock = PTHREAD_MUTEX_INITIALIZER;
+static int g_readTxnDepth = 0;
+
+void ds_begin_read_transaction(void) {
+    pthread_mutex_lock(&g_pageCacheLock);
+    g_readTxnDepth++;
+    pthread_mutex_unlock(&g_pageCacheLock);
+}
+
+void ds_end_read_transaction(void) {
+    pthread_mutex_lock(&g_pageCacheLock);
+    if (g_readTxnDepth > 0) g_readTxnDepth--;
+    // Outside transaction: lightly age cold slots so next frame prefers hot pages.
+    if (g_readTxnDepth == 0) {
+        for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+            if (g_pageCache[i].useCount > 0) g_pageCache[i].useCount >>= 1;
+        }
+    }
+    pthread_mutex_unlock(&g_pageCacheLock);
+}
 
 // FIX SIGSEGV far=0x1: force-fault cũ truyền FF USER pageVA thẳng vào
 // early_kread64 — primitive từ chối (is_kaddr_valid đòi kernel pointer
@@ -324,9 +344,21 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     pthread_mutex_lock(&g_pageCacheLock);
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
         if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
+            if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
             uint64_t a = g_pageCache[i].localAddr;
             pthread_mutex_unlock(&g_pageCacheLock);
             return a;
+        }
+    }
+    // Evict coldest slot among a small window (Fl0rk _recentPageSlots style).
+    int victim = g_pageCacheNext;
+    uint32_t bestUse = UINT32_MAX;
+    for (int k = 0; k < 8; k++) {
+        int i = (g_pageCacheNext + k) % DS_PAGE_CACHE_SLOTS;
+        if (g_pageCache[i].localAddr == 0) { victim = i; break; }
+        if (g_pageCache[i].useCount < bestUse) {
+            bestUse = g_pageCache[i].useCount;
+            victim = i;
         }
     }
     pthread_mutex_unlock(&g_pageCacheLock);
@@ -337,9 +369,10 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     }
 
     pthread_mutex_lock(&g_pageCacheLock);
-    g_pageCache[g_pageCacheNext].pageVA = pageVA;
-    g_pageCache[g_pageCacheNext].localAddr = page.localAddress;
-    g_pageCacheNext = (g_pageCacheNext + 1) % DS_PAGE_CACHE_SLOTS;
+    g_pageCache[victim].pageVA = pageVA;
+    g_pageCache[victim].localAddr = page.localAddress;
+    g_pageCache[victim].useCount = 1;
+    g_pageCacheNext = (victim + 1) % DS_PAGE_CACHE_SLOTS;
     pthread_mutex_unlock(&g_pageCacheLock);
     return page.localAddress;
 }

@@ -155,15 +155,17 @@ int SBoardStartOverlay(void) {
 
     g_sbSettleWas = r_settle_us(5000); // 5ms per call — 10x faster than default 50ms, safe
 
-    NSLog(@"[SBOverlay] init remote call into SpringBoard (15s timeout)...");
-    // 15s: the MIG exception handshake with a busy SpringBoard can take >5s.
-    // 5s was too aggressive → overlay init failed → always fell back to
-    // DirectOverlay ("ESP only in-app"). Parallel startup keeps UI unblocked.
-    // cyanide statbar uses init_remote_call("SpringBoard", false) — NO MIG
-    // filter bypass. MIG bypass (true) injects extra threads + hijacks SB's
-    // exception ports = deep intrusion = SpringBoard death → respring.
-    // Plain init keeps the channel shallow and stable.
-    int rc = init_remote_call("SpringBoard", false);
+    NSLog(@"[SBOverlay] init remote call into SpringBoard (Fl0rk originalThreadOnly)...");
+    // Fl0rk DarkSword path: originalThreadOnly + long first-exception timeout.
+    // Skips synthetic pthread trojan creator — that path set FAKE_LR=0x401 and
+    // was the SIGBUS 0x401 SpringBoard crash (consecutiveCrashCount).
+    // MIG bypass OFF: keep channel shallow (cyanide-safe).
+    int rc = init_remote_call_original_thread_only_with_first_exception_timeout(
+        "SpringBoard", false, 15000);
+    if (rc != 0) {
+        NSLog(@"[SBOverlay] originalThreadOnly failed rc=%d — fallback plain init", rc);
+        rc = init_remote_call_with_first_exception_timeout("SpringBoard", false, 15000);
+    }
     if (rc != 0) return -1;
     uint64_t pid = do_remote_call_stable(5000, "getpid", 0,0,0,0,0,0,0,0);
     if (pid == 0) { destroy_remote_call(); return -1; }
