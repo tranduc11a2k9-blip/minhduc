@@ -71,7 +71,7 @@ int StartDirectOverlay(void) {
         menuView.userInteractionEnabled = YES;
         [vc.view addSubview:menuView];
 
-        // 4. Create System Window (Level 10000010.0 -> above everything on iOS!)
+        // 4. Create Host Window for offscreen ESP_View CADisplayLink loop
         g_systemWindow = [[HUDMainWindow alloc] initWithFrame:screen];
         g_systemWindow.rootViewController = vc;
         g_systemWindow.backgroundColor = [UIColor clearColor];
@@ -80,38 +80,7 @@ int StartDirectOverlay(void) {
         g_systemWindow.userInteractionEnabled = YES;
         [g_systemWindow makeKeyAndVisible];
 
-        // 5. Register with SpringBoard Accessibility Window Hosting Controller
-        Class hostingClass = objc_getClass("SBSAccessibilityWindowHostingController");
-        g_hostingController = hostingClass ? [[hostingClass alloc] init] : nil;
-        SEL registerSel = NSSelectorFromString(@"registerWindowWithContextID:atLevel:");
-        SEL contextSel = NSSelectorFromString(@"_contextId");
-
-        if (g_hostingController && [g_hostingController respondsToSelector:registerSel] && [g_systemWindow respondsToSelector:contextSel]) {
-            unsigned int ctxId = 0;
-            NSMethodSignature *sig = [g_systemWindow methodSignatureForSelector:contextSel];
-            if (sig) {
-                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                [inv setTarget:g_systemWindow];
-                [inv setSelector:contextSel];
-                [inv invoke];
-                [inv getReturnValue:&ctxId];
-                if (ctxId != 0) {
-                    double lvl = [g_systemWindow windowLevel];
-                    NSMethodSignature *regSig = [g_hostingController methodSignatureForSelector:registerSel];
-                    if (regSig) {
-                        NSInvocation *regInv = [NSInvocation invocationWithMethodSignature:regSig];
-                        [regInv setTarget:g_hostingController];
-                        [regInv setSelector:registerSel];
-                        [regInv setArgument:&ctxId atIndex:2];
-                        [regInv setArgument:&lvl atIndex:3];
-                        [regInv invoke];
-                        NSLog(@"[Overlay] Registered context %u with SpringBoard Level %f", ctxId, lvl);
-                    }
-                }
-            }
-        }
-
-        NSLog(@"[Overlay] Direct System Overlay started on full screen!");
+        NSLog(@"[Overlay] Host window started for SpringBoard ESP mirror");
     });
     return 0;
 }

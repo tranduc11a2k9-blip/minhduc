@@ -807,14 +807,6 @@ static inline void SilentFillPrimaryOnly(uint64_t *out, int *outCount) {
 // those shifted the hit point ~1 head-width off and missed near+far.
 static inline Vector3 ResolveSilentHeadWorldPos(uint64_t pawn) {
     if (!isVaildPtr(pawn)) return Vector3{0, 0, 0};
-    // Terminal death guard for silent: CurHP<=0 must not produce a bone (corpse/transition ghost).
-    {
-        const int hp = get_CurHP(pawn);
-        const int mx = get_MaxHP(pawn);
-        if (mx <= 0 || mx > 2000) return Vector3{0,0,0};
-        if (hp == 0 && mx == 0) return Vector3{0,0,0};
-        if (hp <= 0) return Vector3{0,0,0};
-    }
     Vector3 head = getPositionExt(getHead(pawn));
     if (looksLikeWorldPos(head) && !IsZeroVec(head)) {
         Vector3 hip = getPositionExt(getHip(pawn));
@@ -1375,14 +1367,7 @@ static Vector3 AimTrackAndLead(uint64_t pawn, Vector3 bodyPos, float distanceMet
 // Head mode: pure skinned head first (best headshot), not ESP root-hybrid.
 Vector3 GetAimTargetPosMode(uint64_t pawn, int posMode, float distance) {
     (void)distance;
-    // Terminal death guard: CurHP<=0 is dead (even if isKnocked lags). Never aim/ESP ghosts.
-    {
-        const int hp = get_CurHP(pawn);
-        const int mx = get_MaxHP(pawn);
-        if (mx <= 0 || mx > 2000) return Vector3{0,0,0};
-        if (hp == 0 && mx == 0) return Vector3{0,0,0};
-        if (hp <= 0) return Vector3{0,0,0};
-    }
+    if (!isVaildPtr(pawn)) return Vector3{0,0,0};
     // Live head bone first — critical for head lock on remotes.
     Vector3 liveHead = getPositionExt(getHead(pawn));
     Vector3 hip = getPositionExt(getHip(pawn));
@@ -3240,9 +3225,9 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
         [CATransaction commit];
 
-        // Direct System Overlay via SBSAccessibility renders natively without SpringBoard injection.
-        // extern void SBRemotePushESPFrame(UIView *espView);
-        // SBRemotePushESPFrame(self);
+        // Mirror this frame to the SpringBoard-hosted overlay (if active).
+        extern void SBRemotePushESPFrame(UIView *espView);
+        SBRemotePushESPFrame(self);
     }
 }
 
@@ -3642,15 +3627,27 @@ static std::atomic<bool> g_brutalHasAddrs{false};
             ClearProBoxScreenForPawn(PawnObject);
         };
 
-        // Alive/knocked always have MaxHP > 0. (0,0) is unreadable OR despawned — do NOT
-        // fake 100/100 (that was the main "ghost with no enemies" path).
+        Vector3 liveHead = getPositionExt(getHead(PawnObject));
+        Vector3 liveHip  = getPositionExt(getHip(PawnObject));
+        const bool hasLiveBone = looksLikeWorldPos(liveHead) || looksLikeWorldPos(liveHip);
+
+        // Fallback HP if DataPool reads fail/delay but 3D bones exist
+        if (hasLiveBone) {
+            if (CurHP <= 0 && MaxHP <= 0) {
+                CurHP = 200;
+                MaxHP = 200;
+            } else if (MaxHP <= 0) {
+                MaxHP = 200;
+                if (CurHP <= 0) CurHP = 200;
+            }
+        }
+
+        // Alive/knocked always have MaxHP > 0.
         const bool hpUnreadable = (CurHP == 0 && MaxHP == 0);
         const bool hpGarbage = (MaxHP < 0 || MaxHP > 2000 || CurHP > 2000 ||
                                 (MaxHP > 0 && CurHP > MaxHP + 50));
-        // Treat any CurHP <= 0 as terminal for this pawn (even if isKnocked lags).
-        // Knocked-alive always report CurHP > 0. 0 HP + "knocked" flag is a corpse/transition ghost.
-        const bool fullyDead = (!hpUnreadable && CurHP <= 0);
-        if (hpGarbage || hpUnreadable || fullyDead || MaxHP <= 0) {
+        const bool fullyDead = (!hasLiveBone && !hpUnreadable && CurHP <= 0);
+        if (!hasLiveBone && (hpGarbage || hpUnreadable || fullyDead || MaxHP <= 0)) {
             markGhostDead((fullyDead || hpUnreadable || MaxHP <= 0) ? 120 : 45); // longer hold for death
             continue;
         }
@@ -3658,7 +3655,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         {
             uint64_t uid = ReadAddr<uint64_t>(PawnObject + kUserID);
             COW_GamePlay_PlayerID_o pid = ReadAddr<COW_GamePlay_PlayerID_o>(PawnObject + kPlayerID);
-            if (uid == 0 && pid.m_Value == 0 && pid.m_ID == 0 && !isBot) {
+            if (uid == 0 && pid.m_Value == 0 && pid.m_ID == 0 && !isBot && !hasLiveBone) {
                 markGhostDead(90);
                 continue;
             }
@@ -3668,12 +3665,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 
         // ---------------------------------------------------------------------
         // ESP MUST use the SAME head aim uses when possible.
-        // Ghost fix: NEVER invent body from sticky track alone when live bones/root
-        // are gone — that was "no one left but still ESP + aim".
-        // Vehicle: only real mount/vehicle ptr counts (not collapsed bones alone).
         // ---------------------------------------------------------------------
-        Vector3 liveHead = getPositionExt(getHead(PawnObject));
-        Vector3 liveHip  = getPositionExt(getHip(PawnObject));
         Vector3 liveRoot = ReadPlayerRootTransform(PawnObject);
 
         Vector3 mountPos{};
@@ -4511,17 +4503,18 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         if (!lockedFound) {
             // Live re-eval of locked pawn (still in match dict).
             // Ghost: require MaxHP>0 + live bone — never sticky-track invent.
-            const int lhp = get_CurHP(gAimLockTarget);
-            const int lmax = get_MaxHP(gAimLockTarget);
+            int lhp = get_CurHP(gAimLockTarget);
+            int lmax = get_MaxHP(gAimLockTarget);
             const bool lknock = get_IsKnockedDown(gAimLockTarget);
-            // CurHP <= 0 is terminal even if isKnocked flag lags. Do not keep aim/ESP on corpses.
-            const bool lhpBad = (lmax <= 0 || lmax > 2000 || (lhp == 0 && lmax == 0) || (lhp <= 0));
+            Vector3 liveHeadTarget = getPositionExt(getHead(gAimLockTarget));
+            const bool hasLiveHead = looksLikeWorldPos(liveHeadTarget);
+            if (hasLiveHead && lhp <= 0 && lmax <= 0) { lhp = 200; lmax = 200; }
+            const bool lhpBad = !hasLiveHead && (lmax <= 0 || lmax > 2000 || (lhp == 0 && lmax == 0) || (lhp <= 0));
             if (!lhpBad && (lhp > 0) && !(isAimIgnoreKnock && lknock) &&
                 !(isAimIgnoreBot && get_IsBot(gAimLockTarget))) {
                 Vector3 lb = GetAimTargetPosMode(gAimLockTarget, aimPosition, aimDistance);
                 if (IsZeroVec(lb) || !looksLikeWorldPos(lb)) {
-                    Vector3 liveHead = getPositionExt(getHead(gAimLockTarget));
-                    if (looksLikeWorldPos(liveHead)) lb = liveHead;
+                    if (hasLiveHead) lb = liveHeadTarget;
                 }
                 if (!IsZeroVec(lb) && looksLikeWorldPos(lb)) {
                     float ld = iAmAlive ? Vector3::Distance(myLocation, lb) : 10.f;
@@ -4679,13 +4672,22 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     // Wall-off: FOV geometry + adaptive LOS (Camera when flags work).
     auto AimTargetStillValid = [&](uint64_t pawn) -> bool {
         if (!isVaildPtr(pawn)) return false;
-        const int hp = get_CurHP(pawn);
-        const int maxHp = get_MaxHP(pawn);
+        int hp = get_CurHP(pawn);
+        int maxHp = get_MaxHP(pawn);
         const bool knocked = get_IsKnockedDown(pawn);
+        Vector3 liveHeadCheck = getPositionExt(getHead(pawn));
+        const bool hasLiveHead = looksLikeWorldPos(liveHeadCheck);
+
+        if (hasLiveHead && hp <= 0 && maxHp <= 0) {
+            hp = 200; maxHp = 200;
+        } else if (hasLiveHead && maxHp <= 0) {
+            maxHp = 200; if (hp <= 0) hp = 200;
+        }
+
         // Dead / unreadable / garbage HP shell → drop lock (no ghost aim).
-        if (maxHp <= 0 || maxHp > 2000) return false;
-        if (hp == 0 && maxHp == 0) return false;
-        if (hp <= 0) return false; // CurHP<=0 is terminal; do not trust lagging isKnocked for aim/ESP ghosts.
+        if (!hasLiveHead && (maxHp <= 0 || maxHp > 2000)) return false;
+        if (!hasLiveHead && (hp == 0 && maxHp == 0)) return false;
+        if (!hasLiveHead && (hp <= 0)) return false;
         if (hp > 2000 || (maxHp > 0 && hp > maxHp + 50)) return false;
         if (isAimIgnoreKnock && knocked) return false;
         if (isAimIgnoreBot && get_IsBot(pawn)) return false;

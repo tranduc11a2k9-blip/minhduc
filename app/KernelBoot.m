@@ -54,9 +54,8 @@ void kernelBootStart(void) {
     if (g_ready) {
         L(@"OK Already booted — re-establishing overlay.");
         [[KeepAlive shared] start];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            extern int StartDirectOverlay(void);
-            StartDirectOverlay();
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            SBoardStartOverlay();
         });
         return;
     }
@@ -96,20 +95,42 @@ void kernelBootStart(void) {
         L(sret == 0 ? @"OK Sandbox escaped (R+W filesystem)."
                     : @"WARN sandbox_escape returned %d", sret);
 
-        L(@"RUN 4/6 Initializing Background KeepAlive");
+        L(@"RUN 4/6 Opening SpringBoard injection channel (staged)");
         [[KeepAlive shared] start];
-        L(@"OK KeepAlive started.");
+        __block BOOL sbDone = NO;
+        __block int sbret = -1;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            static const int delays[] = {3, 2, 3, 4}; // cumulative: 3s,5s,8s,12s
+            for (int attempt = 0; attempt < 4; attempt++) {
+                sleep(delays[attempt]);
+                sbret = SBoardStartOverlay();
+                if (sbret == 0) break;
+                NSLog(@"[BOOT] SB overlay attempt %d failed rc=%d", attempt + 1, sbret);
+            }
+            sbDone = YES;
+        });
+        L(@"OK Channel establishing (3s..12s staged).");
 
-        L(@"RUN 5/6 Preparing Direct Overlay session");
-        L(@"OK Direct overlay session ready.");
+        L(@"RUN 5/6 Preparing SpringBoard session");
+        L(@"OK SpringBoard session pending (background).");
 
-        L(@"RUN 6/6 Starting Direct System Overlay");
+        L(@"RUN 6/6 Starting ESP renderer (offscreen data source)");
         dispatch_async(dispatch_get_main_queue(), ^{
             extern int StartDirectOverlay(void);
             StartDirectOverlay();
-            NSLog(@"[BOOT] Direct System Overlay started via SBSAccessibility");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                Class hudWinCls = objc_getClass("HUDMainWindow");
+                for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                    if ([w isKindOfClass:hudWinCls]) {
+                        w.alpha = 0.0;
+                        w.hidden = NO;   // keep timer/layers alive
+                        w.userInteractionEnabled = NO;
+                    }
+                }
+                NSLog(@"[BOOT] in-app host window hidden — ESP mirrors to SpringBoard");
+            });
         });
-        L(@"OK Direct System Overlay active.");
+        L(@"OK ESP data source active (mirroring to SpringBoard).");
         g_ready = YES;
         g_booting = NO;
     });

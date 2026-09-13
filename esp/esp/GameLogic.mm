@@ -307,8 +307,6 @@ uint64_t getRightHand(uint64_t player) {
 bool isLocalTeamMate(uint64_t localPlayer, uint64_t Player) {
     if (!isVaildPtr(localPlayer) || !isVaildPtr(Player)) return false;
     if (localPlayer == Player) return true;
-    // Training bots often share TeamID with local — do not treat bots as teammates
-    // when AimOnBot is enabled (isAimIgnoreBot == false). Otherwise aim/silent never lock bots.
     extern bool isAimIgnoreBot;
     const bool isBot = ReadAddr<uint8_t>(Player + (uint64_t)kIsClientBot) != 0;
     if (isBot && !isAimIgnoreBot) return false;
@@ -316,8 +314,7 @@ bool isLocalTeamMate(uint64_t localPlayer, uint64_t Player) {
     COW_GamePlay_PlayerID_o PlayerID = ReadAddr<COW_GamePlay_PlayerID_o>(Player + kPlayerID);
     int myTeamID = myPlayerID.m_TeamID;
     int TeamID = PlayerID.m_TeamID;
-    // Team 0 is often unset — don't treat as "everyone is teammate".
-    if (myTeamID == 0 && TeamID == 0) return false;
+    if (myTeamID == 0 || TeamID == 0) return false;
     return myTeamID == TeamID;
 }
 
@@ -331,7 +328,6 @@ bool isSamePlayerAsLocal(uint64_t localPlayer, uint64_t player) {
         COW_GamePlay_PlayerID_o myId = ReadAddr<COW_GamePlay_PlayerID_o>(localPlayer + kPlayerID);
         COW_GamePlay_PlayerID_o id = ReadAddr<COW_GamePlay_PlayerID_o>(player + kPlayerID);
         if (myId.m_Value != 0 && myId.m_Value == id.m_Value) return true;
-        if (myId.m_ID != 0 && myId.m_ID == id.m_ID) return true;
     }
     return false;
 }
