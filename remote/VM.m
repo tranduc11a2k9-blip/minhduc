@@ -247,6 +247,7 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     uint32_t refCount = kread32(object->address + off_vm_object_ref_count);
     refCount++;
     kwrite32(object->address + off_vm_object_ref_count, refCount);
+    BOOL bumpedRef = YES;
 
     entry.vme_object_or_delta = (uint32_t)packedPointer;
     entry.vme_offset = object->objectOffset;
@@ -269,7 +270,15 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
             mach_port_deallocate(mach_task_self_, memoryObject);
             memoryObject = MACH_PORT_NULL;
         }
+        // Undo the manual ref bump — otherwise FF keeps a phantom reference
+        // and later hits vm_page_validate_no_references panic.
+        if (bumpedRef) {
+            uint32_t rc = kread32(object->address + off_vm_object_ref_count);
+            if (rc > 0) kwrite32(object->address + off_vm_object_ref_count, rc - 1);
+            bumpedRef = NO;
+        }
     }
+    (void)bumpedRef;
 
     ret = mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
     if (ret != KERN_SUCCESS)

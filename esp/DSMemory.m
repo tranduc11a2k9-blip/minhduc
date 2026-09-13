@@ -352,11 +352,16 @@ void ds_begin_read_transaction(void) {
 void ds_end_read_transaction(void) {
     pthread_mutex_lock(&g_pageCacheLock);
     if (g_readTxnDepth > 0) g_readTxnDepth--;
-    // Outside transaction: lightly age cold slots so next frame prefers hot pages.
+    // CRITICAL: flush ALL remapped FF pages at end of each ESP frame.
+    // Holding mach_vm_map'd views of FreeFire pages across frames left
+    // foreign refs on vm_pages → kernel panic in FreeFire:
+    //   vm_page_validate_no_references: page is referenced
+    // Within a frame, the cache still coalesces repeated bone/HP reads.
     if (g_readTxnDepth == 0) {
         for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-            if (g_pageCache[i].useCount > 0) g_pageCache[i].useCount >>= 1;
+            ds_release_page_slot_locked(i);
         }
+        g_pageCacheNext = 0;
     }
     pthread_mutex_unlock(&g_pageCacheLock);
 }
