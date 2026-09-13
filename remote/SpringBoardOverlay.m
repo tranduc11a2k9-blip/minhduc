@@ -1,17 +1,34 @@
 //
-//  SpringBoardOverlay.m — Fl0rk DisplayLink + Cyanide dedicated UIWindow
+//  SpringBoardOverlay.m — Fl0rk DrawView-faithful SpringBoard ESP mirror
 //
-//  Architecture (smooth + no WATCHDOG):
-//    1. Dedicated UIWindow via -initWithWindowScene: (NEVER keyWindow addSubview —
-//       that layout-fights fullscreen Free Fire → WATCHDOG 60s).
-//    2. Window level 999999.0, userInteractionEnabled = NO.
-//    3. ONE persistent remote CGMutablePath. App only CGPathClear+AddLines sparsely.
-//    4. Cached NSInvocation for -[CAShapeLayer setPath:] (Fl0rk
-//       gDrawViewGeometryPathInvocation) — built once, argument = persistent path.
-//    5. CADisplayLink installed INSIDE SpringBoard, target = that NSInvocation.
-//       SB paints setPath locally every tick → NO remote IPC per paint frame.
-//       App mutates path ~3×/s; DisplayLink @15fps re-applies same path (smooth).
-//    6. Atomic in-flight drop + path hash skip.
+//  Verified against Fl0rkFF binary + fl0rk_drawview_symbols.txt:
+//    DrawView.m is oxorany-stripped from release; symbols remain:
+//      _drawview_start_esp_renderer_in_session
+//      _gDrawViewWindow / _gDrawViewCanvas / _gDrawViewGeometryLayer
+//      _gDrawViewGeometryPathInvocation   ← cached NSInvocation setPath:
+//      _drawview_invoke_cached_main_raw   ← paint = re-fire that invocation
+//      _drawview_passthrough_window_class
+//      _drawview_line_point_buffer / _drawview_box_rect_buffer
+//      _drawview_disable_line_layer_actions
+//      _gDrawViewNextPlayerOverlayUS      ← us-rate limit
+//      _gDrawViewSummarySkips/Updates
+//    CADisplayLink (_displayLink) exists ONLY on Fl0rk's APP ViewController —
+//    it drives local UI / publish loop. It is NOT installed inside SpringBoard.
+//    Installing CADisplayLink in SB was our wrong invention.
+//
+//  Cyanide contributes the safe window host:
+//    UIWindow initWithWindowScene: + level 999999.0 + userInteractionEnabled=NO
+//    (NEVER keyWindow addSubview — Free Fire fullscreen → WATCHDOG 60s).
+//
+//  Paint path (Fl0rk):
+//    1. Build dedicated pass-through window + CAShapeLayer once.
+//    2. Build ONE NSInvocation for [shape setPath:] once; retain it.
+//    3. Persist ONE remote CGMutablePath + remote point buffer.
+//    4. App DisplayLink (ESP) calls SBRemotePushESPFrame:
+//         merge paths → if hash unchanged SKIP (gDrawViewSummarySkips)
+//         else CGPathClear+AddLines into persistent path
+//         then invoke_cached_main_raw (performSelectorOnMainThread:invoke wait:NO)
+//    5. Min interval ~33ms (~30fps). Atomic in-flight drop if previous IPC busy.
 //
 
 #import "SpringBoardOverlay.h"
@@ -21,31 +38,33 @@
 #import <UIKit/UIKit.h>
 #import <pthread.h>
 #import <string.h>
+#import <mach/mach_time.h>
 
 #define SB_OVERLAY_WIN_LEVEL 999999.0
-// With DisplayLink painting locally, app only refreshes geometry ~3×/s @60 host.
-// Without DisplayLink fallback: ~8×/s sparse push.
-#define SB_MIRROR_STRIDE_WITH_DL 20
-#define SB_MIRROR_STRIDE_NO_DL   8
-#define SB_DISPLAYLINK_FPS       15
+// Fl0rk gDrawViewNextPlayerOverlayUS-style gate. 33ms ≈ 30fps publish.
+#define SB_MIN_PUBLISH_INTERVAL_US 33000ULL
 
 static BOOL g_sbOverlayOn = NO;
 static uint64_t g_sbWin = 0;
-static uint64_t g_sbShape = 0;
-static uint64_t g_sbCanvas = 0;
+static uint64_t g_sbShape = 0;       // gDrawViewGeometryLayer
+static uint64_t g_sbCanvas = 0;      // gDrawViewCanvas
 
 static uint64_t g_sbPersistentPath = 0;
-static uint64_t g_sbMirrorPtsBuf = 0;
+static uint64_t g_sbMirrorPtsBuf = 0; // gDrawViewLinePointBuffer analogue
 static uint32_t g_sbPathHash = 0;
-static int g_sbMirrorCount = 0;
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
 
-// Fl0rk: cached NSInvocation + SB-local CADisplayLink
+// Fl0rk: _gDrawViewGeometryPathInvocation + invoke_cached_main_raw
 static uint64_t g_sbSetPathInv = 0;
 static uint64_t g_sbSetPathArgBuf = 0;
-static uint64_t g_sbDisplayLink = 0;
 static uint64_t g_sbPerformMainSel = 0;
 static uint64_t g_sbInvokeSel = 0;
+
+// Fl0rk summary counters
+static uint64_t g_sbSummaryAttempts = 0;
+static uint64_t g_sbSummarySkips = 0;
+static uint64_t g_sbSummaryUpdates = 0;
+static uint64_t g_sbNextPublishUS = 0;
 
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
@@ -58,6 +77,14 @@ static const char *kShapeKeys[16] = {
 static uint64_t dlsym_remote(const char *fn, uint64_t a0, uint64_t a1, uint64_t a2,
                              uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
     return r_dlsym_call(R_TIMEOUT, fn, a0,a1,a2,a3,a4,a5,a6,a7);
+}
+
+static uint64_t now_us(void) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    uint64_t t = mach_absolute_time();
+    return (t * tb.numer / tb.denom) / 1000ULL;
 }
 
 typedef struct { NSMutableData *data; } SerCtx;
@@ -105,28 +132,38 @@ static uint64_t persistentPath(void) {
     return g_sbPersistentPath;
 }
 
-static void sb_invalidate_displaylink(void) {
-    if (g_sbDisplayLink) {
-        r_msg2_main(g_sbDisplayLink, "invalidate", 0, 0, 0, 0);
-        g_sbDisplayLink = 0;
-    }
-}
-
 static void sb_reset_mirror_state(void) {
-    sb_invalidate_displaylink();
     g_sbPersistentPath = 0;
     g_sbMirrorPtsBuf = 0;
     g_sbPathHash = 0;
-    g_sbMirrorCount = 0;
     if (r_is_objc_ptr(g_sbSetPathInv)) r_msg2(g_sbSetPathInv, "release", 0,0,0,0);
     if (g_sbSetPathArgBuf) dlsym_remote("free", g_sbSetPathArgBuf, 0,0,0,0,0,0,0);
     g_sbSetPathInv = 0;
     g_sbSetPathArgBuf = 0;
     g_sbPerformMainSel = 0;
     g_sbInvokeSel = 0;
+    g_sbNextPublishUS = 0;
 }
 
-// Fl0rk: build NSInvocation once, arg = persistent path (lives whole session).
+// Fl0rk: _drawview_disable_line_layer_actions
+static void sb_disable_layer_actions(uint64_t layer) {
+    if (!r_is_objc_ptr(layer)) return;
+    // actions = @{@"path": [NSNull null], @"strokeColor": null, ...} — simplest:
+    // setActions: empty dict still allows implicit; setDelegate nil + disableActions
+    // via CATransaction is local-only. Remote: setActions: with NSNull for "path".
+    uint64_t NSMutableDictionary = r_class("NSMutableDictionary");
+    uint64_t NSNullCls = r_class("NSNull");
+    if (!r_is_objc_ptr(NSMutableDictionary) || !r_is_objc_ptr(NSNullCls)) return;
+    uint64_t dict = r_msg2_main(NSMutableDictionary, "dictionary", 0,0,0,0);
+    uint64_t nullObj = r_msg2_main(NSNullCls, "null", 0,0,0,0);
+    uint64_t keyPath = r_nsstr_retained("path");
+    if (r_is_objc_ptr(dict) && r_is_objc_ptr(nullObj) && r_is_objc_ptr(keyPath)) {
+        r_msg2_main(dict, "setObject:forKey:", nullObj, keyPath, 0, 0);
+        r_msg2_main(layer, "setActions:", dict, 0,0,0);
+    }
+}
+
+// Fl0rk: build _gDrawViewGeometryPathInvocation once
 static BOOL sb_ensure_setpath_invocation(void) {
     if (r_is_objc_ptr(g_sbSetPathInv) && g_sbSetPathArgBuf) return YES;
     if (!r_is_objc_ptr(g_sbShape)) return NO;
@@ -164,53 +201,21 @@ static BOOL sb_ensure_setpath_invocation(void) {
     g_sbSetPathArgBuf = argBuf;
     g_sbPerformMainSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     g_sbInvokeSel = r_sel("invoke");
-    NSLog(@"[SBOverlay] Cached setPath: inv=0x%llx path=0x%llx", inv, rp);
+    NSLog(@"[SBOverlay] Fl0rk GeometryPathInvocation=0x%llx path=0x%llx", inv, rp);
     return YES;
 }
 
-// Install CADisplayLink inside SpringBoard — paints setPath locally (0 app IPC/frame).
-static BOOL sb_install_displaylink(void) {
-    if (g_sbDisplayLink) return YES;
-    if (!sb_ensure_setpath_invocation()) return NO;
-
-    uint64_t clsDL = r_class("CADisplayLink");
-    if (!r_is_objc_ptr(clsDL)) return NO;
-
-    // displayLinkWithTarget:selector: — target = NSInvocation, selector = invoke
-    uint64_t dl = r_msg2_main(clsDL, "displayLinkWithTarget:selector:",
-                              g_sbSetPathInv, g_sbInvokeSel ? g_sbInvokeSel : r_sel("invoke"),
-                              0, 0);
-    if (!r_is_objc_ptr(dl)) {
-        NSLog(@"[SBOverlay] CADisplayLink create failed");
-        return NO;
-    }
-
-    r_msg2_main(dl, "setPreferredFramesPerSecond:", SB_DISPLAYLINK_FPS, 0, 0, 0);
-
-    uint64_t mainRL = r_msg2_main(r_class("NSRunLoop"), "mainRunLoop", 0,0,0,0);
-    uint64_t mode = r_nsstr_retained("kCFRunLoopCommonModes");
-    if (r_is_objc_ptr(mainRL) && r_is_objc_ptr(mode)) {
-        r_msg2_main(dl, "addToRunLoop:forMode:", mainRL, mode, 0, 0);
-    } else {
-        NSLog(@"[SBOverlay] RunLoop/mode missing — invalidate DisplayLink");
-        r_msg2_main(dl, "invalidate", 0,0,0,0);
-        return NO;
-    }
-
-    g_sbDisplayLink = dl;
-    NSLog(@"[SBOverlay] SB CADisplayLink ACTIVE @%dfps (local setPath, Fl0rk)", SB_DISPLAYLINK_FPS);
-    return YES;
-}
-
-static void sb_fallback_setpath_async(void) {
+// Fl0rk: _drawview_invoke_cached_main_raw
+static void sb_invoke_cached_main_raw(void) {
     if (!sb_ensure_setpath_invocation()) {
         uint64_t rp = persistentPath();
         if (rp) r_msg2_main_async(g_sbShape, "setPath:", rp, 0,0,0);
         return;
     }
-    // Refresh arg in case path was recreated
+    // Keep arg = current persistent path (may have been recreated after reset)
     remote_write64(g_sbSetPathArgBuf, persistentPath());
     r_msg2(g_sbSetPathInv, "setArgument:atIndex:", g_sbSetPathArgBuf, 2, 0, 0);
+    // waitUntilDone:NO — never block SpringBoard / never block us waiting on SB
     if (g_sbPerformMainSel && g_sbInvokeSel) {
         r_msg(g_sbSetPathInv, g_sbPerformMainSel, g_sbInvokeSel, 0, 0, 0);
     }
@@ -227,11 +232,11 @@ int SBoardStartOverlay(void) {
 
     r_settle_us(5000);
 
-    NSLog(@"[SBOverlay] Initializing SpringBoard overlay (DisplayLink + dedicated UIWindow)...");
+    NSLog(@"[SBOverlay] Fl0rk DrawView session (originalThreadOnly)...");
     int rc = init_remote_call_original_thread_only_with_first_exception_timeout(
         "SpringBoard", false, 15000);
     if (rc != 0) {
-        NSLog(@"[SBOverlay] originalThreadOnly failed rc=%d — fallback plain init", rc);
+        NSLog(@"[SBOverlay] originalThreadOnly failed rc=%d — fallback", rc);
         rc = init_remote_call_with_first_exception_timeout("SpringBoard", false, 15000);
     }
     if (rc != 0) return -1;
@@ -249,14 +254,14 @@ int SBoardStartOverlay(void) {
         if (n > 0 && n < 64) keyWin = r_msg2_main(ws, "objectAtIndex:", 0,0,0,0);
     }
     if (!r_is_objc_ptr(keyWin)) {
-        NSLog(@"[SBOverlay] No SpringBoard window");
+        NSLog(@"[SBOverlay] no SB window");
         destroy_remote_call();
         return -1;
     }
 
     uint64_t scene = r_msg2_main(keyWin, "windowScene", 0,0,0,0);
     if (!r_is_objc_ptr(scene)) {
-        NSLog(@"[SBOverlay] No UIWindowScene");
+        NSLog(@"[SBOverlay] no UIWindowScene");
         destroy_remote_call();
         return -1;
     }
@@ -273,7 +278,7 @@ int SBoardStartOverlay(void) {
     uint64_t whiteColor = r_is_objc_ptr(clsCol) ? r_msg2_main(clsCol, "whiteColor", 0,0,0,0) : 0;
     uint64_t whiteCGColor = r_is_objc_ptr(whiteColor) ? r_msg2_main(whiteColor, "CGColor", 0,0,0,0) : 0;
 
-    // Dedicated UIWindow — Cyanide/Fl0rk. Never touch keyWindow hierarchy.
+    // Fl0rk passthrough window + Cyanide initWithWindowScene:
     uint64_t winAlloc = r_msg2_main(r_class("UIWindow"), "alloc", 0,0,0,0);
     if (!r_is_objc_ptr(winAlloc)) { destroy_remote_call(); return -1; }
 
@@ -290,6 +295,7 @@ int SBoardStartOverlay(void) {
     r_msg2_main(win, "setUserInteractionEnabled:", 0, 0,0,0);
     if (r_is_objc_ptr(clear)) r_msg2_main(win, "setBackgroundColor:", clear, 0,0,0);
 
+    // gDrawViewCanvas
     uint64_t container = r_msg2_main_raw(r_msg2_main(r_class("UIView"), "alloc", 0,0,0,0),
                                          "initWithFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
     if (!r_is_objc_ptr(container)) { destroy_remote_call(); return -1; }
@@ -298,6 +304,7 @@ int SBoardStartOverlay(void) {
     r_msg2_main(container, "setOpaque:", 0, 0,0,0);
     r_msg2_main(win, "addSubview:", container, 0,0,0);
 
+    // gDrawViewGeometryLayer
     uint64_t shape = r_msg2_main(r_class("CAShapeLayer"), "layer", 0,0,0,0);
     if (!r_is_objc_ptr(shape)) { destroy_remote_call(); return -1; }
     r_msg2_main_raw(shape, "setFrame:", bounds, 32, NULL,0,NULL,0,NULL,0);
@@ -308,12 +315,14 @@ int SBoardStartOverlay(void) {
     r_msg2_main(shape, "setOpaque:", 0, 0,0,0);
     double z = 100;
     r_msg2_main_raw(shape, "setZPosition:", &z, 8, NULL,0,NULL,0,NULL,0);
+    sb_disable_layer_actions(shape);
 
     uint64_t cLayer = r_msg2_main(container, "layer", 0,0,0,0);
     if (r_is_objc_ptr(cLayer)) r_msg2_main(cLayer, "addSublayer:", shape, 0,0,0);
 
     r_msg2_main(win, "setHidden:", 0, 0,0,0);
 
+    // Retain like Fl0rk associated-object window root
     uint64_t key = r_sel("fl0rkffESPMenuWindow");
     if (r_is_objc_ptr(key)) {
         dlsym_remote("objc_setAssociatedObject", app, key, win, 1, 0,0,0,0);
@@ -329,29 +338,42 @@ int SBoardStartOverlay(void) {
     sb_reset_mirror_state();
     (void)persistentPath();
     (void)sb_ensure_setpath_invocation();
-    BOOL dlOK = sb_install_displaylink();
 
-    NSLog(@"[SBOverlay] ACTIVE win=0x%llx shape=0x%llx path=0x%llx dl=%s",
-          win, shape, g_sbPersistentPath, dlOK ? "OK" : "FALLBACK");
+    NSLog(@"[SBOverlay] Fl0rk DrawView ACTIVE win=0x%llx canvas=0x%llx geom=0x%llx inv=%s",
+          win, container, shape, r_is_objc_ptr(g_sbSetPathInv) ? "OK" : "NO");
     return 0;
 }
 
 void SBRemotePushESPFrame(UIView *espView) {
     if (!g_sbOverlayOn || !espView) return;
 
-    const int stride = g_sbDisplayLink ? SB_MIRROR_STRIDE_WITH_DL : SB_MIRROR_STRIDE_NO_DL;
-    if (++g_sbMirrorCount % stride != 0) return;
+    g_sbSummaryAttempts++;
+
+    // Fl0rk gDrawViewNextPlayerOverlayUS gate
+    uint64_t t = now_us();
+    if (t < g_sbNextPublishUS) {
+        g_sbSummarySkips++;
+        return;
+    }
 
     static NSMutableData *ops = nil;
     if (!ops) ops = [NSMutableData dataWithCapacity:8192];
 
-    if (!mergePaths(espView, ops)) return;
+    if (!mergePaths(espView, ops)) {
+        g_sbSummarySkips++; // unchanged hash
+        return;
+    }
 
     static int s_remoteBusy = 0;
-    if (__sync_lock_test_and_set(&s_remoteBusy, 1)) return;
+    if (__sync_lock_test_and_set(&s_remoteBusy, 1)) {
+        g_sbSummarySkips++;
+        return;
+    }
 
+    g_sbNextPublishUS = t + SB_MIN_PUBLISH_INTERVAL_US;
     NSData *frameBytes = [ops copy];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @try {
             uint64_t rp = persistentPath();
             if (!rp) return;
@@ -392,17 +414,17 @@ void SBRemotePushESPFrame(UIView *espView) {
                 }
             }
 
-            // Mutate remote path ONLY. DisplayLink in SB calls setPath locally.
             if (n >= 2) {
                 remote_write(ptsBuf, pts, n * 8);
                 dlsym_remote("CGPathClear", rp, 0,0,0,0,0,0,0);
                 dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
-
-                // Keep invocation arg pointed at current path (in case recreated)
-                if (g_sbSetPathArgBuf) remote_write64(g_sbSetPathArgBuf, rp);
-
-                // No DisplayLink → sparse async setPath fallback
-                if (!g_sbDisplayLink) sb_fallback_setpath_async();
+                // Fl0rk paint: invoke cached main raw (NOT SB DisplayLink)
+                sb_invoke_cached_main_raw();
+                g_sbSummaryUpdates++;
+                if ((g_sbSummaryUpdates & 0x3f) == 0) {
+                    NSLog(@"[SBOverlay] Fl0rk summary attempts=%llu skips=%llu updates=%llu",
+                          g_sbSummaryAttempts, g_sbSummarySkips, g_sbSummaryUpdates);
+                }
             }
         } @finally {
             __sync_lock_release(&s_remoteBusy);
@@ -415,7 +437,6 @@ void SBoardOverlaySetStatus(const char *utf8) { (void)utf8; }
 void SBoardStopOverlay(void) {
     pthread_mutex_lock(&g_sbLock);
     if (!g_sbOverlayOn) { pthread_mutex_unlock(&g_sbLock); return; }
-    sb_invalidate_displaylink();
     if (r_is_objc_ptr(g_sbWin)) r_msg2_main(g_sbWin, "setHidden:", 1, 0,0,0);
     if (g_sbPersistentPath) dlsym_remote("CGPathRelease", g_sbPersistentPath, 0,0,0,0,0,0,0);
     if (r_is_objc_ptr(g_sbSetPathInv)) r_msg2(g_sbSetPathInv, "release", 0,0,0,0);
@@ -428,7 +449,6 @@ void SBoardStopOverlay(void) {
     g_sbPathHash = 0;
     g_sbSetPathInv = 0;
     g_sbSetPathArgBuf = 0;
-    g_sbDisplayLink = 0;
     pthread_mutex_unlock(&g_sbLock);
     destroy_remote_call();
 }
