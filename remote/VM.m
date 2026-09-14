@@ -149,8 +149,8 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
  
     uint64_t entryAddr = vm_map_find_entry(map, address);
     if (!entryAddr) {
-        printf("[DS][%s:%d] vm_map_find_entry FAILED addr=0x%llx (no entry covers it)\n",
-               __FUNCTION__, __LINE__, (unsigned long long)address);
+        NSLog(@"[DS] DIAG vm_map_find_entry FAILED addr=0x%llx (no entry covers it)",
+              (unsigned long long)address);
         return result;
     }
 
@@ -321,7 +321,8 @@ struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address)
     struct VMObject vmObject = vm_get_object(vmMap, address);
     if (!vmObject.address)
     {
-        printf("[DS][%s:%d] Failed to get VM object for 0x%llx\n", __FUNCTION__, __LINE__, (unsigned long long)address);
+        NSLog(@"[DS] DIAG vm_map_remote_page no object for 0x%llx",
+              (unsigned long long)address);
         return shmem;
     }
 
