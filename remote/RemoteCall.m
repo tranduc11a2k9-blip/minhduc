@@ -1683,22 +1683,11 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
     reply_with_state(&exc, &newState);
 
-    // Fl0rk @ 0x100e660ec: wait_exception(~1500) AFTER creator reply — sync only.
-    // Do NOT re-sign FAKE_PC 0x101 / drain (old e2ef173). That left SB main
-    // durable-parked at 0x101 → WATCHDOG if bootstrap/restore slipped.
-    // Reply same trapped state (PC still 0x101) → immediate re-fault; next
-    // do_remote_call_temp("getpid") consumes it (Cyanide/Fl0rk shape).
-    {
-        ExceptionMessage creatorExc;
-        int creatorWaitMS = 1500;
-        if (!wait_exception(firstExceptionPort, &creatorExc, creatorWaitMS, false)) {
-            printf("[%s:%d] FAKE_PC_TROJAN_CREATOR trap not received within %dms\n",
-                   __FUNCTION__, __LINE__, creatorWaitMS);
-            fail_after_creator_park(RemoteCallInitFailureFirstExceptionTimeout, targetPid);
-            return -1;
-        }
-        reply_with_state(&creatorExc, &creatorExc.threadState);
-    }
+    // Cyanide TaskRop/RemoteCall.m: after creator reply there is NO wait/repark.
+    // The 1500ms loop above is the PRE-creator drain (same as Cyanide). Post-reply
+    // wait+repark (e2ef173) → SB WATCHDOG at PC=0x101; wait+reply-same (43e15a4)
+    // → SIGBUS PC=0x201. Next do_remote_call_temp("getpid") must consume the
+    // 0x101 trap directly. Fail paths use fail_after_creator_park (restore).
 
     if (g_RC_originalThreadOnly) {
         g_RC_creatingExtraThread = false;
