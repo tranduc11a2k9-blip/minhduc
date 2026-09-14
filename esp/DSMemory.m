@@ -1,5 +1,5 @@
 //
-//  DSMemory.m — DarkSword-style memory provider (Fl0rk mechanism)
+//  DSMemory.m — Fl0rk DarkSwordMemoryProvider (remap + lock/cache/breaker)
 //
 //  Kernel r/w direct — NO task port, NO mach APIs on target.
 //
@@ -21,7 +21,7 @@
 #import "DSMemory.h"
 #import "../kexploit/kexploit_opa334.h"
 #import "../app/KernelBoot.h" // kernelBootLog (diag to Home log card)
-#import "../remote/VM.h"      // vm_map_remote_page — the WORKING page remap (lara/cyanide path)
+#import "../remote/VM.h"      // vm_map_remote_page — Fl0rk DarkSword remap path
 #import "../kexploit/krw.h"
 #import "../kexploit/kutils.h"
 #import "../kexploit/offsets.h"
@@ -191,7 +191,19 @@ int ds_attach(void) {
                     bestStart = start;
                     bestSize = size;
                 }
+                // Fl0rk: never keep attach-probe remaps — free mapping + entry port.
+                mach_vm_deallocate(mach_task_self_,
+                                   (mach_vm_address_t)page.localAddress,
+                                   PAGE_SIZE);
+                if (page.port) {
+                    mach_port_deallocate(mach_task_self_,
+                                         (mach_port_name_t)page.port);
+                }
             } else {
+                if (page.port) {
+                    mach_port_deallocate(mach_task_self_,
+                                         (mach_port_name_t)page.port);
+                }
                 if (failCount < 5) {
                     NSLog(@"[DS] remap FAIL region start=0x%llx size=0x%llx", start, size);
                 }
@@ -311,21 +323,60 @@ uint64_t ds_translate_page(uint64_t page_va) {
 // không". Cache mapped pages (128 slots, LRU-ish round-robin) so repeated
 // reads of the same page (the common case: HP/positions/TypeInfo) hit the
 // cache and cost a memcpy only.
-#define DS_PAGE_CACHE_SLOTS 1024
+// Fl0rk DarkSwordMemoryProvider cache shape:
+//   _pageSlots[256] {VMShmem + lastUse}, _recentPageSlots[8], soft-age on txn end,
+//   NSRecursiveLock across map+insert, degraded after 3 consecutive map failures.
+#define DS_PAGE_CACHE_SLOTS 256
+#define DS_RECENT_SLOTS 8
+#define DS_FAIL_DEGRADE_THRESHOLD 3
 static struct {
     uint64_t pageVA;
     uint64_t localAddr;
-    uint64_t port;     // memory_entry from mach_make_memory_entry_64 — MUST deallocate
-    uint32_t useCount; // Fl0rk _pageUseCounter — prefer hot slots on eviction
+    uint64_t port;     // memory_entry — MUST mach_port_deallocate on eviction
+    uint64_t lastUse;  // Fl0rk lastUse clock
+    uint32_t useCount;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
+static int g_recentPageSlots[DS_RECENT_SLOTS];
+static int g_recentCount = 0;
+static uint64_t g_pageUseCounter = 1;
 static int g_pageCacheNext = 0;
-static pthread_mutex_t g_pageCacheLock = PTHREAD_MUTEX_INITIALIZER;
+// Recursive: begin/end txn + ds_page_local nest like Fl0rk NSRecursiveLock.
+static pthread_mutex_t g_pageCacheLock;
+static pthread_once_t g_pageCacheLockOnce = PTHREAD_ONCE_INIT;
 static int g_readTxnDepth = 0;
+static uint64_t g_consecutiveMapFailures = 0;
+static bool g_degraded = false;
 
-// Evict one cache slot: free BOTH the mapped page AND the memory_entry port.
-// Forgetting the port was the MINHDUC PORT_SPACE kill (limit ~114k) — every
-// bone/ESP read called vm_map_remote_page → new mach_make_memory_entry_64
-// while eviction only mach_vm_deallocate'd the mapping.
+static void ds_page_cache_lock_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_pageCacheLock, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+static void ds_lock(void) {
+    pthread_once(&g_pageCacheLockOnce, ds_page_cache_lock_init);
+    pthread_mutex_lock(&g_pageCacheLock);
+}
+
+static void ds_unlock(void) {
+    pthread_mutex_unlock(&g_pageCacheLock);
+}
+
+static void ds_note_recent_locked(int slot) {
+    for (int i = 0; i < g_recentCount; i++) {
+        if (g_recentPageSlots[i] == slot) {
+            for (int j = i; j > 0; j--) g_recentPageSlots[j] = g_recentPageSlots[j - 1];
+            g_recentPageSlots[0] = slot;
+            return;
+        }
+    }
+    if (g_recentCount < DS_RECENT_SLOTS) g_recentCount++;
+    for (int j = g_recentCount - 1; j > 0; j--) g_recentPageSlots[j] = g_recentPageSlots[j - 1];
+    g_recentPageSlots[0] = slot;
+}
+
 static void ds_release_page_slot_locked(int i) {
     if (i < 0 || i >= DS_PAGE_CACHE_SLOTS) return;
     if (g_pageCache[i].localAddr) {
@@ -340,70 +391,89 @@ static void ds_release_page_slot_locked(int i) {
     g_pageCache[i].pageVA = 0;
     g_pageCache[i].localAddr = 0;
     g_pageCache[i].port = 0;
+    g_pageCache[i].lastUse = 0;
     g_pageCache[i].useCount = 0;
 }
 
 void ds_begin_read_transaction(void) {
-    pthread_mutex_lock(&g_pageCacheLock);
+    ds_lock();
     g_readTxnDepth++;
-    pthread_mutex_unlock(&g_pageCacheLock);
+    ds_unlock();
 }
 
 void ds_end_read_transaction(void) {
-    pthread_mutex_lock(&g_pageCacheLock);
+    ds_lock();
     if (g_readTxnDepth > 0) g_readTxnDepth--;
-    // CRITICAL: flush ALL remapped FF pages at end of each ESP frame.
-    // Holding mach_vm_map'd views of FreeFire pages across frames left
-    // foreign refs on vm_pages → kernel panic in FreeFire:
-    //   vm_page_validate_no_references: page is referenced
-    // Within a frame, the cache still coalesces repeated bone/HP reads.
+    // Fl0rk soft-age — never full per-frame flush (that caused RW-lock panics).
     if (g_readTxnDepth == 0) {
         for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-            ds_release_page_slot_locked(i);
+            if (g_pageCache[i].useCount > 0) g_pageCache[i].useCount >>= 1;
         }
-        g_pageCacheNext = 0;
     }
-    pthread_mutex_unlock(&g_pageCacheLock);
+    ds_unlock();
 }
 
-// FIX SIGSEGV far=0x1: force-fault cũ truyền FF USER pageVA thẳng vào
-// early_kread64 — primitive từ chối (is_kaddr_valid đòi kernel pointer
-// 0xfffff000...) rồi crash CỐ Ý bằng *(int*)1 = 0. Không bao giờ force-fault
-// user VA qua primitive này: nếu trang chưa resident, bỏ qua (caller retry).
+// Map+cache insert MUST stay under g_pageCacheLock (Fl0rk NSRecursiveLock scope).
+// Unlocking before vm_map_remote_page raced kwrite_zone_element →
+// "Taking non-sleepable RW lock with preemption enabled".
 static uint64_t ds_page_local(uint64_t pageVA) {
-    pthread_mutex_lock(&g_pageCacheLock);
-    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
-        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
-            if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
-            uint64_t a = g_pageCache[i].localAddr;
-            pthread_mutex_unlock(&g_pageCacheLock);
-            return a;
-        }
-    }
-    // Evict coldest slot among a small window (Fl0rk _recentPageSlots style).
-    int victim = g_pageCacheNext;
-    uint32_t bestUse = UINT32_MAX;
-    for (int k = 0; k < 8; k++) {
-        int i = (g_pageCacheNext + k) % DS_PAGE_CACHE_SLOTS;
-        if (g_pageCache[i].localAddr == 0) { victim = i; break; }
-        if (g_pageCache[i].useCount < bestUse) {
-            bestUse = g_pageCache[i].useCount;
-            victim = i;
-        }
-    }
-    pthread_mutex_unlock(&g_pageCacheLock);
+    ds_lock();
 
-    struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
-    if (!page.localAddress) {
-        // Map failed — still drop any leaked entry port from the attempt.
-        if (page.port) {
-            mach_port_deallocate(mach_task_self_, (mach_port_name_t)page.port);
-        }
+    if (g_degraded) {
+        ds_unlock();
         return 0;
     }
 
-    pthread_mutex_lock(&g_pageCacheLock);
-    // Evict previous occupant (frees its port + mapping).
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (g_pageCache[i].pageVA == pageVA && g_pageCache[i].localAddr) {
+            if (g_pageCache[i].useCount < 0xFFFFFFFFu) g_pageCache[i].useCount++;
+            g_pageCache[i].lastUse = g_pageUseCounter++;
+            ds_note_recent_locked(i);
+            uint64_t a = g_pageCache[i].localAddr;
+            ds_unlock();
+            return a;
+        }
+    }
+
+    // Prefer empty slot; else coldest among recent window then global next.
+    int victim = -1;
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (g_pageCache[i].localAddr == 0 && g_pageCache[i].port == 0) {
+            victim = i;
+            break;
+        }
+    }
+    if (victim < 0) {
+        uint64_t bestUse = UINT64_MAX;
+        int window = g_recentCount > 0 ? g_recentCount : DS_RECENT_SLOTS;
+        for (int k = 0; k < window; k++) {
+            int i = (g_recentCount > 0)
+                ? g_recentPageSlots[k]
+                : ((g_pageCacheNext + k) % DS_PAGE_CACHE_SLOTS);
+            if (i < 0 || i >= DS_PAGE_CACHE_SLOTS) continue;
+            uint64_t score = g_pageCache[i].lastUse;
+            if (score < bestUse) { bestUse = score; victim = i; }
+        }
+        if (victim < 0) victim = g_pageCacheNext % DS_PAGE_CACHE_SLOTS;
+    }
+
+    // Hold lock through remap — Fl0rk does not drop lock around map.
+    struct VMShmem page = vm_map_remote_page(g_ff_map, pageVA);
+    if (!page.localAddress) {
+        if (page.port) {
+            mach_port_deallocate(mach_task_self_, (mach_port_name_t)page.port);
+        }
+        g_consecutiveMapFailures++;
+        if (g_consecutiveMapFailures >= DS_FAIL_DEGRADE_THRESHOLD) {
+            g_degraded = true;
+            NSLog(@"[DS] degraded after %llu consecutive map failures — stop remapping",
+                  (unsigned long long)g_consecutiveMapFailures);
+        }
+        ds_unlock();
+        return 0;
+    }
+
+    g_consecutiveMapFailures = 0;
     if (g_pageCache[victim].localAddr || g_pageCache[victim].port) {
         ds_release_page_slot_locked(victim);
     }
@@ -411,13 +481,17 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].localAddr = page.localAddress;
     g_pageCache[victim].port = page.port;
     g_pageCache[victim].useCount = 1;
+    g_pageCache[victim].lastUse = g_pageUseCounter++;
+    ds_note_recent_locked(victim);
     g_pageCacheNext = (victim + 1) % DS_PAGE_CACHE_SLOTS;
-    pthread_mutex_unlock(&g_pageCacheLock);
-    return page.localAddress;
+    uint64_t a = page.localAddress;
+    ds_unlock();
+    return a;
 }
 
 static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
     if (!K(g_ff_map) || !va || !buf || !len) return false;
+    if (g_degraded) return false;
 
     uint8_t *p = (uint8_t *)buf;
     uint64_t cur = va;
@@ -433,9 +507,7 @@ static bool ds_rw_remap(uint64_t va, void *buf, size_t len, bool isWrite) {
         if (!localAddr) return false;
 
         void *local = (void *)(uintptr_t)(localAddr + page_off);
-        if (isWrite) {
-            memcpy(local, p, chunk);
-        }
+        if (isWrite) memcpy(local, p, chunk);
         else memcpy(p, local, chunk);
 
         p += chunk; cur += chunk; remain -= chunk;
@@ -468,12 +540,15 @@ bool ds_read_str(uint64_t va, char *out, size_t maxlen) {
 #pragma mark - accessors
 
 void ds_detach(void) {
-    pthread_mutex_lock(&g_pageCacheLock);
+    ds_lock();
     for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
         ds_release_page_slot_locked(i);
     }
     g_pageCacheNext = 0;
-    pthread_mutex_unlock(&g_pageCacheLock);
+    g_recentCount = 0;
+    g_consecutiveMapFailures = 0;
+    g_degraded = false;
+    ds_unlock();
     g_ff_proc = g_ff_task = g_ff_base = 0;
     g_ff_map = 0;
     g_ff_pid = 0;

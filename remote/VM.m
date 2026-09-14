@@ -250,7 +250,9 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     BOOL bumpedRef = YES;
 
     entry.vme_object_or_delta = (uint32_t)packedPointer;
-    entry.vme_offset = object->objectOffset;
+    // XNU stores vme_offset as page number (bytes >> PAGE_SHIFT).
+    // object->objectOffset is already byte-expanded via VME_OFFSET(); pack it back.
+    entry.vme_offset = object->objectOffset >> 12;
 
     // Exclusive: concurrent kwrite_zone_element raced XNU RW lock → panic.
     kwrite_zone_element(nextAddr, &entry, sizeof(struct vm_map_entry));
