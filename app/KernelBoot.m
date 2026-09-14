@@ -55,10 +55,12 @@ static void boot_start_sb_overlay(void) {
             }
             RemoteCallInitFailure fail = remote_call_last_init_failure();
             const char *why = remote_call_init_failure_description(fail);
-            NSLog(@"[BOOT] SpringBoard overlay attempt %d failed rc=%d fail=%s",
-                  attempt + 1, sbret, why ?: "?");
-            L(@"WARN SB overlay attempt %d rc=%d (%s)",
-              attempt + 1, sbret, why ? [NSString stringWithUTF8String:why] : @"?");
+            NSString *whyStr = why ? [NSString stringWithUTF8String:why] : @"?";
+            NSLog(@"[BOOT] SpringBoard overlay attempt %d failed rc=%d fail=%@",
+                  attempt + 1, sbret, whyStr);
+            // L() is NSString formatting — must use %@ for NSString*, never %s.
+            L(@"WARN SB overlay attempt %d rc=%d (%@)",
+              attempt + 1, sbret, whyStr);
         }
         L(@"ERR SpringBoard overlay failed after 4 attempts — ESP will not draw over FF.");
     });
