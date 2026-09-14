@@ -77,27 +77,17 @@ void vm_map_iterate_entries(uint64_t vm_map_ptr, void (^itBlock)(uint64_t start,
 
 uint64_t vm_map_find_entry(uint64_t vm_map_ptr, uint64_t address)
 {
-    static uint64_t s_cached_entry = 0;
-    static uint64_t s_cached_start = 0;
-    static uint64_t s_cached_end = 0;
-    static uint64_t s_cached_map = 0;
-
-    if (s_cached_map == vm_map_ptr && s_cached_entry != 0 && address >= s_cached_start && address < s_cached_end) {
-        return s_cached_entry;
-    }
-
+    // No entry cache. pthread_create / stack COW splits map entries; a cached
+    // entry pointer keeps pointing at the pre-COW shared object (zeros) while
+    // the write landed on a new anonymous entry — DIAG: create ret=0 but
+    // remote_read(out) stayed 0 after shmem clear. Fl0rk/Cyanide walk fresh.
     __block uint64_t found_entry = 0;
     vm_map_iterate_entries(vm_map_ptr, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
         if (address >= start && address < end) {
             found_entry = entry;
-            s_cached_entry = entry;
-            s_cached_start = start;
-            s_cached_end = end;
-            s_cached_map = vm_map_ptr;
             *stop = YES;
         } else if (start > address) {
             // XNU vm_map entries are strictly sorted by start address.
-            // If start > address, this address is unmapped. Stop searching immediately!
             *stop = YES;
         }
     });

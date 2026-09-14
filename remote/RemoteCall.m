@@ -1796,13 +1796,14 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
 
-    // Drop any cached mapping so we observe the store pthread just did.
+    // Drop shmem page cache (named-entry to old object). vm_map_find_entry also
+    // must not cache — COW after create splits entries (see VM.m).
     clear_remote_shmem_cache();
     uint64_t pthreadAddr = remote_read64(trojanMemTemp);
     RC_DIAG("post-pthread pthreadAddr=0x%llx out=0x%llx",
             (unsigned long long)pthreadAddr, (unsigned long long)trojanMemTemp);
     if (!pthreadAddr) {
-        RC_DIAG("pthread out still 0 after cache clear — create did not store");
+        RC_DIAG("pthread out still 0 after caches cleared — create did not store?");
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
