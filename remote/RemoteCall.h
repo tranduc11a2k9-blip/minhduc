@@ -45,6 +45,11 @@ typedef enum {
     RemoteCallInitFailureLocalThread,
     RemoteCallInitFailureNoTargetThreads,
     RemoteCallInitFailureFirstExceptionTimeout,
+    RemoteCallInitFailureBootstrapGetpid,
+    RemoteCallInitFailurePthreadCreate,
+    RemoteCallInitFailureCallThread,
+    RemoteCallInitFailureThreadResume,
+    RemoteCallInitFailureRestoreOriginal,
     RemoteCallInitFailureOther,
 } RemoteCallInitFailure;
 
