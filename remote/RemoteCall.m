@@ -1807,14 +1807,42 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     }
     remote_write64(trojanMemTemp, 0);
 
-    // DIAG: FAKE_PC 0x301 as start_routine left *out=0 after ret=0 on SB.
-    // Use a real shared-cache fn (getpid) so libpthread accepts the pointer;
-    // after we have the mach thread port we park PC at FAKE_PC_TROJAN before resume.
-    uint64_t startRoutine = remote_pac(g_RC_trojanThreadAddr,
-                                       native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid")),
-                                       0);
-    RC_DIAG("pthread start_routine=getpid signed=0x%llx out=0x%llx",
-            (unsigned long long)startRoutine, (unsigned long long)trojanMemTemp);
+    // start_routine must be a function pointer SpringBoard's libpthread will
+    // accept. remote_pac(..., IA) of OUR local dlsym left *out=0 after ret=0
+    // (remap roundtrip OK — create simply never stored pthread_t). Resolve
+    // getpid INSIDE SB via remote dlsym so PAC/IB matches the target ABI.
+    // After we have the mach thread, park PC at FAKE_PC_TROJAN before resume.
+    uint64_t nameBuf = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
+    if (!g_RC_success || !nameBuf) {
+        RC_DIAG("malloc nameBuf for dlsym failed");
+        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
+        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+        return -1;
+    }
+    if (!remote_writeStr(nameBuf, "getpid")) {
+        RC_DIAG("remote_writeStr getpid failed");
+        do_remote_call_temp(100, "free", nameBuf, 0, 0, 0, 0, 0, 0, 0);
+        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
+        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+        return -1;
+    }
+    // RTLD_DEFAULT == (void*)-2
+    uint64_t startRoutine = do_remote_call_temp(100, "dlsym",
+                                                (uint64_t)(int64_t)-2, nameBuf,
+                                                0, 0, 0, 0, 0, 0);
+    do_remote_call_temp(100, "free", nameBuf, 0, 0, 0, 0, 0, 0, 0);
+    if (!g_RC_success || !startRoutine) {
+        RC_DIAG("remote dlsym(getpid) failed success=%d ptr=0x%llx",
+                (int)g_RC_success, (unsigned long long)startRoutine);
+        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
+        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+        return -1;
+    }
+    uint64_t localGetpid = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid"));
+    RC_DIAG("pthread start_routine remote_dlsym=0x%llx local_strip=0x%llx out=0x%llx",
+            (unsigned long long)startRoutine,
+            (unsigned long long)localGetpid,
+            (unsigned long long)trojanMemTemp);
 
     uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
                                                 trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
