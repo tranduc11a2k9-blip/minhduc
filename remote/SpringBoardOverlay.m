@@ -214,14 +214,14 @@ static int sb_open_session(void) {
         abandon_remote_call();
     }
     r_settle_us(3000);
-    // Fl0rk: EXTRA trojan thread (originalThreadOnly=NO). Path IPC stays off SB main.
+    // Fl0rk: EXTRA trojan thread only. Never originalThreadOnly on SpringBoard —
+    // that parks com.apple.main-thread at FAKE_PC 0x101 between calls → WATCHDOG
+    // (seen IPS: main unresponsive, PC=0x101, 60s checkin timeout).
     int rc = init_remote_call_with_first_exception_timeout("SpringBoard", false, 15000);
     if (rc != 0) {
-        NSLog(@"[SBOverlay] extra-thread init failed rc=%d — fallback originalThreadOnly", rc);
-        rc = init_remote_call_original_thread_only_with_first_exception_timeout(
-            "SpringBoard", false, 15000);
+        NSLog(@"[SBOverlay] extra-thread init failed rc=%d — no originalThreadOnly fallback", rc);
+        return -1;
     }
-    if (rc != 0) return -1;
     uint64_t pid = do_remote_call_stable(5000, "getpid", 0,0,0,0,0,0,0,0);
     if (pid == 0) {
         destroy_remote_call();
