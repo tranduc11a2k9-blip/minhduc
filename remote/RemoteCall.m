@@ -1840,27 +1840,43 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             (unsigned long long)heapOut, (unsigned long long)pthreadAddr);
     do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
 
+    uint64_t callThreadPort = 0;
     if (!pthreadAddr || pthreadAddr == kCanary) {
-        RC_DIAG("pthreadAddr=0x%llx after pthread_create — create failed",
-                (unsigned long long)pthreadAddr);
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
-    (void)remoteCrashSigned; // used below when parking at 0x301
-    uint64_t callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
-    RC_DEBUG("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
-    if (!g_RC_success || !callThreadPort) {
-        RC_DIAG("pthread_mach_thread_np failed success=%d port=0x%llx",
-                (int)g_RC_success, (unsigned long long)callThreadPort);
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
-    g_RC_callThreadAddr = task_get_ipc_port_kobject(g_RC_taskAddr, (mach_port_t)callThreadPort);
-    if (!is_kaddr_valid(g_RC_callThreadAddr)) {
-        RC_DIAG("synthetic thread kobject invalid port=0x%llx addr=0x%llx",
-                (unsigned long long)callThreadPort, (unsigned long long)g_RC_callThreadAddr);
-        fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
-        return -1;
+        RC_DIAG("pthread_create is STUB on this iOS — trying thread[1] reuse");
+        if (g_RC_threadList.count >= 2) {
+            uint64_t thread2Addr = g_RC_threadList[1].unsignedLongLongValue;
+            if (is_kaddr_valid(thread2Addr)) {
+                callThreadPort = task_find_port_for_thread(g_RC_taskAddr, thread2Addr);
+                if (callThreadPort) {
+                    g_RC_callThreadAddr = thread2Addr;
+                    RC_DIAG("thread[1] reuse addr=0x%llx port=0x%llx",
+                            (unsigned long long)thread2Addr, (unsigned long long)callThreadPort);
+                }
+            }
+        }
+        if (!callThreadPort) {
+            RC_DIAG("thread[1] reuse failed — falling back to originalThreadOnly");
+            g_RC_creatingExtraThread = false;
+            g_RC_pid = (int)targetPid;
+            return 0;
+        }
+    } else {
+        (void)remoteCrashSigned; // used below when parking at 0x301
+        callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
+        RC_DEBUG("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
+        if (!g_RC_success || !callThreadPort) {
+            RC_DIAG("pthread_mach_thread_np failed success=%d port=0x%llx",
+                    (int)g_RC_success, (unsigned long long)callThreadPort);
+            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+            return -1;
+        }
+        g_RC_callThreadAddr = task_get_ipc_port_kobject(g_RC_taskAddr, (mach_port_t)callThreadPort);
+        if (!is_kaddr_valid(g_RC_callThreadAddr)) {
+            RC_DIAG("synthetic thread kobject invalid port=0x%llx addr=0x%llx",
+                    (unsigned long long)callThreadPort, (unsigned long long)g_RC_callThreadAddr);
+            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+            return -1;
+        }
     }
 
     // The new thread is running sleep(3600) — suspend it before modifying
