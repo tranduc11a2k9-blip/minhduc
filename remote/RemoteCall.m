@@ -914,15 +914,12 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
 
     thread_set_mutex(g_RC_dummyThreadAddr, 0x40000000);
     // stateBuf must stay live until helper finishes copyin inside set_state.
-    // Join (or timeout-kill) before free — unlike set_exception_port whose args
-    // are immediates/ports only.
+    // Helper LR=pthread_exit so join returns after set_state. No timedjoin —
+    // pthread_timedjoin_np is not available on iOS (Actions build break).
     {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 2;
-        int jerr = pthread_timedjoin_np(pthread, NULL, &ts);
+        int jerr = pthread_join(pthread, NULL);
         if (jerr != 0) {
-            RC_DIAG("TRO park: helper join err=%d — cancel", jerr);
+            RC_DIAG("TRO park: helper join err=%d — cancel+join", jerr);
             pthread_cancel(pthread);
             pthread_join(pthread, NULL);
         }
