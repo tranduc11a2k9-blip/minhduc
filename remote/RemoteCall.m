@@ -1443,6 +1443,7 @@ bool remote_read_internal(uint64_t src, void *dst, uint64_t size)
         return rc_vphone_bridge_read(src, dst, size);
 
     if (!src || !dst || !size) return false;
+    src = native_strip(src);
     uint64_t dstAddr = (uint64_t)(uintptr_t)dst;
     uint64_t until = src + size;
 
@@ -1527,6 +1528,7 @@ bool remote_write_internal(uint64_t dst, const void *src, uint64_t size)
         return rc_vphone_bridge_write(dst, src, size);
 
     if (!src || !dst || !size) return false;
+    dst = native_strip(dst);
 
     uint64_t srcAddr = (uint64_t)(uintptr_t)src;
     uint64_t until   = dst + size;
@@ -2094,7 +2096,15 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                     (unsigned long long)createResult, (int)g_RC_success);
         }
 
-        if (pthreadAddr && pthreadAddr != kCanary) {
+        if (newThreadAddr && is_kaddr_valid(newThreadAddr)) {
+            callThreadPort = task_find_port_for_thread(g_RC_taskAddr, newThreadAddr);
+            RC_DIAG("synthetic thread 0x%llx port in SB space = 0x%llx",
+                    (unsigned long long)newThreadAddr, (unsigned long long)callThreadPort);
+            if (callThreadPort) {
+                g_RC_callThreadAddr = newThreadAddr;
+                createdSuspended = true;
+            }
+        } else if (pthreadAddr && pthreadAddr != kCanary) {
             callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
             RC_DEBUG("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
             if (g_RC_success && callThreadPort) {
@@ -2106,21 +2116,10 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                     callThreadPort = 0;
                 }
             } else {
-                RC_DIAG("pthread_mach_thread_np returned 0 (expected for suspended) — resolving port via kernel");
                 callThreadPort = 0;
             }
-
-            if (!callThreadPort && newThreadAddr && is_kaddr_valid(newThreadAddr)) {
-                callThreadPort = task_find_port_for_thread(g_RC_taskAddr, newThreadAddr);
-                RC_DIAG("synthetic thread port from task_find_port_for_thread = 0x%llx",
-                        (unsigned long long)callThreadPort);
-                if (callThreadPort) {
-                    g_RC_callThreadAddr = newThreadAddr;
-                    createdSuspended = true;
-                }
-            }
         } else {
-            RC_DIAG("create miss (bounce=0x%llx) — falling through to thread[1] TRO-swap",
+            RC_DIAG("create miss (bounce=0x%llx) — falling through to thread[1] reuse",
                     (unsigned long long)pthreadAddr);
         }
     } else {
@@ -2191,9 +2190,14 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (callThreadPort) {
         // Suspended create/reuse with a usable port — park via thread_set_state.
         arm_thread_state64_internal park = {0};
+        park.__sp = g_RC_originalState.__sp;
+        park.__fp = g_RC_originalState.__fp;
+        park.__flags = g_RC_originalState.__flags;
+
         uint64_t stateBuf = do_remote_call_temp(100, "malloc",
                                                 sizeof(arm_thread_state64_internal),
                                                 0, 0, 0, 0, 0, 0, 0);
+        stateBuf = native_strip(stateBuf);
         if (!g_RC_success || !stateBuf) {
             RC_DIAG("malloc stateBuf for 0x301 park failed");
             fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
@@ -2201,12 +2205,24 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         }
         sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
         remote_write(stateBuf, &park, sizeof(park));
+
+        uint16_t options = 0;
+        if (g_RC_callThreadAddr) {
+            options = thread_get_options(g_RC_callThreadAddr);
+            thread_set_options(g_RC_callThreadAddr, (uint16_t)(options | TH_IN_MACH_EXCEPTION));
+        }
+
         uint64_t setKr = do_remote_call_temp(100, "thread_set_state",
                                              callThreadPort,
                                              ARM_THREAD_STATE64,
                                              stateBuf,
                                              ARM_THREAD_STATE64_COUNT,
                                              0, 0, 0, 0);
+
+        if (g_RC_callThreadAddr) {
+            thread_set_options(g_RC_callThreadAddr, options);
+        }
+
         RC_DIAG("park synthetic 0x301 via thread_set_state kr=%llu pac301=0x%llx",
                 (unsigned long long)setKr, (unsigned long long)remoteCrashSigned);
         do_remote_call_temp(100, "free", stateBuf, 0, 0, 0, 0, 0, 0, 0);
