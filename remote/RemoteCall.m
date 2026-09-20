@@ -1840,35 +1840,46 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
         clear_remote_shmem_cache();
         uint64_t pthreadAddr = remote_read64(heapOut);
-        RC_DIAG("post-pthread heapOut=0x%llx pthreadAddr=0x%llx",
-                (unsigned long long)heapOut, (unsigned long long)pthreadAddr);
+        // Cross-check via SB memcpy (756f983) — KRW can miss a live SB store.
+        do_remote_call_temp(100, "memcpy", heapOut, heapOut, 8, 0, 0, 0, 0, 0);
+        clear_remote_shmem_cache();
+        uint64_t pthreadAddrSB = remote_read64(heapOut);
+        RC_DIAG("post-pthread heapOut=0x%llx krw=0x%llx sb=0x%llx",
+                (unsigned long long)heapOut,
+                (unsigned long long)pthreadAddr,
+                (unsigned long long)pthreadAddrSB);
+        if (pthreadAddrSB && pthreadAddrSB != kCanary)
+            pthreadAddr = pthreadAddrSB;
         do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
 
-        if (!pthreadAddr || pthreadAddr == kCanary) {
-            RC_DIAG("heapOut still CANARY/0 after suspended_np — create did not store");
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
+        if (pthreadAddr && pthreadAddr != kCanary) {
+            (void)remoteCrashSigned;
+            callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
+            RC_DEBUG("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
+            if (!g_RC_success || !callThreadPort) {
+                RC_DIAG("pthread_mach_thread_np failed success=%d port=0x%llx",
+                        (int)g_RC_success, (unsigned long long)callThreadPort);
+                fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+                return -1;
+            }
+            g_RC_callThreadAddr = task_get_ipc_port_kobject(g_RC_taskAddr, (mach_port_t)callThreadPort);
+            if (!is_kaddr_valid(g_RC_callThreadAddr)) {
+                RC_DIAG("synthetic thread kobject invalid port=0x%llx addr=0x%llx",
+                        (unsigned long long)callThreadPort, (unsigned long long)g_RC_callThreadAddr);
+                fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+                return -1;
+            }
+            createdSuspended = true;
+        } else {
+            // ret=0 but *out still canary on 17.5.1 SB (log x4). Same as iOS26
+            // stub shape — do NOT hard-fail; reuse inject thread[1] (always present).
+            RC_DIAG("suspended_np ret=0 but out CANARY/0 — falling through to thread[1] reuse");
         }
-
-        (void)remoteCrashSigned;
-        callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
-        RC_DEBUG("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
-        if (!g_RC_success || !callThreadPort) {
-            RC_DIAG("pthread_mach_thread_np failed success=%d port=0x%llx",
-                    (int)g_RC_success, (unsigned long long)callThreadPort);
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
-        }
-        g_RC_callThreadAddr = task_get_ipc_port_kobject(g_RC_taskAddr, (mach_port_t)callThreadPort);
-        if (!is_kaddr_valid(g_RC_callThreadAddr)) {
-            RC_DIAG("synthetic thread kobject invalid port=0x%llx addr=0x%llx",
-                    (unsigned long long)callThreadPort, (unsigned long long)g_RC_callThreadAddr);
-            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
-            return -1;
-        }
-        createdSuspended = true;
     } else {
         RC_DIAG("iOS26+ pthread stubs — skipping create+sleep; trying thread[1] reuse");
+    }
+
+    if (!callThreadPort) {
         if (g_RC_threadList.count >= 2) {
             uint64_t thread2Addr = g_RC_threadList[1].unsignedLongLongValue;
             if (is_kaddr_valid(thread2Addr)) {
@@ -1886,7 +1897,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             g_RC_pid = (int)targetPid;
             return 0;
         }
-        // Reused live thread may be running — suspend before set_state.
+        // Reused live inject thread — suspend before set_state/park.
         uint64_t suspendRet = do_remote_call_temp(100, "thread_suspend", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
         RC_DIAG("thread_suspend reused port=0x%llx ret=%llu",
                 (unsigned long long)callThreadPort, (unsigned long long)suspendRet);
