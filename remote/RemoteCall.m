@@ -1153,11 +1153,17 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
 
     ExceptionMessage exc;
+    RC_DIAG("stable/%s wait1 begin timeout=%d", name ?: "(addr-call)", newTimeout);
     if (!wait_exception(g_RC_secondExceptionPort, &exc, newTimeout, false)) {
+        RC_DIAG("stable/%s wait1 TIMEOUT (new thread didn't hit 0x301 park?)", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive first exception on new thread\n", __FUNCTION__, __LINE__);
         g_RC_success = false;
         return 0;
     }
+    RC_DIAG("stable/%s wait1 caught PC=0x%llx LR=0x%llx (expect 0x301)",
+            name ?: "(addr-call)",
+            (unsigned long long)native_strip(exc.threadState.__pc),
+            (unsigned long long)native_strip(exc.threadState.__lr));
 
     exc.threadState.__x[0] = x0;
     exc.threadState.__x[1] = x1;
@@ -1179,7 +1185,9 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     }
 
     ExceptionMessage exc2;
+    RC_DIAG("stable/%s wait2 begin", name ?: "(addr-call)");
     if (!wait_exception(g_RC_secondExceptionPort, &exc2, newTimeout, false)) {
+        RC_DIAG("stable/%s wait2 TIMEOUT", name ?: "(addr-call)");
         printf("[%s:%d] Don't receive second exception on new thread (name=%s) — repark\n",
                __FUNCTION__, __LINE__, name ?: "(addr-call)");
         // Best-effort: thread may be wedged at FAKE_LR. Mark failed; caller must
@@ -1188,6 +1196,11 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
         return 0;
     }
     uint64_t retValue = exc2.threadState.__x[0];
+    RC_DIAG("stable/%s wait2 caught PC=0x%llx LR=0x%llx ret=0x%llx",
+            name ?: "(addr-call)",
+            (unsigned long long)native_strip(exc2.threadState.__pc),
+            (unsigned long long)native_strip(exc2.threadState.__lr),
+            (unsigned long long)retValue);
     // Re-park: reply keeps thread blocked in exception until next hijack.
     reply_with_state(&exc2, &exc2.threadState);
     if (remote_call_should_log_result(name, true))
@@ -1200,15 +1213,23 @@ bool restore_trojan_thread(arm_thread_state64_internal *state)
     ExceptionMessage exc;
     int restoreTimeoutMS = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 20000;
     if (restoreTimeoutMS < 1000) restoreTimeoutMS = 1000;
+    RC_DIAG("restore_trojan_thread waiting firstExceptionPort timeout=%dms", restoreTimeoutMS);
     if (!wait_exception(g_RC_firstExceptionPort, &exc, restoreTimeoutMS, false)) {
+        RC_DIAG("restore_trojan_thread wait TIMEOUT %dms", restoreTimeoutMS);
         printf("[%s:%d] Failed to receive exception while restoring within %dms\n",
                __FUNCTION__, __LINE__, restoreTimeoutMS);
         return false;
     }
 
+    RC_DIAG("restore_trojan_thread caught excPC=0x%llx excLR=0x%llx — restoring original PC=0x%llx LR=0x%llx",
+            (unsigned long long)native_strip(exc.threadState.__pc),
+            (unsigned long long)native_strip(exc.threadState.__lr),
+            (unsigned long long)native_strip(state->__pc),
+            (unsigned long long)native_strip(state->__lr));
     state->__flags = exc.threadState.__flags;
     sign_state(g_RC_trojanThreadAddr, state, state->__pc, state->__lr);
     reply_with_state(&exc, state);
+    RC_DIAG("restore_trojan_thread reply sent — original thread resumed");
     return true;
 }
 
@@ -2265,7 +2286,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     }
     (void)parkedViaGuard;
 
-    RC_DEBUG("[%s:%d] New thread created, resuming original\n", __FUNCTION__, __LINE__);
+    RC_DIAG("Calling restore_trojan_thread...");
     if (!restore_trojan_thread(&g_RC_originalState)) {
         RC_DIAG("restore original after pthread bootstrap failed");
         // Extra thread is live; still tear down cleanly via destroy path later.
@@ -2273,14 +2294,16 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         fail_after_creator_park(RemoteCallInitFailureRestoreOriginal, targetPid);
         return -1;
     }
-    RC_DEBUG("[%s:%d] Original thread restored\n", __FUNCTION__, __LINE__);
+    RC_DIAG("Original thread restored, calling first stable getpid...");
 
     g_RC_pid = (int)do_remote_call_stable(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
-    printf("[RemoteCall] Synthetic call thread live inside %s (pid=%d).\n", process, g_RC_pid);
+    RC_DIAG("first stable getpid result pid=%d", g_RC_pid);
 
     g_RC_trojanMem = do_remote_call_stable(1000, "mmap", 0, PAGE_SIZE, VM_PROT_READ | VM_PROT_WRITE, MAP_PRIVATE | MAP_ANON, (uint64_t)-1, 0, 0, 0);
+    RC_DIAG("stable mmap result=0x%llx", (unsigned long long)g_RC_trojanMem);
 
     do_remote_call_stable(100, "memset", g_RC_trojanMem, 0, PAGE_SIZE, 0, 0, 0, 0, 0);
+    RC_DIAG("stable memset done");
 
     g_RC_success = true;
     RC_DEBUG("[%s:%d] Finished successfully\n", __FUNCTION__, __LINE__);
