@@ -1039,6 +1039,18 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
             (unsigned long long)native_strip(exc.threadState.__pc),
             (unsigned long long)native_strip(exc.threadState.__lr));
 
+    // Never reply onto a state that isn't a live faulted thread. Replying with
+    // a real function pointer + FAKE_LR onto a bogus state resumes a thread
+    // with sp=0 and gets the *target process* SIGKILLed
+    // (SpringBoard IPS 2026-09-26 06:21:04, CODESIGNING "Invalid Page").
+    if (!exception_state_is_sane(&exc)) {
+        RC_DIAG("temp/%s wait1 REJECT non-live state (sp=0x%llx) — not replying",
+                name ?: "?",
+                (unsigned long long)native_strip(exc.threadState.__sp));
+        g_RC_success = false;
+        return 0;
+    }
+
     exc.threadState.__x[0] = x0;
     exc.threadState.__x[1] = x1;
     exc.threadState.__x[2] = x2;
@@ -1164,6 +1176,19 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
             name ?: "(addr-call)",
             (unsigned long long)native_strip(exc.threadState.__pc),
             (unsigned long long)native_strip(exc.threadState.__lr));
+
+    // This is the guard that saved SpringBoard on 2026-09-26: the port handed us
+    // an all-zero state, and we used to sign pc=<real fn>/lr=0x401 onto it and
+    // reply. getpid then ran (leaf, no stack needed) and RET 0x401 aborted the
+    // process with SIGKILL / CODESIGNING "Invalid Page". A zeroed state is never
+    // the parked 0x301 thread — drop the session instead of replying.
+    if (!exception_state_is_sane(&exc)) {
+        RC_DIAG("stable/%s wait1 REJECT non-live state (sp=0x%llx) — not replying",
+                name ?: "(addr-call)",
+                (unsigned long long)native_strip(exc.threadState.__sp));
+        g_RC_success = false;
+        return 0;
+    }
 
     exc.threadState.__x[0] = x0;
     exc.threadState.__x[1] = x1;
@@ -2227,6 +2252,38 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
         remote_write(stateBuf, &park, sizeof(park));
 
+        // Verify the park bytes actually reached SpringBoard's heap. The log at
+        // 2026-09-26 06:19:13 showed thread_set_state return kr=0 yet the resumed
+        // thread never trapped at 0x301 (next call saw a zeroed state), which
+        // means the kernel read a buffer that did not hold our signed 0x301.
+        // remote_read is known-poisoned on this path, so let SpringBoard compare
+        // its OWN memory: write a second copy and remote-memcmp it.
+        uint64_t expectBuf = do_remote_call_temp(100, "malloc",
+                                                 sizeof(arm_thread_state64_internal),
+                                                 0, 0, 0, 0, 0, 0, 0);
+        expectBuf = native_strip(expectBuf);
+        if (!g_RC_success || !expectBuf) {
+            RC_DIAG("park verify: expectBuf malloc failed — skipping check");
+        } else {
+            remote_write(expectBuf, &park, sizeof(park));
+            clear_remote_shmem_cache();
+            uint64_t diff = do_remote_call_temp(100, "memcmp",
+                                                stateBuf, expectBuf,
+                                                sizeof(arm_thread_state64_internal),
+                                                0, 0, 0, 0, 0);
+            if (!g_RC_success || diff != 0) {
+                RC_DIAG("park verify FAILED: remote_write did not land (sb memcmp diff=%llu) "
+                        "— refusing to resume synthetic thread",
+                        (unsigned long long)diff);
+                do_remote_call_temp(100, "free", expectBuf, 0, 0, 0, 0, 0, 0, 0);
+                do_remote_call_temp(100, "free", stateBuf, 0, 0, 0, 0, 0, 0, 0);
+                fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+                return -1;
+            }
+            RC_DIAG("park verify OK: signed 0x301/0x401 confirmed in SB heap");
+            do_remote_call_temp(100, "free", expectBuf, 0, 0, 0, 0, 0, 0, 0);
+        }
+
         uint16_t options = 0;
         if (g_RC_callThreadAddr) {
             options = thread_get_options(g_RC_callThreadAddr);
@@ -2298,6 +2355,18 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     g_RC_pid = (int)do_remote_call_stable(100, "getpid", 0, 0, 0, 0, 0, 0, 0, 0);
     RC_DIAG("first stable getpid result pid=%d", g_RC_pid);
+
+    // The stable call is the first proof that the synthetic thread is really
+    // parked at 0x301 and answers on secondExceptionPort. If it did not, the
+    // session is unusable — bail instead of falling through to the unconditional
+    // `g_RC_success = true` at the end, which used to hand callers a live-looking
+    // but broken session (every later objc_msgSend then went nowhere).
+    if (!g_RC_success || !g_RC_pid) {
+        RC_DIAG("first stable getpid failed (success=%d) — tearing down session",
+                (int)g_RC_success);
+        fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
+        return -1;
+    }
 
     g_RC_trojanMem = do_remote_call_stable(1000, "mmap", 0, PAGE_SIZE, VM_PROT_READ | VM_PROT_WRITE, MAP_PRIVATE | MAP_ANON, (uint64_t)-1, 0, 0, 0);
     RC_DIAG("stable mmap result=0x%llx", (unsigned long long)g_RC_trojanMem);

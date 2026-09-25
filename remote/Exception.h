@@ -35,3 +35,10 @@ mach_port_t create_exception_port(void);
 void destroy_exception_port(mach_port_t exceptionPort);
 bool wait_exception(mach_port_t exceptionPort, ExceptionMessage *excBuffer, int timeout, bool debug);
 void reply_with_state(ExceptionMessage *exc, arm_thread_state64_internal *state);
+
+// Reject an exception message that cannot be a live faulted thread.
+// SpringBoard IPS 2026-09-26 06:21:04 (SIGKILL / CODESIGNING "Invalid Page"):
+//   faultingThread pc=__getpid  lr=0x401 (FAKE_LR_TROJAN)  sp=0  x[0..28]=0
+// wait_exception() accepted ANY message on the port, so a zeroed state was
+// replied to as if it were the parked call thread. Do not reply without this.
+bool exception_state_is_sane(ExceptionMessage *exc);

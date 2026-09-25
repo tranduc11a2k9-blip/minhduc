@@ -8,8 +8,10 @@
 #import "../../kexploit/kexploit_opa334.h"
 #import "Exception.h"
 #import "RemoteCall.h"
+#import "PAC.h"
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
+#import <stddef.h>
 
 // xnu-10002.81.5/osfmk/mach/port.h
 #define MPO_PROVISIONAL_ID_PROT_OPTOUT     0x8000  /* Opted out of EXCEPTION_IDENTITY_PROTECTED violation for now */
@@ -64,6 +66,34 @@ bool wait_exception(mach_port_t exceptionPort, ExceptionMessage *excBuffer, int 
     kern_return_t kr = mach_msg(&excBuffer->Head, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, EXCEPTION_MSG_SIZE, exceptionPort, timeout, MACH_PORT_NULL);
     
     if(kr != KERN_SUCCESS)  return false;
+
+    return true;
+}
+
+bool exception_state_is_sane(ExceptionMessage *exc)
+{
+    if (!exc)
+        return false;
+
+    // A real ARM_THREAD_STATE64 exception_message always carries threadState
+    // in full; anything shorter is a different message entirely.
+    if (exc->Head.msgh_size <
+        (mach_msg_size_t)(offsetof(ExceptionMessage, threadState) +
+                          sizeof(arm_thread_state64_internal)))
+        return false;
+
+    if (exc->flavor != ARM_THREAD_STATE64)
+        return false;
+
+    // A faulted thread always has a non-zero PC and a mapped user SP. The
+    // SpringBoard kill above came from replying onto a state that had
+    // pc=0/sp=0: getpid is a leaf so it ran, then RET 0x401 aborted.
+    uint64_t pc = native_strip(exc->threadState.__pc);
+    uint64_t sp = native_strip(exc->threadState.__sp);
+    if (pc == 0 || pc < 0x1000ULL)
+        return false;
+    if (sp < 0x100000000ULL)
+        return false;
 
     return true;
 }
