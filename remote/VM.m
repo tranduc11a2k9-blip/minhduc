@@ -394,7 +394,20 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     //          bound check is coming from a different writer entirely.
     // Exclusive: concurrent writes raced XNU's non-sleepable RW lock -> panic
     // "Taking non-sleepable RW lock with preemption enabled".
-    pthread_mutex_lock(&g_vmRemapLock);
+    //
+    // The lock is NOT taken here. vm_create_shmem_with_object() takes
+    // g_vmRemapLock before calling us, and g_vmRemapLock is a plain
+    // PTHREAD_MUTEX_INITIALIZER, i.e. NOT recursive, so a second lock in this
+    // body self-deadlocks the calling thread on the very first remap. Those two
+    // lines shipped in 9b540f48. Device evidence, 2026-09-26 11:14, app pid 626:
+    //   thread 15763 main,    GameTargetModuleBase -> ds_attach
+    //                               -> vm_map_remote_page -> here
+    //   thread 15769 utility,  SBoardStartOverlay -> init_remote_call -> remote_read
+    //                               -> get_shmem_for_page -> vm_map_remote_page -> here
+    // both parked in __psynch_mutexwait on mutex 0x102514280, and the stackshot
+    // reports it "owned by thread 15763" -- the recursive-lock signature. Because
+    // this lock is the first thing on the path, the DIAG below never ran and the
+    // whole remap primitive was untested on every build up to 9b540f48.
 
     // Read-modify-write of the single in-bounds block [0x20, 0x40). Everything
     // outside vme_object_or_delta in that block is preserved byte for byte.
@@ -415,7 +428,8 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
               check == newOD ? @"MATCH" : @"MISMATCH");
     }
 
-    pthread_mutex_unlock(&g_vmRemapLock);
+    // No unlock here: g_vmRemapLock is owned by vm_create_shmem_with_object(),
+    // which releases it once we return.
 
     // vme_offset deliberately NOT written. pageObjectOffset stays logged by the
     // DIAG above so the next run tells us whether it is non-zero, instead of
