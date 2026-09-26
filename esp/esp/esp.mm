@@ -2774,7 +2774,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 //                            the matrix is frozen, the drawing is innocent.
 // Bump this every commit that changes measurement, so a device log identifies
 // its own build. Absence of this token = the IPA on the device is older.
-#define ESP_DIAG_BUILD "PUSH1"
+#define ESP_DIAG_BUILD "PUSH2"
 
 static int g_hbLastReal = -1;
 static int g_hbLastBot  = -1;
@@ -2816,7 +2816,12 @@ static void ESPDiagHeartbeat(void) {
 
     DSPageCacheDiag cd = ds_page_cache_diag();
 
-    NSLog(@"[HB] %@ base=0x%llx pid=%d at=%d ti=0x%llx st=0x%llx mg=0x%llx cam=0x%llx "
+    // %s, NOT %@. ESP_DIAG_BUILD is a C string literal, and %@ makes os_log send
+    // -objcDescription to it: it dereferences the literal's own bytes ("PUSH1\0")
+    // as an isa, follows the garbage, and SIGSEGVs on the main queue.
+    // That is the crash in incident 5793D039 (run #198, ddbc6a16), whose stack is
+    // NSLog -> ESPDiagHeartbeat -> dispatch block. Fixed here only; no other change.
+    NSLog(@"[HB] %s base=0x%llx pid=%d at=%d ti=0x%llx st=0x%llx mg=0x%llx cam=0x%llx "
           @"mt=0x%llx pawn=0x%llx hp=%d real=%d bot=%d "
           @"cache{g=%llu,live=%d,stale=%d} "
           @"VP{ok=%d m0=%.4f m3=%.4f m12=%.4f m15=%.4f}",
