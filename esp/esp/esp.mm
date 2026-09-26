@@ -2774,7 +2774,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 //                            the matrix is frozen, the drawing is innocent.
 // Bump this every commit that changes measurement, so a device log identifies
 // its own build. Absence of this token = the IPA on the device is older.
-#define ESP_DIAG_BUILD "PUSH2"
+#define ESP_DIAG_BUILD "FLUSH1"
 
 static int g_hbLastReal = -1;
 static int g_hbLastBot  = -1;
@@ -3380,6 +3380,25 @@ static void ESPDiagHeartbeat(void) {
         static uint64_t s_lastMatchDiag = 0;
         if (match != s_lastMatchDiag) {
             if (s_lastMatchDiag != 0) {
+                // TEST: a page slot pins one shmem mapping made by the kernel
+                // remap. ds_page_local (DSMemory.m:430) re-serves that slot on a
+                // bare VA match, forever, with no re-validation and no age. When
+                // Unity reuses the physical page the slot points at, every
+                // subsequent read of that VA is a frozen snapshot. Device log
+                // 19:31:46-19:32:04 shows exactly that: world=(64.30,12.76,22.90)
+                // byte-identical for 18s while VP m0 swings 0.78 -> -0.12, and
+                // real=11->14 / hp=200->50->200 prove the game was live.
+                //
+                // Releasing the slots drops the shmem ports, so the next read
+                // re-maps and reads fresh. Once per match only: the code comment
+                // at DSMemory.m:410 records that a full per-frame flush caused
+                // RW-lock panics, and this is deliberately not that.
+                DSPageCacheDiag before = ds_page_cache_diag();
+                ds_flush_page_cache();
+                DSPageCacheDiag after = ds_page_cache_diag();
+                NSLog(@"[FLUSH] match 0x%llx->0x%llx dropped live=%d stale=%d now live=%d",
+                      (unsigned long long)s_lastMatchDiag, (unsigned long long)match,
+                      before.liveSlots, before.staleGen, after.liveSlots);
                 ds_cache_bump_generation();
             }
             s_lastMatchDiag = match;
