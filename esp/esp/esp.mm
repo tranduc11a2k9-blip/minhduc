@@ -3280,6 +3280,30 @@ static std::atomic<bool> g_brutalHasAddrs{false};
               (unsigned long long)matchGame, (unsigned long long)match, (unsigned long long)camera);
     }
 
+    // A new match tears the game's address space down and rebuilds it. Every
+    // page mapping we hold aliases a vm_object the game has already freed, and
+    // nothing else invalidates them (ds_detach only runs on a pid change). The
+    // symptom of holding those is ESP frozen on screen: the boxes are the same
+    // pixels every frame because the data behind them is the same freed memory.
+    // Report it rather than guess: staleGen > 0 means the cache crossed a match.
+    {
+        static uint64_t s_lastMatchDiag = 0;
+        if (match != s_lastMatchDiag) {
+            if (s_lastMatchDiag != 0) {
+                ds_cache_bump_generation();
+            }
+            s_lastMatchDiag = match;
+        }
+        static CFTimeInterval s_cacheLog = 0;
+        CFTimeInterval nowC = CACurrentMediaTime();
+        if (nowC - s_cacheLog > 5.0) {
+            s_cacheLog = nowC;
+            DSPageCacheDiag cd = ds_page_cache_diag();
+            NSLog(@"[DS] DIAG cache gen=%llu live=%d staleGen=%d",
+                  (unsigned long long)cd.generation, cd.liveSlots, cd.staleGen);
+        }
+    }
+
     uint64_t myPawnObject = getLocalPlayer(match);
 
     int curHp = isVaildPtr(myPawnObject) ? get_CurHP(myPawnObject) : 0;
@@ -3414,6 +3438,21 @@ static std::atomic<bool> g_brutalHasAddrs{false};
                 NSLog(@"[DIAG] pawn=%llu alive=%d camPC=%d val=%.0f followCam=%llu valid=%d",
                       (unsigned long long)myPawnObject, (int)(isVaildPtr(myPawnObject) && get_CurHP(myPawnObject) > 0),
                       (int)isCamPC, camPCValue, (unsigned long long)fc, (int)isVaildPtr(fc));
+
+                // Is the view matrix actually LIVE? Print the first row and the
+                // two rows W2S divides by. If these are byte-identical across
+                // samples while the camera moves, the matrix is frozen and the
+                // projection -- not the drawing -- is what is stuck.
+                {
+                    float m[16];
+                    if (GetViewMatrixInto(camera, m)) {
+                        NSLog(@"[DIAG] VP m0=%.4f m1=%.4f m2=%.4f m3=%.4f m12=%.4f m15=%.4f",
+                              m[0], m[1], m[2], m[3], m[12], m[15]);
+                    } else {
+                        NSLog(@"[DIAG] VP FAILED for camera=0x%llx",
+                              (unsigned long long)camera);
+                    }
+                }
                 kernel_boot_log_fn logFn = kernelBootLog;
                 if (logFn) {
                     NSString *line = [NSString stringWithFormat:

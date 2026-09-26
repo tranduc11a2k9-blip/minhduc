@@ -334,8 +334,11 @@ static struct {
     uint64_t localAddr;
     uint64_t port;     // memory_entry — MUST mach_port_deallocate on eviction
     uint64_t lastUse;  // Fl0rk lastUse clock
+    uint64_t gen;      // match generation this mapping was taken under
     uint32_t useCount;
 } g_pageCache[DS_PAGE_CACHE_SLOTS];
+// Bumped on every match change by the ESP layer; see ds_cache_bump_generation.
+static uint64_t g_cacheGeneration = 1;
 static int g_recentPageSlots[DS_RECENT_SLOTS];
 static int g_recentCount = 0;
 static uint64_t g_pageUseCounter = 1;
@@ -480,6 +483,7 @@ static uint64_t ds_page_local(uint64_t pageVA) {
     g_pageCache[victim].pageVA = pageVA;
     g_pageCache[victim].localAddr = page.localAddress;
     g_pageCache[victim].port = page.port;
+    g_pageCache[victim].gen = g_cacheGeneration;
     g_pageCache[victim].useCount = 1;
     g_pageCache[victim].lastUse = g_pageUseCounter++;
     ds_note_recent_locked(victim);
@@ -553,6 +557,49 @@ void ds_detach(void) {
     g_ff_map = 0;
     g_ff_pid = 0;
     g_cached_entry = 0;
+}
+
+
+void ds_flush_page_cache(void) {
+    ds_lock();
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        ds_release_page_slot_locked(i);
+    }
+    g_pageCacheNext = 0;
+    g_recentCount = 0;
+    g_pageUseCounter++;
+    ds_unlock();
+    // The single-entry cache holds a raw vm_map_entry pointer. After the map is
+    // rebuilt that entry is freed, and the [start,end) range it cached will
+    // still be hit by ds_translate_page() on the new map -- serving a dangling
+    // object pointer. It has to go too, and it is touched outside ds_lock().
+    g_cached_entry = 0;
+    g_cached_start = 0;
+    g_cached_end = 0;
+    g_cached_object = 0;
+    g_cached_obj_offset = 0;
+}
+
+// Bumped by the ESP layer the moment the match pointer changes. A new match
+// means the game tore down and rebuilt its address space, so every mapping
+// taken before that point is pointing at memory the game has already freed.
+void ds_cache_bump_generation(void) {
+    ds_lock();
+    g_cacheGeneration++;
+    ds_unlock();
+}
+
+DSPageCacheDiag ds_page_cache_diag(void) {
+    DSPageCacheDiag d = {0, 0, 0};
+    ds_lock();
+    for (int i = 0; i < DS_PAGE_CACHE_SLOTS; i++) {
+        if (!g_pageCache[i].localAddr) continue;
+        d.liveSlots++;
+        if (g_pageCache[i].gen < g_cacheGeneration) d.staleGen++;
+    }
+    d.generation = g_cacheGeneration;
+    ds_unlock();
+    return d;
 }
 
 bool ds_attached(void) { return K(g_ff_task); }

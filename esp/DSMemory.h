@@ -62,6 +62,25 @@ bool     ds_write(uint64_t va, const void *buf, size_t len);
 void ds_begin_read_transaction(void);
 void ds_end_read_transaction(void);
 
+// The target's address space is rebuilt when a match starts: the game frees and
+// reallocates its vm_objects, but our cached mappings still alias the pages
+// captured at map time, so they keep returning the memory that was just freed.
+// ds_detach() only runs on a pid change, so nothing else invalidates them.
+// Bumping the generation lets the cache be dropped on exactly that boundary.
+void ds_cache_bump_generation(void);
+void ds_flush_page_cache(void);
+
+// Diagnostic, throttled by the caller. staleGen is the number of live slots
+// mapped BEFORE the current generation, i.e. mappings that survived a match
+// transition and are therefore suspect.
+typedef struct {
+    int liveSlots;
+    int staleGen;
+    uint64_t generation;
+} DSPageCacheDiag;
+DSPageCacheDiag ds_page_cache_diag(void);
+
+
 #ifdef __cplusplus
 }
 #endif
