@@ -3379,25 +3379,29 @@ static void ESPDiagHeartbeat(void) {
     {
         static uint64_t s_lastMatchDiag = 0;
         if (match != s_lastMatchDiag) {
-            if (s_lastMatchDiag != 0) {
-                // TEST: a page slot pins one shmem mapping made by the kernel
-                // remap. ds_page_local (DSMemory.m:430) re-serves that slot on a
-                // bare VA match, forever, with no re-validation and no age. When
-                // Unity reuses the physical page the slot points at, every
-                // subsequent read of that VA is a frozen snapshot. Device log
-                // 19:31:46-19:32:04 shows exactly that: world=(64.30,12.76,22.90)
-                // byte-identical for 18s while VP m0 swings 0.78 -> -0.12, and
-                // real=11->14 / hp=200->50->200 prove the game was live.
-                //
-                // Releasing the slots drops the shmem ports, so the next read
-                // re-maps and reads fresh. Once per match only: the code comment
-                // at DSMemory.m:410 records that a full per-frame flush caused
-                // RW-lock panics, and this is deliberately not that.
+            // Fire on the FIRST valid match of this attach, not only on a
+            // change. The previous attempt hung the flush off `match` changing
+            // and the 19:51 log proved it never fires: mt=0x13d66e800 was
+            // constant for the whole window, so zero [FLUSH] lines. Entering a
+            // match is exactly when the lobby's pages go stale, and right after
+            // it Unity rebuilds the address space, so this is the moment worth
+            // dropping every slot.
+            bool firstMatch = (s_lastMatchDiag == 0 && match != 0);
+            if (s_lastMatchDiag != 0 || firstMatch) {
+                // A page slot pins one shmem mapping made by the kernel remap.
+                // ds_page_local (DSMemory.m:430) re-serves that slot on a bare
+                // VA match, with no re-validation and no age. Once Unity reuses
+                // the physical page, every later read of that VA is a frozen
+                // snapshot. Releasing slots drops the shmem ports so the next
+                // read re-maps. Once per match only, never per frame: the
+                // comment at DSMemory.m:410 records that a full per-frame flush
+                // caused RW-lock panics, and this is deliberately not that.
                 DSPageCacheDiag before = ds_page_cache_diag();
                 ds_flush_page_cache();
                 DSPageCacheDiag after = ds_page_cache_diag();
-                NSLog(@"[FLUSH] match 0x%llx->0x%llx dropped live=%d stale=%d now live=%d",
-                      (unsigned long long)s_lastMatchDiag, (unsigned long long)match,
+                NSLog(@"[PUSH-FLUSH] first=%d 0x%llx->0x%llx dropped live=%d stale=%d now live=%d",
+                      (int)firstMatch, (unsigned long long)s_lastMatchDiag,
+                      (unsigned long long)match,
                       before.liveSlots, before.staleGen, after.liveSlots);
                 ds_cache_bump_generation();
             }
