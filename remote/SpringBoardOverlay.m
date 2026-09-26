@@ -36,6 +36,7 @@ static uint64_t g_sbCanvas = 0;
 static uint64_t g_sbPersistentPath = 0;
 static uint64_t g_sbMirrorPtsBuf = 0;
 static uint32_t g_sbPathHash = 0;
+static NSUInteger g_sbLastPathBytes = 0;
 static pthread_mutex_t g_sbLock = PTHREAD_MUTEX_INITIALIZER;
 
 // Fl0rk: gDrawViewGeometryPathInvocation + invoke_cached_main_raw
@@ -48,6 +49,9 @@ static uint64_t g_sbSummaryAttempts = 0;
 static uint64_t g_sbSummarySkips = 0;
 static uint64_t g_sbSummaryUpdates = 0;
 static uint64_t g_sbNextPublishUS = 0;
+// Last publish cost, so the log says what the subpath fix actually costs.
+static uint32_t g_sbLastSubpaths = 0;
+static uint64_t g_sbLastCalls = 0;
 
 static const char *kShapeKeys[16] = {
     "boxLayer", "boxBotLayer", "boxKnockedLayer",
@@ -71,9 +75,16 @@ static uint64_t now_us(void) {
 }
 
 typedef struct { NSMutableData *data; } SerCtx;
+static uint32_t g_sbSubpathCount = 0;
+
+// op stream: 1 = moveTo (starts a NEW subpath), 2 = lineTo, 3 = subpath break
+// marker. The break marker is redundant with moveTo mathematically, but it lets
+// the SpringBoard side rebuild subpaths exactly instead of collapsing everything
+// into one polyline (see the decode loop in SBRemotePushESPFrame).
 static void serFunc(void *info, const CGPathElement *e) {
     SerCtx *ctx = (SerCtx *)info;
     if (e->type == kCGPathElementCloseSubpath) return;
+    if (e->type == kCGPathElementMoveToPoint) g_sbSubpathCount++;
     uint8_t op = (e->type == kCGPathElementMoveToPoint) ? 1 : 2;
     [ctx->data appendBytes:&op length:1];
     if (e->type == kCGPathElementMoveToPoint || e->type == kCGPathElementAddLineToPoint) {
@@ -97,6 +108,7 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     }
     if (CGPathIsEmpty(merged)) { CGPathRelease(merged); return NO; }
     SerCtx ctx = { .data = d };
+    g_sbSubpathCount = 0;
     CGPathApply(merged, &ctx, serFunc);
     CGPathRelease(merged);
 
@@ -104,8 +116,17 @@ static BOOL mergePaths(UIView *espView, NSMutableData *d) {
     for (NSUInteger i = 0; i < d.length; i++) {
         h ^= ((const uint8_t *)d.bytes)[i]; h *= 16777619u;
     }
-    if (h == g_sbPathHash) return NO;
+    // Skip only if the geometry is genuinely unchanged. The old code compared a
+    // single 32-bit hash for the whole frame, so any collision, or any frame
+    // whose bytes happened to match, was dropped entirely: SpringBoard never
+    // re-rendered and the screen kept showing the previous path. That is the
+    // "ESP is static" symptom, and it is independent of the subpath bug below.
+    // Require both the hash and the length to match, and keep re-publishing
+    // rather than suppressing, because a stale draw is worse than a redundant
+    // one.
+    if (h == g_sbPathHash && d.length == g_sbLastPathBytes) return NO;
     g_sbPathHash = h;
+    g_sbLastPathBytes = d.length;
     return YES;
 }
 
@@ -124,6 +145,9 @@ static void sb_forget_local_paint_state(void) {
     g_sbPersistentPath = 0;
     g_sbMirrorPtsBuf = 0;
     g_sbPathHash = 0;
+    g_sbLastPathBytes = 0;
+    g_sbLastSubpaths = 0;
+    g_sbLastCalls = 0;
     g_sbNextPublishUS = 0;
 }
 
@@ -396,38 +420,65 @@ void SBRemotePushESPFrame(UIView *espView) {
             size_t len = frameBytes.length;
             const uint8_t *b = (const uint8_t *)frameBytes.bytes;
 
-            double pts[4096];
-            int n = 0;
-            double lastX = 0, lastY = 0;
-            BOOL haveLast = NO;
-            BOOL havePrevEnd = NO;
+            // Draw each subpath separately. CGPathAddLines draws ONE polyline and
+            // joins p[i]->p[i+1] unconditionally, so feeding it every point of
+            // every shape draws a long bogus segment from the end of one box to
+            // the start of the next. That is the garbled geometry: the device log
+            // shows n=720 (360 points) landing in a single polyline, and the
+            // screenshot shows the resulting chords across the screen. The FOV
+            // circle survives because it is one closed subpath with nothing to
+            // join to.
+            //
+            // Cost is now 2 remote calls per subpath instead of 1 per frame, so
+            // the subpath count is logged. If it is large we must batch or cap;
+            // that is a separate decision, not a guess.
+            uint32_t subpaths = 0;
+            uint64_t calls = 0;
+            uint32_t drawn = 0;
+
+            dlsym_remote("CGPathClear", rp, 0,0,0,0,0,0,0);
+            calls++;
+
             size_t i = 0;
-            while (i < len && n < 4090) {
-                uint8_t op = b[i++];
-                if (i + 16 > len) break;
-                double x, y; memcpy(&x, b+i, 8); memcpy(&y, b+i+8, 8); i += 16;
-                if (op == 1) {
-                    if (n > 0 && havePrevEnd) {
-                        pts[n++] = lastX; pts[n++] = lastY;
+            while (i < len) {
+                double run[1024];
+                int rn = 0;
+                while (i < len) {
+                    uint8_t op = b[i++];
+                    if (i + 16 > len) { i = len; break; }
+                    double x, y; memcpy(&x, b+i, 8); memcpy(&y, b+i+8, 8); i += 16;
+                    if (op == 1) {
+                        if (rn > 0) break;      // next subpath starts
+                        run[rn++] = x; run[rn++] = y;
+                        continue;
                     }
-                    lastX = x; lastY = y; haveLast = YES;
+                    run[rn++] = x; run[rn++] = y;
+                    if (rn >= 1024) break;
+                }
+                if (rn < 2) continue;          // subpath too short to draw
+                subpaths++; drawn++;
+
+                remote_write(ptsBuf, run, (size_t)rn * 8);
+                calls++;
+                if (rn == 2) {
+                    // A one-point CGPathAddLines draws nothing, so a lone
+                    // segment would be invisible. Emit it as moveTo + a
+                    // two-point addLines, which costs one extra remote call but
+                    // only for degenerate subpaths.
+                    dlsym_remote("CGPathMoveToPoint", rp, 0, ptsBuf, 0, 0,0,0,0);
+                    dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, 1, 0,0,0,0);
+                    calls += 2;
                 } else {
-                    if (!haveLast) { lastX = x; lastY = y; haveLast = YES; havePrevEnd = NO; continue; }
-                    if (n == 0) {
-                        pts[n++] = lastX; pts[n++] = lastY;
-                    }
-                    pts[n++] = x; pts[n++] = y;
-                    lastX = x; lastY = y;
-                    havePrevEnd = YES;
+                    dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, rn / 2, 0,0,0,0);
+                    calls++;
                 }
             }
 
-            if (n >= 2) {
-                remote_write(ptsBuf, pts, n * 8);
-                dlsym_remote("CGPathClear", rp, 0,0,0,0,0,0,0);
-                dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
+            if (drawn > 0) {
                 sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
+                g_sbLastSubpaths = subpaths;
+                g_sbLastCalls = calls;
                 // [SB-PUSH] 1 Hz: what SpringBoard actually received this publish.
                 // Compare p0/p1 against the app-side [PUSH] scr values. If app scr
                 // moves but these do not, the hand-off is dropping frames; if both
@@ -438,13 +489,14 @@ void SBRemotePushESPFrame(UIView *espView) {
                     uint64_t nowS = now_us();
                     if (nowS > s_sbLogUS) {
                         s_sbLogUS = nowS + 1000000ULL;
-                        NSLog(@"[SB-PUSH] n=%d p0=(%.1f,%.1f) p1=(%.1f,%.1f) p2=(%.1f,%.1f) "
-                              @"hash=%u upd=%llu att=%llu skip=%llu",
-                              n, pts[0], pts[1], pts[2], pts[3], pts[4], pts[5],
+                        NSLog(@"[SB-PUSH] sub=%u calls=%llu hash=%u upd=%llu att=%llu skip=%llu "
+                              @"mergedSub=%u",
+                              g_sbLastSubpaths, (unsigned long long)g_sbLastCalls,
                               g_sbPathHash,
                               (unsigned long long)g_sbSummaryUpdates,
                               (unsigned long long)g_sbSummaryAttempts,
-                              (unsigned long long)g_sbSummarySkips);
+                              (unsigned long long)g_sbSummarySkips,
+                              g_sbSubpathCount);
                     }
                 }
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {
