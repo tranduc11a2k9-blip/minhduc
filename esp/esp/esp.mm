@@ -2774,9 +2774,7 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 //                            the matrix is frozen, the drawing is innocent.
 // Bump this every commit that changes measurement, so a device log identifies
 // its own build. Absence of this token = the IPA on the device is older.
-#define ESP_DIAG_BUILD "APPDATA1"
-
-static void AppDataProbe(void);
+#define ESP_DIAG_BUILD "PUSH1"
 
 static int g_hbLastReal = -1;
 static int g_hbLastBot  = -1;
@@ -2830,126 +2828,6 @@ static void ESPDiagHeartbeat(void) {
           g_hbLastReal, g_hbLastBot,
           (unsigned long long)cd.generation, cd.liveSlots, cd.staleGen,
           vpOk, vp[0], vp[3], vp[12], vp[15]);
-
-    {
-        static CFTimeInterval s_probe = 0;
-        CFTimeInterval nowP = CACurrentMediaTime();
-        if (nowP - s_probe > 60.0) { s_probe = nowP; AppDataProbe(); }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// [APPDATA] Read-only probe. Exists because three facts needed to design the
-// app-data reset cannot be inferred from source and must be measured on device:
-//
-//   1. uid. sandbox_escape() + platformize_self() run at startup, but the names
-//      do not promise uid 0. This decides everything: an app's data container
-//      is owned by that app's own uid, so WITHOUT root we cannot touch Free
-//      Fire's container on the filesystem at all and the only route left is
-//      driving SpringBoard's own APIs through the existing remote-call session.
-//
-//   2. Which bundle id Free Fire actually installed under. Not hardcoded
-//      (com.dts.freefireth vs freefiremax differ, and a wrong guess silently
-//      finds nothing). Instead every metadata plist is scanned and the ones
-//      mentioning "freefire" are reported, so the id is discovered, not assumed.
-//      Also proves the scan mechanism itself works by printing the total count.
-//
-//   3. What lives in the data container, i.e. where the guest identity is
-//      plausibly stored, so that a later delete can be aimed at a specific
-//      file rather than blindly wiping everything.
-//
-// Strictly read-only: opens directories and files for reading only. Removes
-// nothing. Retries every 60s because the first run can race app installation.
-// ---------------------------------------------------------------------------
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-static void AppDataListDir(const char *label, const char *dir, int maxEntries) {
-    DIR *d = opendir(dir);
-    if (!d) {
-        NSLog(@"[APPDATA]   %s opendir(%s) FAILED errno=%d", label, dir, errno);
-        return;
-    }
-    int n = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != nullptr && n < maxEntries) {
-        if (e->d_name[0] == '.') continue;
-        char p[768];
-        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
-        struct stat st;
-        if (lstat(p, &st) != 0) continue;
-        NSLog(@"[APPDATA]   %s %-40s %s %lld", label, e->d_name,
-              S_ISDIR(st.st_mode) ? "DIR " : "FILE", (long long)st.st_size);
-        n++;
-    }
-    closedir(d);
-    NSLog(@"[APPDATA]   %s -> %d entries listed (cap %d)", label, n, maxEntries);
-}
-
-void AppDataProbe(void) {
-    NSLog(@"[APPDATA] uid=%d euid=%d gid=%d pid=%d",
-          (int)getuid(), (int)geteuid(), (int)getgid(), (int)getpid());
-
-    static const char *kMeta = "/var/mobile/Containers/Metadata/Application";
-    static const char *kData = "/var/mobile/Containers/Data/Application";
-
-    DIR *md = opendir(kMeta);
-    if (!md) {
-        NSLog(@"[APPDATA] opendir(%s) FAILED errno=%d -- cannot enumerate containers",
-              kMeta, errno);
-        return;
-    }
-
-    int seen = 0, hits = 0;
-    struct dirent *de;
-    while ((de = readdir(md)) != nullptr) {
-        const char *nm = de->d_name;
-        size_t l = strlen(nm);
-        if (l < 7 || strcmp(nm + l - 6, ".plist") != 0) continue;
-        if (nm[0] == '.') continue;
-
-        char path[512];
-        snprintf(path, sizeof(path), "%s/%s", kMeta, nm);
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) continue;
-        char buf[8192];
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        if (n <= 0) continue;
-        buf[n] = 0;
-        seen++;
-
-        // Binary plists keep identifiers as plain ASCII, so scan for the token
-        // and print the whole printable run around it.
-        for (ssize_t i = 0; i + 8 <= n; i++) {
-            if (strncasecmp(buf + i, "freefire", 8) != 0) continue;
-            ssize_t s = i, e2 = i;
-            while (s > 0 && buf[s - 1] >= 0x21 && buf[s - 1] < 0x7f) s--;
-            while (e2 + 1 < n && buf[e2 + 1] >= 0x21 && buf[e2 + 1] < 0x7f) e2++;
-            char bid[128];
-            ssize_t len = e2 - s + 1;
-            if (len > (ssize_t)sizeof(bid) - 1) len = (ssize_t)sizeof(bid) - 1;
-            memcpy(bid, buf + s, (size_t)len);
-            bid[len] = 0;
-
-            char uuid[128];
-            snprintf(uuid, sizeof(uuid), "%.*s", (int)(l - 6), nm);
-            NSLog(@"[APPDATA] HIT bundleId=%s uuid=%s", bid, uuid);
-            hits++;
-
-            char ddir[768], bdir[768];
-            snprintf(ddir, sizeof(ddir), "%s/%s", kData, uuid);
-            snprintf(bdir, sizeof(bdir), "/var/containers/Bundle/Application/%s", uuid);
-            AppDataListDir("DATA", ddir, 40);
-            AppDataListDir("BUNDLE", bdir, 6);
-            break;
-        }
-    }
-    closedir(md);
-    NSLog(@"[APPDATA] scanned=%d plists hits=%d", seen, hits);
 }
 
 
