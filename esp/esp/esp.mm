@@ -2750,6 +2750,81 @@ static std::atomic<bool> g_brutalHasAddrs{false};
     } \
 } while (0)
 
+// ── DIAG heartbeat ────────────────────────────────────────────────────────
+// One unconditional line per second, printed from the top of updateFrame
+// BEFORE every early return. The previous measurement round buried its DIAGs
+// behind the in-match gate, so a log captured during lobby/loading contained
+// none of them and proved nothing. This line always prints, so the log says
+// which gate is blocking AND what the previous frame actually produced.
+//
+//   base= pid= at=            attach state (ds_attached / ds_pid / Moudule_Base)
+//   ti= st=                  raw kGameFacadeTypeInfo read and *(ti+0xB8) —
+//                            the head of the matchGame chain, before any
+//                            further indirection
+//   mg= cam= mt= pawn= hp=   the pointer chain, one stage at a time; the first
+//                            one that is 0 is the gate that stopped us
+//   real= bot=               players the LAST completed frame managed to draw
+//                            (real=0 ⇒ data/chain, not projection)
+//   cache{g= live= stale=}   g = cache generation, stale = slots mapped before
+//                            generation g. stale>0 ⇒ the cache crossed a match
+//                            boundary and is serving freed memory.
+//   VP{ok= m0= m3= m12= m15=} view-projection row terms WorldToScreen uses;
+//                            m3/m12 are the w-row constants it divides by.
+//                            Identical across samples while the camera turns ⇒
+//                            the matrix is frozen, the drawing is innocent.
+static int g_hbLastReal = -1;
+static int g_hbLastBot  = -1;
+
+static void ESPDiagHeartbeat(void) {
+    static CFTimeInterval s_hb = 0;
+    CFTimeInterval nowH = CACurrentMediaTime();
+    if (nowH - s_hb < 1.0) return;
+    s_hb = nowH;
+
+    const uint64_t base = Moudule_Base;
+    const int attached  = ds_attached() ? 1 : 0;
+    const int pid       = (int)ds_pid();
+
+    uint64_t ti = 0, st = 0, mg = 0, cam = 0, mt = 0, pawn = 0;
+    int   hp   = -1;
+    float vp[16];
+    int   vpOk = 0;
+    memset(vp, 0, sizeof(vp));
+
+    if (isVaildPtr(base)) {
+        ti = ReadAddr<uint64_t>(base + (uint64_t)kGameFacadeTypeInfo);
+        if (isVaildPtr(ti)) {
+            st = ReadAddr<uint64_t>(ti + 0xB8);
+        }
+        mg = getMatchGame(base);
+        if (isVaildPtr(mg)) {
+            cam = CameraMain(mg);
+            mt  = getMatch(mg);
+            if (isVaildPtr(mt)) {
+                pawn = getLocalPlayer(mt);
+                if (isVaildPtr(pawn)) hp = get_CurHP(pawn);
+            }
+        }
+    }
+    if (isVaildPtr(cam)) {
+        vpOk = GetViewMatrixInto(cam, vp) ? 1 : 0;
+    }
+
+    DSPageCacheDiag cd = ds_page_cache_diag();
+
+    NSLog(@"[HB] base=0x%llx pid=%d at=%d ti=0x%llx st=0x%llx mg=0x%llx cam=0x%llx "
+          @"mt=0x%llx pawn=0x%llx hp=%d real=%d bot=%d "
+          @"cache{g=%llu,live=%d,stale=%d} "
+          @"VP{ok=%d m0=%.4f m3=%.4f m12=%.4f m15=%.4f}",
+          (unsigned long long)base, pid, attached,
+          (unsigned long long)ti, (unsigned long long)st,
+          (unsigned long long)mg, (unsigned long long)cam,
+          (unsigned long long)mt, (unsigned long long)pawn, hp,
+          g_hbLastReal, g_hbLastBot,
+          (unsigned long long)cd.generation, cd.liveSlots, cd.staleGen,
+          vpOk, vp[0], vp[3], vp[12], vp[15]);
+}
+
 
 
 
@@ -2973,6 +3048,9 @@ static std::atomic<bool> g_brutalHasAddrs{false};
             ESPSyncFromPrefs();
             lastPrefSync = now;
         }
+        // Runs before every early return below, so the log always carries the
+        // gate state even when the render path bails out immediately.
+        ESPDiagHeartbeat();
         
         // Color / thickness: use synced globals most frames. Re-read prefs only while
         // rainbow is on or ~8×/s so RGB picker still feels live without 16 prefs
@@ -3136,6 +3214,8 @@ static std::atomic<bool> g_brutalHasAddrs{false};
         ds_begin_read_transaction();
         ESPFrameStats stats = [self renderESPWithBuffers:&buffers viewWidth:viewWidth viewHeight:viewHeight matrixVpWidth:matrixVpW matrixVpHeight:matrixVpH screenCenter:screenCenter];
         ds_end_read_transaction();
+        g_hbLastReal = stats.realCount;
+        g_hbLastBot  = stats.botCount;
 
         bool showVisuals = (isESP || isESP2);
         
