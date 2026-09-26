@@ -428,6 +428,25 @@ void SBRemotePushESPFrame(UIView *espView) {
                 dlsym_remote("CGPathAddLines", rp, 0, ptsBuf, n / 2, 0,0,0,0);
                 sb_invoke_cached_main_raw();
                 g_sbSummaryUpdates++;
+                // [SB-PUSH] 1 Hz: what SpringBoard actually received this publish.
+                // Compare p0/p1 against the app-side [PUSH] scr values. If app scr
+                // moves but these do not, the hand-off is dropping frames; if both
+                // move and the screen is still static, the CAShapeLayer is not
+                // presenting the new path.
+                {
+                    static uint64_t s_sbLogUS = 0;
+                    uint64_t nowS = now_us();
+                    if (nowS > s_sbLogUS) {
+                        s_sbLogUS = nowS + 1000000ULL;
+                        NSLog(@"[SB-PUSH] n=%d p0=(%.1f,%.1f) p1=(%.1f,%.1f) p2=(%.1f,%.1f) "
+                              @"hash=%u upd=%llu att=%llu skip=%llu",
+                              n, pts[0], pts[1], pts[2], pts[3], pts[4], pts[5],
+                              g_sbPathHash,
+                              (unsigned long long)g_sbSummaryUpdates,
+                              (unsigned long long)g_sbSummaryAttempts,
+                              (unsigned long long)g_sbSummarySkips);
+                    }
+                }
                 if ((g_sbSummaryUpdates & 0x3f) == 0) {
                     NSLog(@"[SBOverlay] 15fps updates=%llu skips=%llu attempts=%llu",
                           g_sbSummaryUpdates, g_sbSummarySkips, g_sbSummaryAttempts);

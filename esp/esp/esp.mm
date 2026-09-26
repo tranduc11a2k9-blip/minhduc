@@ -2772,6 +2772,10 @@ static std::atomic<bool> g_brutalHasAddrs{false};
 //                            m3/m12 are the w-row constants it divides by.
 //                            Identical across samples while the camera turns ⇒
 //                            the matrix is frozen, the drawing is innocent.
+// Bump this every commit that changes measurement, so a device log identifies
+// its own build. Absence of this token = the IPA on the device is older.
+#define ESP_DIAG_BUILD "PUSH1"
+
 static int g_hbLastReal = -1;
 static int g_hbLastBot  = -1;
 
@@ -2812,10 +2816,11 @@ static void ESPDiagHeartbeat(void) {
 
     DSPageCacheDiag cd = ds_page_cache_diag();
 
-    NSLog(@"[HB] base=0x%llx pid=%d at=%d ti=0x%llx st=0x%llx mg=0x%llx cam=0x%llx "
+    NSLog(@"[HB] %@ base=0x%llx pid=%d at=%d ti=0x%llx st=0x%llx mg=0x%llx cam=0x%llx "
           @"mt=0x%llx pawn=0x%llx hp=%d real=%d bot=%d "
           @"cache{g=%llu,live=%d,stale=%d} "
           @"VP{ok=%d m0=%.4f m3=%.4f m12=%.4f m15=%.4f}",
+          ESP_DIAG_BUILD,
           (unsigned long long)base, pid, attached,
           (unsigned long long)ti, (unsigned long long)st,
           (unsigned long long)mg, (unsigned long long)cam,
@@ -4148,6 +4153,31 @@ static void ESPDiagHeartbeat(void) {
         Vector3 aimW = looksLikeWorldPos(s.aimPos) ? s.aimPos : s.head;
         Vector3 w2sAimCheck = WorldToScreenLayer(aimW, matrixData, (float)matrixVpWidth, (float)matrixVpHeight, (float)viewWidth, (float)viewHeight);
         bool isOnScreen = (w2sAimCheck.z > 0.001f && w2sAimCheck.x >= 0 && w2sAimCheck.x <= viewWidth && w2sAimCheck.y >= 0 && w2sAimCheck.y <= viewHeight);
+
+        // [PUSH] 1 Hz on the first drawn snap: splits "frozen data" from
+        // "frozen hand-off". w2sAimCheck is already computed for this pawn and
+        // is the SAME world point the ESP box is built around, so this costs
+        // nothing extra. Read the decision table in the commit message:
+        //   world moves + scr moves          -> data & projection alive
+        //   world moves + scr frozen         -> projection stuck (GetViewMatrixInto)
+        //   world frozen                     -> bone/node offset wrong (kHeadNode family)
+        // Compare [PUSH] scr against [SB-PUSH] p0 to see if the push survived.
+        if (si == 0) {
+            static int s_pushLog = 0;
+            if (++s_pushLog % 60 == 1) {
+                uint64_t hn = ReadAddr<uint64_t>(s.pawn + kHeadNode);
+                uint64_t hp = ReadAddr<uint64_t>(s.pawn + kHipNode);
+                uint64_t h628 = ReadAddr<uint64_t>(s.pawn + 0x628);
+                NSLog(@"[PUSH] pawn=0x%llx headN=0x%llx hipN=0x%llx n628=0x%llx "
+                      @"world=(%.2f,%.2f,%.2f) scr=(%.1f,%.1f,%.3f) on=%d frame=%d",
+                      (unsigned long long)s.pawn,
+                      (unsigned long long)hn, (unsigned long long)hp,
+                      (unsigned long long)h628,
+                      s.head.x, s.head.y, s.head.z,
+                      w2sAimCheck.x, w2sAimCheck.y, w2sAimCheck.z,
+                      (int)isOnScreen, g_cacheFrameCounter);
+            }
+        }
 
         // Alert only nearer off-screen threats; throttle harder when crowded.
         const float alertMaxDis = veryCrowded ? 70.f : (crowded ? 95.f : 120.f);
