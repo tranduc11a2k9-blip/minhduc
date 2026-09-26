@@ -509,6 +509,14 @@ static void clear_remote_shmem_cache(void)
     g_RC_shmemEvictions = 0;
 }
 
+// Exposed so remote_objc.m can drop a stale alias before injecting a string.
+// The cache is what lets remote_write land in a mapping that is no longer the
+// target's live page; r_alloc_str() in remote/remote_objc.m relies on this.
+void remote_clear_shmem_cache(void)
+{
+    clear_remote_shmem_cache();
+}
+
 static uint32_t reap_dead_port_names(const char *reason)
 {
     mach_port_name_array_t names = NULL;

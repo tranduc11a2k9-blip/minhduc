@@ -4,6 +4,7 @@
 
 #import "remote_objc.h"
 #import "RemoteCall.h"
+#import <Foundation/Foundation.h>
 #import <pthread.h>
 #import <stdlib.h>
 #import <string.h>
@@ -118,13 +119,44 @@ uint64_t r_dlsym_call(int timeout, const char *fnName,
     return r_call_stable(timeout, fnName, a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
+// remote_write() goes through the vm_map_entry hijack, so it can silently land
+// in a stale alias and leave the target's real page untouched. Nothing about its
+// return value tells us that, and a NULL objc_getClass() looks exactly the same
+// as "class genuinely not found".
+//
+// So verify with the target itself: strlen() inside SpringBoard reads the target's
+// own memory, and every named remote call in this file is already proven working
+// (getpid/malloc/free/memset/memcpy all return sane values in the 10:21 log).
+// Expected length is authoritative, so a mismatch localises the fault exactly.
+static bool r_str_verify(uint64_t buf, size_t expect)
+{
+    if (!buf) return false;
+    remote_clear_shmem_cache();
+    uint64_t got = r_call_stable(R_TIMEOUT, "strlen", buf, 0, 0, 0, 0, 0, 0, 0);
+    return got == (uint64_t)expect;
+}
+
 uint64_t r_alloc_str(const char *s)
 {
     if (!s) return 0;
-    uint64_t len = strlen(s) + 1;
-    uint64_t buf = r_call_stable(R_TIMEOUT, "malloc", len, 0, 0, 0, 0, 0, 0, 0);
-    if (buf) remote_writeStr(buf, s);
-    return buf;
+    size_t len = strlen(s);
+    uint64_t buf = r_call_stable(R_TIMEOUT, "malloc", len + 1, 0, 0, 0, 0, 0, 0, 0);
+    if (!buf) return 0;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        // Drop any cached alias for this page before writing, so we never write
+        // into a mapping that is no longer the target's live page.
+        remote_clear_shmem_cache();
+        if (remote_writeStr(buf, s) && r_str_verify(buf, len))
+            return buf;
+    }
+
+    uint64_t got = r_call_stable(R_TIMEOUT, "strlen", buf, 0, 0, 0, 0, 0, 0, 0);
+    NSLog(@"[RemoteObjC] r_alloc_str FAILED for \"%s\" buf=0x%llx: target strlen=%llu, expected %zu "
+          "— remote_write is not reaching SpringBoard memory",
+          s, (unsigned long long)buf, (unsigned long long)got, len);
+    r_call_stable(R_TIMEOUT, "free", buf, 0, 0, 0, 0, 0, 0, 0);
+    return 0;
 }
 
 void r_free(uint64_t ptr)

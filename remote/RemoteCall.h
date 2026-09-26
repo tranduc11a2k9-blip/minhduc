@@ -74,6 +74,9 @@ void remote_hexdump(uint64_t remoteAddr, size_t size);
 bool remote_write(uint64_t dst, const void *src, uint64_t size);
 bool remote_write64(uint64_t dst, uint64_t val);
 bool remote_writeStr(uint64_t dst, const char *str);
+// Drop every cached page alias. remote_write() can otherwise write through a
+// mapping that is no longer the target's live page, silently losing the write.
+void remote_clear_shmem_cache(void);
 uint64_t remote_call_trojan_mem(void);
 int destroy_remote_call(void);
 // Drop every piece of local RemoteCall state without trying to IPC the remote
