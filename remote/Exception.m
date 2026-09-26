@@ -88,9 +88,16 @@ bool exception_state_is_sane(ExceptionMessage *exc)
     // A faulted thread always has a non-zero PC and a mapped user SP. The
     // SpringBoard kill above came from replying onto a state that had
     // pc=0/sp=0: getpid is a leaf so it ran, then RET 0x401 aborted.
+    //
+    // Do NOT put a lower bound on pc. Every legitimate park in this engine sits
+    // far below any real code address on purpose: FAKE_PC_TROJAN_CREATOR=0x101,
+    // FAKE_PC_TROJAN=0x301, FAKE_LR_TROJAN_CREATOR=0x201, FAKE_LR_TROJAN=0x401.
+    // A bound like "pc < 0x1000" rejects the very traps we are waiting for; it
+    // broke the bootstrap getpid on 2026-09-26 09:46:31 with
+    // "temp/getpid wait1 REJECT non-live state (sp=0x16affe1a0)".
     uint64_t pc = native_strip(exc->threadState.__pc);
     uint64_t sp = native_strip(exc->threadState.__sp);
-    if (pc == 0 || pc < 0x1000ULL)
+    if (pc == 0)
         return false;
     if (sp < 0x100000000ULL)
         return false;

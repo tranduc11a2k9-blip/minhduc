@@ -1044,9 +1044,11 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     // with sp=0 and gets the *target process* SIGKILLed
     // (SpringBoard IPS 2026-09-26 06:21:04, CODESIGNING "Invalid Page").
     if (!exception_state_is_sane(&exc)) {
-        RC_DIAG("temp/%s wait1 REJECT non-live state (sp=0x%llx) — not replying",
+        RC_DIAG("temp/%s wait1 REJECT non-live state (pc=0x%llx sp=0x%llx flavor=%u) — not replying",
                 name ?: "?",
-                (unsigned long long)native_strip(exc.threadState.__sp));
+                (unsigned long long)native_strip(exc.threadState.__pc),
+                (unsigned long long)native_strip(exc.threadState.__sp),
+                (unsigned)exc.flavor);
         g_RC_success = false;
         return 0;
     }
@@ -1183,9 +1185,11 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     // process with SIGKILL / CODESIGNING "Invalid Page". A zeroed state is never
     // the parked 0x301 thread — drop the session instead of replying.
     if (!exception_state_is_sane(&exc)) {
-        RC_DIAG("stable/%s wait1 REJECT non-live state (sp=0x%llx) — not replying",
+        RC_DIAG("stable/%s wait1 REJECT non-live state (pc=0x%llx sp=0x%llx flavor=%u) — not replying",
                 name ?: "(addr-call)",
-                (unsigned long long)native_strip(exc.threadState.__sp));
+                (unsigned long long)native_strip(exc.threadState.__pc),
+                (unsigned long long)native_strip(exc.threadState.__sp),
+                (unsigned)exc.flavor);
         g_RC_success = false;
         return 0;
     }
